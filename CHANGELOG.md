@@ -7,6 +7,48 @@ Changeloggen börjar vid 0.9.41. Äldre versioner finns inte dokumenterade här.
 
 ---
 
+## 0.10.2 — 2026-09-02
+
+### Fixat
+
+- **Datorn kunde inte somna när appen var öppen.** Sagt.ai höll ljudkanalen för
+  mötesljud igång hela tiden, även när ingen inspelning pågick — vilket hindrade
+  Macen från att gå i viloläge och höll högtalarens ljudmotor vaken dygnet runt.
+  Mötesljudet kopplas nu in när du börjar spela in och släpps när du slutar.
+
+- **Ljud från en tidigare inspelning kunde hamna i nästa.** Upp till två sekunder
+  från slutet av föregående inspelning kunde följa med in i början av nästa
+  transkription. Det gick inte att se i appen.
+
+- **Falsk varning om systemljud.** Startade du en inspelning utan att något
+  spelades på datorn — vanlig diktering — varnade appen för att mötesljud inte
+  fångades, trots att det inte fanns något att fånga. Varningen kommer nu bara när
+  det faktiskt spelas ljud som appen missar.
+
+- **Inspelningar som försvann utan förklaring.** Om skrivningen till disk
+  misslyckades kunde inspelningen tystna helt, och alla senare inspelningar under
+  samma körning gjorde det också tills appen startades om. Nu får du ett tydligt
+  fel, och det som hunnit spelas in sparas.
+
+- **En inspelning som inte innehöll något ljud sa ingenting.** Nu får du veta
+  direkt när inspelningen är tom eller när din egen mikrofonkanal var tyst, i
+  stället för att upptäcka det när du öppnar transkriptet.
+
+### Nytt
+
+- **Loggfil även på Windows.** Appen sparar nu samma slags loggfil på Windows som
+  på Mac sedan förra versionen, under `AppData\Roaming\com.sagt.ai\logs\`. Den
+  beskriver vad appen gör — vilka ljudenheter som används och när något
+  misslyckas — så att ett problem går att felsöka i efterhand i stället för att
+  behöva återskapas. **Den innehåller aldrig ditt ljud och aldrig texten ur dina
+  inspelningar.** Filen roterar vid 5 MB och lämnar aldrig datorn av sig själv.
+
+### Ändrat
+
+- **Loggfilen skriver mycket mindre i viloläge.** Den fylldes tidigare av en rad
+  per sekund även när ingenting hände, vilket gjorde att verkliga fel skrevs över
+  inom ett dygn. Nu räcker samma utrymme i ungefär en månad.
+
 ## 0.10.1 — 2026-08-30
 
 ### Fixat

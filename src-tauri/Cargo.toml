@@ -14,7 +14,7 @@ name = "sagt"
 # strängen. Att hålla fältet utanför synken gjorde alltså inte problemet ofarligt — det
 # gjorde det osynligt. Rätt svar på en fil som måste vara i synk är att lägga den under
 # grinden, vilket den nu är.
-version = "0.10.1"
+version = "0.10.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -55,8 +55,18 @@ chrono = { version = "0.4", features = ["serde"] }
 # "cannot find ... in windows_core::imp" — INNAN vår egen kod ens nåddes. Felet såg
 # ut som ett beroendeproblem och var en saknad rad här. Uppmätt 2026-08-24.
 #
-# Direkt windows-dep för WASAPI-peakmetrar (audio_meter.rs). cpal drar in en egen
-# äldre windows-version transitivt — olika major-versioner samexisterar i Cargo.
+# Direkt windows-dep med två konsumenter. cpal drar in en egen äldre
+# windows-version transitivt — olika major-versioner samexisterar i Cargo.
+#
+#   audio_meter.rs  WASAPI-peakmetrar     -> Media_Audio*, System_Com*, UI_Shell*,
+#                                            Devices_FunctionDiscovery
+#   applog.rs       filloggning på Windows -> Foundation, System_Console, System_Pipes,
+#                                            Security (CreatePipe är gatad bakom den:
+#                                            signaturen nämner SECURITY_ATTRIBUTES även
+#                                            när vi skickar None)
+#
+# Featurelistan är additiv och gemensam; håll grupperna ovan uppdaterade när en ny
+# konsument tillkommer, annars går det inte att veta vilken rad som får strykas.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Media_Audio",
@@ -65,6 +75,10 @@ windows = { version = "0.61", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
 ] }
 
 # Systemljud på macOS (mac_sysaudio.rs). objc2 och core-foundation finns redan

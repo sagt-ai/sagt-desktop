@@ -96,6 +96,13 @@ extern "C" {
         data_size: *mut u32,
         data: *mut c_void,
     ) -> OSStatus;
+    fn AudioObjectGetPropertyDataSize(
+        obj: AudioObjectID,
+        addr: *const AudioObjectPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        data_size: *mut u32,
+    ) -> OSStatus;
     fn AudioDeviceCreateIOProcID(
         dev: AudioObjectID,
         proc_: AudioDeviceIOProc,
@@ -126,6 +133,11 @@ const K_DEVICE_UID: u32 = fcc(b"uid ");
 // Inte `goin` (kAudioDevicePropertyDeviceIsRunning), som bara svarar för den
 // egna klienten och alltid är 0 innan vi startat något själva.
 const K_DEVICE_RUNNING_SOMEWHERE: u32 = fcc(b"gone");
+// Process-objekt (macOS 14.2+, samma generation som tap-API:t). Ger det
+// `kAudioDevicePropertyDeviceIsRunningSomewhere` inte kan ge: vem som spelar.
+const K_PROCESS_OBJECT_LIST: u32 = fcc(b"prs#");
+const K_PROCESS_PID: u32 = fcc(b"ppid");
+const K_PROCESS_IS_RUNNING_OUTPUT: u32 = fcc(b"piro");
 const K_SYSTEM_OBJECT: AudioObjectID = 1;
 const K_ELEM_MAIN: u32 = 0;
 
@@ -216,8 +228,15 @@ pub fn request_permission() {
     // vilket kan vara minuter senare. Apples konvention är att en callback-tagare
     // Block_copy:ar blocket, men det är inte dokumenterat för det här privata API:t
     // — och gissar vi fel blir det en use-after-free i en callback vi inte äger.
-    // Kostnaden är ett litet block per appstart; funktionen anropas som mest en
-    // gång per körning eftersom den bara nås vid NotDetermined.
+    //
+    // ⚠️ RÄTTAD 2026-09-01. Här stod tidigare att funktionen anropas "som mest en
+    // gång per körning". Det stämmer inte, och ingenting upprätthöll det: utöver
+    // anropet i `run()`s setup anropas den från `try_sys_capture` vid VARJE
+    // byggförsök så länge statusen är NotDetermined — alltså en gång per
+    // backoff-intervall (5 s → 15 s → 60 s → tak 5 min) för en användare som
+    // aldrig svarar på dialogen. Kostnaden är fortfarande försumbar (ett block om
+    // några tiotal byte per försök, som mest ett per fem minuter), och läckan är
+    // därför fortsatt medveten — men taket är backoffen, inte "en gång".
     std::mem::forget(block);
 }
 
@@ -284,6 +303,29 @@ pub struct MacSysStream {
     ctx: *mut IoCtx,
 }
 
+// SAFETY: `MacSysStream` får skickas mellan trådar, och det är en förutsättning för
+// att bygget ska kunna ske utanför övervakningsloopen (annars är mikrofonen gisslan hos
+// en CoreAudio-start som kan blockera ~15 s).
+//
+// Underlaget, fält för fält:
+//
+// * `tap` och `agg` är `AudioObjectID` — vanliga u32 som HAL:en delar ut. De har ingen
+//   trådaffinitet; de är namn på objekt som lever i `coreaudiod`, inte i vår process.
+// * `proc_id` är en opak `AudioDeviceIOProcID`. Samma sak: en handtagsidentitet, inte
+//   en pekare in i trådlokalt tillstånd.
+// * `ctx` är en `Box<IoCtx>` som VI äger ensamma. `IoCtx` innehåller `Sender<f32>` och
+//   `Arc<AtomicBool>`, båda `Send`. Ingen annan tråd rör lådan förrän IOProc:en gör det,
+//   och den körs på CoreAudios egen realtidstråd oavsett var strukten bor.
+//
+// Nedrivningen i `Drop` (`AudioDeviceStop`, `AudioDeviceDestroyIOProcID`,
+// `AudioHardwareDestroyAggregateDevice`, `AudioHardwareDestroyProcessTap`) är HAL-anrop
+// utan krav på anropande tråd — de är inte huvudtrådsbundna som AppKit-API:er.
+//
+// ⚠️ Det som INTE är verifierat är att `Drop` från en annan tråd än den som byggde är
+// oproblematiskt i praktiken; underlaget ovan är API-kontraktet, inte en mätning. Det
+// inträffar när motorn avslutas medan ett bygge pågår, och det är den enda vägen dit.
+unsafe impl Send for MacSysStream {}
+
 impl Drop for MacSysStream {
     fn drop(&mut self) {
         unsafe {
@@ -307,7 +349,21 @@ impl Drop for MacSysStream {
     }
 }
 
-/// Spelar utenheten just nu, för någon process i systemet?
+/// Kör utenhetens IO-motor just nu, för någon klient i systemet?
+///
+/// ⚠️ **RUBRIKEN RÄTTAD 2026-09-01.** Här stod "Spelar utenheten just nu", och det är
+/// inte vad `kAudioDevicePropertyDeviceIsRunningSomewhere` svarar på. Egenskapen säger
+/// att enhetens IO-motor är IGÅNG för någon klient — vilket den är även när klienten
+/// matar digital tystnad. Uppmätt: `true` i tjugo mätningar i rad utan att något
+/// spelades, medan CoreAudios egen logg samtidigt rapporterade utgångens kedja på
+/// `rms:[-120.000000]`. En öppen Chrome eller Electron-app räcker för att hålla den
+/// sann hela dagen; det gjorde också vår egen tap innan den fick en livscykel.
+///
+/// Skillnaden spelar roll åt två håll. **För sitt eget syfte är egenskapen rätt vald** —
+/// frågan "kan en tap haka i enhetens klocka?" handlar just om motorn, inte om ljudet.
+/// Men den duger INTE som svar på "spelar någon ljud?", och den som läser den gamla
+/// rubriken drar den slutsatsen — vilket är precis vad guardrail-varningen i `audio.rs`
+/// hade behövt ett svar på.
 ///
 /// 🔴 Detta är en FÖRUTSÄTTNING för att tappen ska kunna starta, inte en optimering.
 /// Uppmätt på macOS 26.6.1 2026-08-30: med tyst utgång blockerar `AudioDeviceStart`
@@ -371,6 +427,141 @@ pub fn output_is_active() -> bool {
         return true;
     }
     running != 0
+}
+
+/// Spelar någon ANNAN process ut ljud just nu?
+///
+/// `None` = frågan gick inte att besvara (API:t saknas eller svarade fel) — anroparen
+/// ska då falla tillbaka på det beteende som gällde innan sonden fanns, inte gissa.
+///
+/// # Varför den behövs vid sidan av `output_is_active()`
+///
+/// De två svarar på olika frågor, och skillnaden är hela poängen.
+/// `output_is_active()` säger *att enhetens IO-motor kör för någon klient* — rätt fråga
+/// när man undrar om en tap kan haka i enhetens klocka, men obrukbar som svar på "spelas
+/// det något?". Den är sann även vid digital tystnad, och den blir sann av **vår egen
+/// tap**: uppmätt 2026-09-01 gav sonden `true` oavbrutet i tjugo mätningar medan
+/// CoreAudios logg samtidigt rapporterade utgångens kedja på `rms:[-120]`.
+///
+/// Guardrail-varningen behövde den andra frågan. Utan den var den binär på macOS —
+/// falsklarm vid ren diktering, och tyst när tappen fanns men gav nollor, vilket är
+/// precis vad ett återkallat TCC-medgivande ger.
+///
+/// # Varför vår egen pid räknas bort
+///
+/// Under inspelning kör vårt aggregat, som innehåller utenheten. Utan uteslutningen
+/// hade sonden svarat "ja, någon spelar" på vår egen fångst — samma självreferens som
+/// gör `output_is_active()` oanvändbar här, återinförd i en ny funktion.
+pub fn other_process_is_playing() -> Option<bool> {
+    let addr = AudioObjectPropertyAddress {
+        selector: K_PROCESS_OBJECT_LIST,
+        scope: K_SCOPE_GLOBAL,
+        element: K_ELEM_MAIN,
+    };
+    let mut size: u32 = 0;
+    let st = unsafe {
+        AudioObjectGetPropertyDataSize(K_SYSTEM_OBJECT, &addr, 0, std::ptr::null(), &mut size)
+    };
+    if st != 0 || size == 0 {
+        return None;
+    }
+    let n = size as usize / std::mem::size_of::<AudioObjectID>();
+    let mut ids: Vec<AudioObjectID> = vec![0; n];
+    let st = unsafe {
+        AudioObjectGetPropertyData(
+            K_SYSTEM_OBJECT,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            ids.as_mut_ptr() as *mut c_void,
+        )
+    };
+    if st != 0 {
+        return None;
+    }
+
+    let me = std::process::id() as i32;
+    // Ett process-objekt vars `piro` inte gick att läsa gör hela svaret osäkert. Att
+    // räkna det som "spelar inte" vore att svara nej på grund av okunskap.
+    let mut unknown = false;
+    for id in ids {
+        let mut pid: i32 = 0;
+        let mut psz = std::mem::size_of::<i32>() as u32;
+        let paddr = AudioObjectPropertyAddress {
+            selector: K_PROCESS_PID,
+            scope: K_SCOPE_GLOBAL,
+            element: K_ELEM_MAIN,
+        };
+        let st = unsafe {
+            AudioObjectGetPropertyData(
+                id,
+                &paddr,
+                0,
+                std::ptr::null(),
+                &mut psz,
+                &mut pid as *mut _ as *mut c_void,
+            )
+        };
+        if st != 0 {
+            // Just DEN HÄR processen går inte att attribuera. Den kan mycket väl spela
+            // ljud, så svaret blir osäkert — men bara om ingen annan visar sig göra det.
+            unknown = true;
+            continue;
+        }
+        if pid == me {
+            continue;
+        }
+        let raddr = AudioObjectPropertyAddress {
+            selector: K_PROCESS_IS_RUNNING_OUTPUT,
+            scope: K_SCOPE_GLOBAL,
+            element: K_ELEM_MAIN,
+        };
+        let mut running: u32 = 0;
+        let mut rsz = std::mem::size_of::<u32>() as u32;
+        let st = unsafe {
+            AudioObjectGetPropertyData(
+                id,
+                &raddr,
+                0,
+                std::ptr::null(),
+                &mut rsz,
+                &mut running as *mut _ as *mut c_void,
+            )
+        };
+        if st != 0 {
+            unknown = true;
+            continue;
+        }
+        if running != 0 {
+            return Some(true);
+        }
+    }
+    // 🔴 Ett tomt svep är INTE detsamma som ett oläsbart. Har vi räknat igenom listan
+    // och kunnat läsa varje post är "ingen annan spelar" ett riktigt svar, även om
+    // listan bara innehöll oss själva — det är exakt läget vid ren diktering på en
+    // maskin utan andra ljudappar, och det är då falsklarmet ska UTEBLI.
+    //
+    // Ett tidigare utkast krävde att minst en `piro` lästs för att svara `Some(false)`.
+    // På en sådan maskin blev svaret `None`, guardrailen varnade, och falsklarmet var
+    // tillbaka genom en sidodörr. Samma felform som grinden som godkänner tyst när den
+    // inte sett några poster — bara med motsatt utfall.
+    if unknown {
+        // 🔴 Loggas, och det är hela poängen med raden. Utan den återgår macOS-
+        // guardrailen tyst till sitt gamla beteende — falsklarm vid varje diktering —
+        // och ingenting säger att kalibreringen är ur funktion. En grind som slutar
+        // fungera utan att säga det är samma felform som revisionen letade efter.
+        //
+        // En gång per anrop är för ofta; raden skrivs bara när svaret faktiskt blir
+        // osäkert, vilket på en frisk maskin aldrig händer (uppmätt 2026-09-02: alla
+        // process-objekt läsbara, svaret Some(false)/Some(true) genomgående).
+        eprintln!(
+            "DEBUG: kunde inte läsa alla ljudprocesser — vet inte om någon spelar,              guardrailen faller tillbaka på sitt gamla beteende"
+        );
+        None
+    } else {
+        Some(false)
+    }
 }
 
 fn default_output_uid() -> Result<CFString, String> {
@@ -441,6 +632,16 @@ fn tap_uid(tap: AudioObjectID) -> Result<CFString, String> {
     Ok(unsafe { CFString::wrap_under_create_rule(uid) })
 }
 
+/// UID för vårt privata aggregat, med processens pid inbakad.
+///
+/// Utbruten ur `start()` för att gå att testa: mekanismen är att strängen SKA variera
+/// per process, och det påståendet går annars bara att kontrollera genom att starta två
+/// appar och läsa CoreAudios logg. Se kommentaren vid anropsplatsen för varför den inte
+/// får vara konstant.
+fn aggregate_uid() -> String {
+    format!("ai.sagt.motet.aggregate.{}", std::process::id())
+}
+
 /// Startar systemljudsfångst. Returnerar guarden och samplingsfrekvensen.
 ///
 /// Best-effort precis som Windows-vägen: varje felväg ger `Err`, och anroparen
@@ -495,6 +696,20 @@ pub fn start(
                 CFNumber::from(0i32).as_CFType(),
             ),
         ]);
+        // 🔴 UID:t bär processens pid. Det var tidigare en konstant sträng, och två
+        // samtidiga instanser — en installerad app och en `tauri:dev`-körning, eller
+        // två inloggade användarkonton — hade då bett CoreAudio om två aggregat med
+        // samma UID. Vad som händer då är overifierat, och det är hela poängen: det
+        // är inte ett tillstånd man vill ta reda på i fält.
+        //
+        // Det blockerade dessutom felsökningen konkret. Revisionen 2026-09-01 kunde
+        // inte köra en dev-instans bredvid den installerade appen just av det skälet,
+        // och därför blev de två största fynden lämnade utan runtime-verifiering.
+        // Ett verktyg man inte kan köra bredvid sig självt är svårare att laga.
+        //
+        // Namnet ("Sagt.ai MÖTET") lämnas konstant — det är en visningssträng, och
+        // aggregatet är `private` så ingen användare ser det i Ljud-inställningarna.
+        let agg_uid = aggregate_uid();
         let agg_desc = CFDictionary::from_CFType_pairs(&[
             (
                 CFString::new("name").as_CFType(),
@@ -502,7 +717,7 @@ pub fn start(
             ),
             (
                 CFString::new("uid").as_CFType(),
-                CFString::new("ai.sagt.motet.aggregate").as_CFType(),
+                CFString::new(&agg_uid).as_CFType(),
             ),
             (
                 CFString::new("private").as_CFType(),
@@ -590,3 +805,28 @@ pub fn start(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::aggregate_uid;
+
+    #[test]
+    fn aggregatets_uid_bar_processens_pid() {
+        // 🔴 NEGATIVT TEST för fynd 13. Grinden är att strängen INTE får vara en
+        // konstant: två instanser på samma maskin bad annars CoreAudio om två aggregat
+        // med samma UID, och det var vad som hindrade en dev-körning bredvid den
+        // installerade appen — alltså det som lämnade revisionens två största fynd
+        // utan runtime-verifiering.
+        let uid = aggregate_uid();
+        assert!(
+            uid.contains(&std::process::id().to_string()),
+            "UID:t måste variera per process, fick {uid}"
+        );
+        // Prefixet är fortfarande vårt, så aggregatet går att känna igen i
+        // CoreAudios logg och i pmset-assertionens namn.
+        assert!(uid.starts_with("ai.sagt.motet.aggregate."), "oväntat prefix: {uid}");
+        // Stabil inom processen — annars skulle varje ombyggnad ge ett nytt aggregat-UID.
+        assert_eq!(uid, aggregate_uid());
+    }
+}
+

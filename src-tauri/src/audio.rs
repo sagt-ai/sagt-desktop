@@ -33,6 +33,34 @@ fn current_session_generation() -> u64 {
     SESSION_GENERATION.load(Ordering::SeqCst)
 }
 
+// Monotonisk MOTORgeneration — samma grepp som sessionsgenerationen ovan, men för
+// ljudmotorns trådar. Bumpas av både `start()` och `stop()`, och varje tråd bär den
+// generation den startades med.
+//
+// 🔴 Varför en generation och inte `is_running`-flaggan. Flaggan kunde inte svara på
+// frågan "är JAG fortfarande den aktuella motorn". `stop()` satte den till false, men
+// en loop som stod i ett blockerande enhetsbygge såg det inte förrän anropet
+// returnerade — och hann `start()` sätta tillbaka den till true dessförinnan såg den
+// aldrig ett false alls. Resultatet blev två motorer med varsin uppsättning fångster
+// som band om mot varandra. Ett tal kan inte återtas på det sättet: den gamla tråden
+// ser ett annat tal än sitt eget, hur många gånger flaggan än hunnit vända.
+static ENGINE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn bump_engine_generation() -> u64 {
+    ENGINE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Ren jämförelse, utbruten för att gå att testa utan att röra den globala räknaren —
+/// ett test som muterar en `static` läcker in i varje annat test som körs parallellt.
+fn generation_is_current(current: u64, mine: u64) -> bool {
+    current == mine
+}
+
+/// Är den här motortråden fortfarande den aktuella?
+fn engine_generation_is_current(mine: u64) -> bool {
+    generation_is_current(ENGINE_GENERATION.load(Ordering::SeqCst), mine)
+}
+
 // Sessionsrelativ tid (sekunder) för ett segment som börjar vid `speech_start_ms`, mätt mot
 // den delade `session.start_time`. Båda kanalerna (mic/sys) använder samma origo + samma
 // väggklocka → segmenten sorteras i rätt ordning i vyn oavsett kanal.
@@ -151,6 +179,10 @@ struct SessionState {
 }
 
 pub struct AudioMonitor {
+    /// "Finns det redan en motor?" — läses BARA av `start()` för att avgöra om en ny
+    /// tråd ska spawnas, och nollställs av motortråden när den avslutar sig själv.
+    /// Att avsluta trådar är inte längre dess jobb: det gör `ENGINE_GENERATION`, av
+    /// skälen i kommentaren där.
     is_running: Arc<Mutex<bool>>,
     is_recording: Arc<Mutex<bool>>,
     pub settings: Arc<Mutex<AudioSettings>>,
@@ -249,6 +281,9 @@ impl AudioMonitor {
             return Ok(());
         }
         *running = true;
+        // Ny motor → ny generation. Varje tråd nedan bär den, och en tråd från en
+        // tidigare motor avslutar sig själv så snart den ser att talet ändrats.
+        let my_gen = bump_engine_generation();
         let is_running = self.is_running.clone();
         let is_recording = self.is_recording.clone(); // Clone for threads
         let settings = self.settings.clone();
@@ -267,13 +302,12 @@ impl AudioMonitor {
 
             // Start Session Recorder Thread
             let app_handle_recorder = app.clone();
-            let is_running_recorder = is_running.clone();
             let is_recording_recorder = is_recording.clone();
             let session_state_recorder = session_state.clone();
             let settings_recorder = settings.clone();
 
             thread::spawn(move || {
-                start_session_recorder(session_rx, app_handle_recorder, is_running_recorder, is_recording_recorder, session_state_recorder, settings_recorder);
+                start_session_recorder(session_rx, app_handle_recorder, my_gen, is_recording_recorder, session_state_recorder, settings_recorder);
             });
 
             // --- Microphone Capture (LAT) ---
@@ -324,17 +358,14 @@ impl AudioMonitor {
             // kräver att `SysCapture` blir `Send` (den håller råa CoreAudio-pekare), och
             // gjordes inte i samma ändring som den här eftersom det inte gick att
             // runtime-verifiera i samma session.
-            let mut sys_capture = if sys_capture_worth_attempting() {
-                build_sys_capture(
-                    &host, &app, &level_tx, &session_tx, &settings, &is_recording,
-                    &session_state, None,
-                )
-            } else {
-                println!(
-                    "DEBUG: Utgången är vilande vid start — MÖTET-tappen byggs när ljud spelas"
-                );
-                None
-            };
+            // INGET startbygge längre. Det var den här platsen — bygget före loopens
+            // första mic-reconcile — som höll mikrofonen i 34,3 sekunder den 30 augusti
+            // och gav två tysta inspelningar i rad. Och en tap som byggs vid motorstart
+            // rivs aldrig, vilket höll datorn vaken i två dygn (se reconcilen nedan).
+            //
+            // MÖTET byggs numera när en inspelning startar, asynkront, av reconcilen.
+            let mut sys_capture: Option<SysCapture> = None;
+            let mut pending_sys_build = PendingSysBuild::new();
 
              // --- Main Loop: Aggregating Levels & Keeping Alive ---
              let mut current_mic = 0.0;
@@ -404,10 +435,122 @@ impl AudioMonitor {
              // Fem av nio inspelningar föll så innan orsaken var känd.
              let mut sys_fail_streak: u32 = 0;
              let mut sys_retry_at: Option<Instant> = None;
+             // När den nuvarande fångsten byggdes. Avgör om ett fel ska räknas som
+             // "den fungerade och dog" eller "den fungerade aldrig" — se
+             // `sys_capture_was_stable`, som är den grind backoffen ovan saknade.
+             // Börjar som None: ingen fångst finns förrän ett bygge levererat en, och
+             // tidpunkten sätts där resultatet installeras.
+             let mut sys_built_at: Option<Instant> = None;
+             // Senaste gången vi frågade om utgången är vaken. Throttlar sonden i
+             // reconcilen; None = "fråga direkt" (inspelningsstart, eller nyss släppt).
+             let mut last_sys_probe: Option<Instant> = None;
+             // När den nuvarande sammanhängande uppspelningen (någon ANNAN process)
+             // började. Guardrailens tystnadsgren kräver att den varat en stund.
+             let mut playing_since: Option<Instant> = None;
+
+             // Föregående varvs starttid — underlaget för hängningsdetektorn nedan.
+             let mut last_tick = Instant::now();
 
              loop {
-                if !*is_running.lock().unwrap() {
+                // Motorgenerationen, inte flaggan — se ENGINE_GENERATION för varför
+                // en flagga som kan sättas tillbaka inte kan avsluta den här tråden.
+                if !engine_generation_is_current(my_gen) {
                     break;
+                }
+
+                // --- Hängningsdetektor för övervakningsloopen ---
+                //
+                // 🔴 Det här är den enda instrumentering som hade namngett felet den
+                // 30 augusti direkt. Loopen satt då 34,3 sekunder inne i
+                // `build_mic_capture`, och eftersom reconcilen, enhetspollen och
+                // nivåaggregeringen alla bor i samma varv stod allt stilla samtidigt.
+                // Uppmätt i apploggen: mellan 13:22:12.684 ("Selected input device")
+                // och 13:22:47.013 ("Mic stream started") skrevs INTE EN RAD från den
+                // här loopen. Tre inspelningar startades och stoppades under tiden, två
+                // av dem utan mikrofon. Felet syntes alltså bara som ett HÅL i loggen —
+                // och ett hål är det svåraste som finns att upptäcka, eftersom det
+                // kräver att någon läser tidsstämplarna och undrar över mellanrummet.
+                //
+                // Raden nedan gör hålet till en utskrift. Den säger inte var loopen
+                // stod, men den säger ATT den stod, hur länge, och vid vilken tidpunkt
+                // — vilket är skillnaden mellan "något är konstigt" och en sökbar rad.
+                let tick_gap = last_tick.elapsed();
+                if loop_stalled(tick_gap) {
+                    println!(
+                        "🔴 AUDIO: övervakningsloopen stod stilla i {:.1} s — ett blockerande \
+                         anrop (enhetsbygge/enhetsenumerering) höll varvet. Mic-reconcile, \
+                         enhetspoll och nivåuppdatering var pausade hela tiden.",
+                        tick_gap.as_secs_f32()
+                    );
+                }
+                last_tick = Instant::now();
+
+                // --- Resultat från ett pågående MÖTET-bygge ---
+                // Ligger i varvets topp (~20 ms) och inte i 2s-pollen: en färdig fångst
+                // ska installeras när den är klar, inte upp till två sekunder senare.
+                if let Some(built) = pending_sys_build.poll() {
+                    let pinned_name = pending_sys_build.take_pinned();
+                    debug_assert!(sys_capture.is_none(), "bygge klart medan en fångst redan fanns");
+                    // Inspelningen kan ha stoppats medan bygget pågick. Då är fångsten
+                    // inte längre önskad, och att installera den vore att återinföra
+                    // precis den vilande tap som den lata livscykeln finns för att
+                    // undvika — den skulle sedan ligga kvar tills nästa inspelning.
+                    // 🔴 `sys_capture_wanted`, inte `!is_recording`. Villkoret MÅSTE vara
+                    // samma predikat som reconcilen använde när den beställde bygget.
+                    // Var det inte det: på Windows är en fångst önskad även i vila, medan
+                    // det här villkoret läste `is_recording` rått och släppte den —
+                    // varpå reconcilen beställde en ny i nästa varv. Bygge → släpp →
+                    // bygge, femtio gånger i sekunden, i viloläge. Exakt den churn hela
+                    // ändringsserien finns för att ta bort, införd av dess egen fix.
+                    if built.is_some() && !sys_capture_wanted(*is_recording.lock().unwrap()) {
+                        println!("DEBUG: MÖTET-bygget blev klart men fångsten är inte längre önskad — släpps");
+                        drop(built);
+                        sys_built_at = None;
+                        last_sys_probe = None;
+                        continue;
+                    }
+                    sys_capture = built;
+                    if sys_capture.is_some() {
+                        // Streaken nollas INTE här — se sys_capture_was_stable. Ett bygge
+                        // som returnerar Some säger bara att API:t tog emot anropet.
+                        sys_built_at = Some(Instant::now());
+                        if sys_fail_streak > 0 {
+                            println!(
+                                "DEBUG: MÖTET-fångsten byggd igen efter {} misslyckade försök \
+                                 — räknas som lyckad först efter {} s utan fel",
+                                sys_fail_streak,
+                                SYS_STABLE_AFTER.as_secs()
+                            );
+                        }
+                    } else {
+                        sys_built_at = None;
+                        sys_fail_streak = sys_fail_streak.saturating_add(1);
+                        let wait = sys_retry_backoff(sys_fail_streak);
+                        sys_retry_at = Some(Instant::now() + wait);
+                        println!(
+                            "DEBUG: MÖTET-fångsten kunde inte startas ({} i rad) — nytt försök om {} s",
+                            sys_fail_streak,
+                            wait.as_secs()
+                        );
+                    }
+                    // Pinnad bind som misslyckades eller föll tillbaka till default →
+                    // tillbaka till Default och endpointen i karantän, så att metersvepet
+                    // inte retry-loopar en endpoint som vägrar loopback.
+                    if let Some(name) = pinned_name {
+                        let bound_ok = sys_capture.as_ref()
+                            .map(|c| c.device_name == name)
+                            .unwrap_or(false);
+                        if !bound_ok {
+                            println!("DEBUG: Pinned bind to {:?} failed — quarantining", name);
+                            pinned_quarantine = Some((name, Instant::now()));
+                            sys_target = SysTarget::Default;
+                        }
+                    }
+                    if let Some(cap) = &sys_capture {
+                        // Ny enhet får en fräsch tystnadsfrist innan guardrail-varningen.
+                        last_sys_audible = Instant::now();
+                        let _ = app_handle_main.emit("sys-device-changed", cap.device_name.clone());
+                    }
                 }
 
                 // --- Lat mic-livscykel: håll mic-INPUT öppen bara när den behövs ---
@@ -480,6 +623,105 @@ impl AudioMonitor {
                     }
                 }
 
+                // --- Lat MÖTET-livscykel: håll tappen bara under inspelning ---
+                //
+                // 🔴 Uppmätt 2026-09-01 på den installerade appen: tappen byggdes vid
+                // motorstart och revs ALDRIG. Efter två dygns overksam körning höll den
+                // fortfarande en `PreventUserIdleSystemSleep`-spärr (namngiven
+                // `ai.sagt.motet.aggregate.context`) och den inbyggda högtalarens
+                // IO-motor. Datorn kunde alltså inte somna så länge appen var öppen, och
+                // på Apple Silicon hölls den I2S-motor som högtalare och `Digital Mic`
+                // delar igång dygnet runt.
+                //
+                // Mikrofonen fick sin lata livscykel av samma skäl ("så länge appen bara
+                // ligger öppen hålls micen INTE"); MÖTET fick den aldrig, trots att den
+                // kostar mer.
+                //
+                // Ingen konsument förlorar något: `settings-page.tsx` visar bara
+                // mic-nivån, och `control-bar.tsx` visar systemnivån enbart när
+                // `isRecording` är sant. Kontrollerat i frontend, inte antaget.
+                //
+                // ⚠️ Medveten kostnad: MÖTET är uppe först en bit in i inspelningen i
+                // stället för från sampel 0.
+                //
+                // Storleken på den kostnaden gissade jag fel på i planen ("~70 ms", ur
+                // tap-byggets egen tid 46–55 ms). Uppmätt 2026-09-02 blev det **2,5
+                // sekunder**, och orsaken är inte tappen: mic-reconcilen ligger före i
+                // samma varv och `build_mic_capture` blockerar loopen tills cpal öppnat
+                // enheten. Sekvensen ur apploggen:
+                //
+                //     21:11:03.826  Recording START
+                //     21:11:03.827  Selected input device        <- mic-bygget börjar
+                //     21:11:06.325  Mic stream started           <- 2,5 s senare
+                //     21:11:06.340  Core Audio tap startad       <- tappen 15 ms efter
+                //
+                // Tappen kostar alltså 15 ms; mic-öppningen dominerar helt. Just den
+                // körningen var första inspelningen efter ett nytt TCC-medgivande; i
+                // normalläge visar loggen 97 ms (13:56:30.839→.936) och 191 ms
+                // (17:11:04.508→.699) för samma steg.
+                //
+                // Ordningen är ändå rätt: mikrofonen är den obligatoriska kanalen och
+                // ska byggas först. Att mic-bygget självt är synkront i loopen är ett
+                // eget, kvarstående fynd — samma familj som det som just åtgärdades för
+                // MÖTET, och nu det enda blockerande anropet kvar i varvet.
+                {
+                    let sys_wanted = sys_capture_wanted(*is_recording.lock().unwrap());
+                    if sys_wanted {
+                        // Sonden kostar ett par CoreAudio-anrop, så den throttlas — men
+                        // FÖRSTA försöket sker direkt (None), annars hade varje
+                        // inspelning börjat med upp till en sekunds MÖTET-tystnad.
+                        let may_probe = sys_capture.is_none()
+                            && !pending_sys_build.is_pending()
+                            && sys_rebuild_allowed(sys_retry_at, Instant::now())
+                            && last_sys_probe
+                                .map_or(true, |t: Instant| t.elapsed() >= Duration::from_secs(1));
+                        if may_probe {
+                            last_sys_probe = Some(Instant::now());
+                            if sys_capture_worth_attempting() {
+                                let pinned_name = match &sys_target {
+                                    SysTarget::Pinned(n) => Some(n.clone()),
+                                    SysTarget::Default => None,
+                                };
+                                pending_sys_build.request(
+                                    SysBuildCtx {
+                                        app: app.clone(),
+                                        level_tx: level_tx.clone(),
+                                        session_tx: session_tx.clone(),
+                                        settings: settings.clone(),
+                                        is_recording: is_recording.clone(),
+                                        session_state: session_state.clone(),
+                                    },
+                                    pinned_name,
+                                );
+                            }
+                        }
+                    } else if sys_capture.is_some() {
+                        // ⚠️ ÖPPET FYND, medvetet lämnat. Nedrivningen sker HÄR, på
+                        // övervakningsloopens tråd: droppen kör `AudioDeviceStop`,
+                        // `AudioDeviceDestroyIOProcID`, `AudioHardwareDestroyAggregateDevice`
+                        // och `AudioHardwareDestroyProcessTap` — samma HAL som kan blockera
+                        // ~15 s vid start. Bygget flyttades till egen tråd; nedrivningen
+                        // gjorde det inte, och den gick från att ske sällan (enhetsbyte,
+                        // fel) till att ske vid VARJE inspelningsstopp.
+                        //
+                        // Varför den lämnas: uppmätt 2026-09-02 tog hela nedrivningen 7 ms
+                        // (21:35:39.255 → .262). Att göra den asynkron kräver en
+                        // reaper-tråd och en till kanal i en loop som redan fått fyra
+                        // strukturella ändringar i samma serie, och skulle byta en mätt
+                        // 7-millisekunderskostnad mot oprövad samtidighet. Händer det ändå
+                        // rapporteras det av `loop_stalled`, som finns just för att den
+                        // här sortens gap inte ska vara osynliga.
+                        println!("DEBUG: MÖTET-tappen släppt (viloläge — ej inspelning)");
+                        sys_capture = None;
+                        sys_built_at = None;
+                        current_sys = 0.0;
+                        // Nästa inspelning ska sonderas direkt, inte efter en sekund.
+                        last_sys_probe = None;
+                    } else {
+                        last_sys_probe = None;
+                    }
+                }
+
                 // Use a shorter timeout to stay responsive but drain messages
                 match level_rx.recv_timeout(Duration::from_millis(20)) {
                     Ok(input) => {
@@ -518,7 +760,11 @@ impl AudioMonitor {
                     last_emit = Instant::now();
                 }
 
-                if last_log.elapsed() > Duration::from_secs(1) {
+                // Loopens livstecken. Se `heartbeat_interval` för varför takten
+                // skiljer sig mellan inspelning och vila. Ett låstag per varv, som
+                // reconcilen ovan redan tar — inte ett nästlat villkor, som hade
+                // tagit låset 50 ggr/s under hela viloperiodens 30 sekunder.
+                if last_log.elapsed() >= heartbeat_interval(*is_recording.lock().unwrap()) {
                     println!("DEBUG: RMS Levels - Mic: {:.4}, Sys: {:.4}", current_mic, current_sys);
                     last_log = Instant::now();
                 }
@@ -657,7 +903,9 @@ impl AudioMonitor {
                     if !recording_now && matches!(sys_target, SysTarget::Pinned(_)) {
                         println!("DEBUG: Not recording — unpinning loopback, reverting to default");
                         sys_target = SysTarget::Default;
-                        force_sys_rebind = true;
+                        // Ingen `force_sys_rebind` här längre: utanför inspelning finns
+                        // ingen fångst att binda om, och att tvinga fram ett bygge vore
+                        // att återinföra just den tap som den lata livscykeln tog bort.
                     }
                     if let SysTarget::Pinned(name) = &sys_target {
                         // Meter-enumereringen i stället för cpal: output_devices() format-
@@ -668,19 +916,105 @@ impl AudioMonitor {
                             force_sys_rebind = true;
                         }
                     }
-                    let needs_rebind = force_sys_rebind || match (&sys_target, &sys_capture) {
-                        (_, Some(cap)) if cap.failed.load(Ordering::SeqCst) => true,
+                    // --- Felad fångst: riv alltid, och bokför om den aldrig fungerade ---
+                    //
+                    // Låg tidigare som en arm i `needs_rebind` nedan (`failed` => true)
+                    // och gick därmed förbi backoffen helt. Se `sys_capture_was_stable`
+                    // för varför det gav en ombyggnad var annan sekund utan tak.
+                    //
+                    // Att riva direkt är dessutom rätt oavsett när vi bygger om: en död
+                    // fångst levererar inte ett sampel men håller kvar sitt aggregat,
+                    // sin IO-kontext och — på macOS — sömnspärren.
+                    if sys_capture.as_ref().is_some_and(|c| c.failed.load(Ordering::SeqCst)) {
+                        let stable = sys_capture_was_stable(sys_built_at, Instant::now());
+                        if let Some(cap) = sys_capture.take() {
+                            println!(
+                                "DEBUG: MÖTET-fångsten felade (enhet {:?}, hann bli stabil: {}) — river",
+                                cap.device_name, stable
+                            );
+                            drop(cap);
+                        }
+                        sys_built_at = None;
+                        current_sys = 0.0;
+                        if stable {
+                            // Den fungerade i minst en halv minut och dog sedan: en
+                            // faktisk händelse i omvärlden. Bygg om direkt.
+                            //
+                            // 🔴 INGEN `force_sys_rebind` här. Fångsten är redan tagen,
+                            // så `needs_rebind`-grinden (som kräver `sys_capture.is_some()`)
+                            // kan inte fyra i det här varvet — flaggan hade blivit
+                            // strandad, reconcilen byggt en ny fångst, och NÄSTA poll
+                            // rivit den nybyggda på den kvarlämnade flaggan. Två aggregat
+                            // per återhämtning i stället för ett. Reconcilen äger
+                            // bygge-från-ingenting; den behöver ingen flagga för det.
+                            sys_fail_streak = 0;
+                            sys_retry_at = None;
+                            // Sondera direkt i nästa varv i stället för att vänta ut
+                            // throttlingen — enheten försvann just, svaret kan ha ändrats.
+                            last_sys_probe = None;
+                        } else {
+                            // Den föll i samma andetag som den byggdes. Bygget var alltså
+                            // aldrig lyckat, och ett till på samma villkor blir det inte
+                            // heller — in i trappan.
+                            sys_fail_streak = sys_fail_streak.saturating_add(1);
+                            let wait = sys_retry_backoff(sys_fail_streak);
+                            sys_retry_at = Some(Instant::now() + wait);
+                            println!(
+                                "DEBUG: MÖTET-fångsten föll direkt efter bygget ({} i rad) — nytt försök om {} s",
+                                sys_fail_streak,
+                                wait.as_secs()
+                            );
+                        }
+                    }
+
+                    // En fångst som levt igenom stabilitetsfönstret har bevisat sig.
+                    // Nollställningen bor HÄR och inte vid det lyckade bygget: ett bygge
+                    // som returnerar `Some` säger bara att CoreAudio/WASAPI tog emot
+                    // anropet, och att kalla det ett lyckat försök är precis det som
+                    // gjorde att trappan aldrig kunde klättra.
+                    if sys_fail_streak > 0
+                        && sys_capture.is_some()
+                        && sys_capture_was_stable(sys_built_at, Instant::now())
+                    {
+                        println!(
+                            "DEBUG: MÖTET-fångsten stabil i {} s — nollställer felräknaren (var {})",
+                            SYS_STABLE_AFTER.as_secs(), sys_fail_streak
+                        );
+                        sys_fail_streak = 0;
+                        sys_retry_at = None;
+                    }
+
+                    // 🔴 Aldrig ett andra bygge medan ett pågår. Två samtidiga byggen
+                    // vore två aggregat, alltså exakt den churn hela den här historiken
+                    // handlar om. `force_sys_rebind` nollställs INTE här utan inne i
+                    // grenen, så en begäran som krockar med ett pågående bygge går fram
+                    // vid nästa poll i stället för att tappas.
+                    // 🔴 Pollen BESLUTAR, reconcilen BYGGER. Att bygga från `None`
+                    // hörde tidigare hemma här, men efter den lata livscykeln finns det
+                    // beslutet i reconcilen (som vet om en inspelning pågår och kör var
+                    // ~20 ms i stället för var 2 s). Ett enda byggställe — samma regel
+                    // som mic-vägen redan följer.
+                    //
+                    // Kvar här: byte av utenhet mitt i en inspelning, och `force` efter
+                    // ett follow-the-audio-målbyte. Båda kräver en BEFINTLIG fångst att
+                    // binda om, och båda är meningslösa utanför inspelning.
+                    //
+                    // `sys_capture.is_some()` är lastbärande, inte defensivt: utan det
+                    // kunde ett `force_sys_rebind` som blivit kvar från förra sessionens
+                    // metersvep starta ett bygge HÄR, förbi reconcilens
+                    // `sys_capture_worth_attempting()`-gate — alltså en tap mot en
+                    // möjligen vilande utgång, vilket är hela felet som grinden finns för.
+                    // `sys_capture_wanted` och inte `recording_now`: på Windows ska
+                    // ombindning vid utgångsbyte ske även utanför inspelning, precis som
+                    // före den lata livscykeln.
+                    let needs_rebind = sys_capture_wanted(recording_now)
+                        && !pending_sys_build.is_pending()
+                        && sys_capture.is_some()
+                        && (force_sys_rebind || match (&sys_target, &sys_capture) {
                         (SysTarget::Default, Some(cap)) =>
                             default_out_name.as_deref() != Some(cap.device_name.as_str()),
-                        // Backoff gäller BARA den här armen: den är den enda som är
-                        // sann enbart för att fångsten saknas. De andra utlöses av en
-                        // faktisk händelse (failed-flagga, bytt utenhet) och ska gå
-                        // igenom direkt. `force_sys_rebind` går också före backoffen.
-                        (SysTarget::Default, None) => default_out_name.is_some()
-                            && sys_rebuild_allowed(sys_retry_at, Instant::now())
-                            && sys_capture_worth_attempting(),
-                        (SysTarget::Pinned(_), _) => false,
-                    };
+                        _ => false,
+                    });
                     if needs_rebind {
                         force_sys_rebind = false;
                         let pinned_name = match &sys_target {
@@ -698,49 +1032,21 @@ impl AudioMonitor {
                             drop(cap);
                         }
                         current_sys = 0.0;
-                        sys_capture = build_sys_capture(
-                            &host, &app, &level_tx, &session_tx, &settings, &is_recording, &session_state,
-                            pinned_name.as_deref(),
+                        // Bygget sker utanför loopen; resultatet installeras i varvets
+                        // topp. Allt som förut låg här — streak, backoff, karantän,
+                        // sys-device-changed — bor nu i den grenen, eftersom det är där
+                        // utfallet är känt.
+                        pending_sys_build.request(
+                            SysBuildCtx {
+                                app: app.clone(),
+                                level_tx: level_tx.clone(),
+                                session_tx: session_tx.clone(),
+                                settings: settings.clone(),
+                                is_recording: is_recording.clone(),
+                                session_state: session_state.clone(),
+                            },
+                            pinned_name,
                         );
-                        if sys_capture.is_some() {
-                            if sys_fail_streak > 0 {
-                                println!(
-                                    "DEBUG: MÖTET-fångsten igång igen efter {} misslyckade försök",
-                                    sys_fail_streak
-                                );
-                            }
-                            sys_fail_streak = 0;
-                            sys_retry_at = None;
-                        } else {
-                            sys_fail_streak = sys_fail_streak.saturating_add(1);
-                            let wait = sys_retry_backoff(sys_fail_streak);
-                            sys_retry_at = Some(Instant::now() + wait);
-                            println!(
-                                "DEBUG: MÖTET-fångsten kunde inte startas ({} i rad) — nytt försök om {} s",
-                                sys_fail_streak,
-                                wait.as_secs()
-                            );
-                        }
-                        // Pinned-bind som misslyckades eller föll tillbaka till default →
-                        // återgå till Default och sätt endpointen i karantän så att
-                        // metersvepet inte retry-loopar en endpoint som vägrar loopback
-                        // (vissa BT-HFP-endpoints gör det).
-                        if let Some(name) = pinned_name {
-                            let bound_ok = sys_capture.as_ref()
-                                .map(|c| c.device_name == name)
-                                .unwrap_or(false);
-                            if !bound_ok {
-                                println!("DEBUG: Pinned bind to {:?} failed — quarantining", name);
-                                pinned_quarantine = Some((name, Instant::now()));
-                                sys_target = SysTarget::Default;
-                            }
-                        }
-                        if let Some(cap) = &sys_capture {
-                            // Ny enhet får en fräsch tystnadsfrist innan guardrail-varningen.
-                            last_sys_audible = Instant::now();
-                            // Synligt för frontend/support — vilken endpoint MÖTET följer nu.
-                            let _ = app_handle_main.emit("sys-device-changed", cap.device_name.clone());
-                        }
                     }
 
                     // Guardrail "audio-warning": inspelning aktiv ≥ 5 s utan loopback
@@ -750,6 +1056,30 @@ impl AudioMonitor {
                     // problemet tills efteråt. 10 s → 5 s: i möteskontext är varje
                     // förlorad replik dyr, och follow-the-audio-switchen har redan
                     // hunnit försöka innan varningen fyrar.
+                    // 🔴 EN sondering per poll, delad av diagnosraden och båda
+                    // guardrail-besluten. Sonden enumererar systemets process-objekt och
+                    // gör två CoreAudio-anrop per objekt — tiotals IPC-anrop mot
+                    // coreaudiod, på den tråd som inte får blockera. Att anropa den två
+                    // eller tre gånger per varv vore att fördubbla just den exponering
+                    // som resten av den här ändringsserien handlar om att minska.
+                    let playing_now = if recording_now {
+                        someone_else_is_playing()
+                    } else {
+                        None
+                    };
+                    // Sammanhängande uppspelning måste ha en STARTTID — se
+                    // SUSTAINED_PLAYBACK. `Some(false)`, `None` och "inte längre
+                    // inspelning" nollar alla, så en ny uppspelning börjar om från noll.
+                    match playing_now {
+                        Some(true) => {
+                            if playing_since.is_none() {
+                                playing_since = Some(Instant::now());
+                            }
+                        }
+                        _ => playing_since = None,
+                    }
+                    let playing_for = playing_since.map(|t: Instant| t.elapsed());
+
                     if recording_now {
                         if rec_state.is_none() {
                             // Start-kant: färskt per-inspelnings-state (RecordingState::new).
@@ -782,12 +1112,45 @@ impl AudioMonitor {
                             sys_retry_at = None;
                             // Pre-flight: startar inspelningen helt utan loopback finns
                             // inget att vänta på — varna omedelbart.
-                            if sys_capture.is_none() {
+                            //
+                            // 🔴 ...men inte medan ett bygge pågår. Med den lata
+                            // livscykeln begärs tappen först när inspelningen startar,
+                            // så ett pågående bygge är NORMALFALLET de första
+                            // tiondelarna av varje session. Utan det här villkoret hade
+                            // varje inspelning som råkar starta strax före en 2s-poll
+                            // fått "Systemljud är inte tillgängligt" — en varning som
+                            // motsäger sig själv en bråkdel av en sekund senare, och det
+                            // säkraste sättet att lära användaren att ignorera bannern.
+                            if sys_capture.is_none()
+                                && !pending_sys_build.is_pending()
+                                && missing_capture_is_a_problem(playing_now)
+                            {
                                 let _ = app_handle_main
                                     .emit("audio-warning", rec.fire_preflight_warning());
                             }
                             rec_state = Some(rec);
                         }
+
+                        // Guardrailens INDATA, en gång per poll under inspelning. Raden
+                        // finns för att ett supportärende ska gå att avgöra utan att
+                        // gissa: varför varnade den, eller varför varnade den inte.
+                        // Kostar 30 rader per minuts inspelning — försumbart mot de
+                        // 43 644 tystnadsrader i viloläge som fynd 7 tog bort.
+                        //
+                        // 🔴 Ligger EFTER start-kanten, inte före. Start-kanten nollställer
+                        // `last_sys_audible`, så raden ovanför den visade tiden sedan
+                        // MOTORSTART i stället för sedan inspelningsstart. Uppmätt på
+                        // Windows 2026-09-08: `bunden_tystnad=2509s` på första raden i en
+                        // inspelning, `2s` på nästa. Ofarligt för logiken, men en logg som
+                        // ska läsas i ett supportärende får inte inleda varje inspelning
+                        // med ett tal som ser ut som ett fel.
+                        println!(
+                            "DEBUG: MÖTET-diagnos: fångst={}, bygge_pågår={}, annan_uppspelning={:?}, bunden_tystnad={:.0}s",
+                            sys_capture.is_some(),
+                            pending_sys_build.is_pending(),
+                            playing_now,
+                            last_sys_audible.elapsed().as_secs_f32()
+                        );
                     } else {
                         // Stopp-kant: släck banner som hör till inspelningen — droppen av
                         // RecordingState ÄR nollställningen av övrigt per-inspelnings-state.
@@ -799,27 +1162,77 @@ impl AudioMonitor {
                                 let _ = app_handle_main.emit("audio-warning-cleared", ());
                             }
                         }
+                        // En `force` som satts av metersvepet strax före stopp hör till
+                        // den avslutade inspelningen och får inte följa med in i nästa.
+                        force_sys_rebind = false;
                     }
 
-                    // Tystnadsgrenen kräver att NÅGON endpoint varit hörbar nyligen:
-                    // varningen betyder "det låter någonstans men vi fångar det inte".
-                    // Ren diktering utan uppspelning är äkta tystnad — inget falsklarm.
-                    // Saknad loopback varnar däremot ovillkorligt (urdragen utgång ska
-                    // ge banner även om inget råkar spelas just då).
+                    // Tystnadsgrenen: varningen betyder "det låter någonstans men vi
+                    // fångar det inte". Ren diktering utan uppspelning är äkta tystnad
+                    // och ska inte ge banner.
+                    //
+                    // Underlaget för "det låter någonstans" skiljer sig per plattform:
+                    // Windows läser metersvepet, macOS process-sonden. Se
+                    // `someone_else_is_playing` för varför macOS saknade svar helt.
                     if let Some(rec) = rec_state.as_mut() {
-                        if rec.silence_warning_ready()
-                            && (sys_capture.is_none()
-                                || (last_sys_audible.elapsed() >= Duration::from_secs(5)
-                                    && rec.last_any_endpoint_audible
-                                        .is_some_and(|t| t.elapsed() < Duration::from_secs(5))))
-                        {
-                            let _ = app_handle_main
-                                .emit("audio-warning", rec.fire_silence_warning());
+                        if rec.silence_warning_ready() {
+                            let windows_endpoint_audible = rec
+                                .last_any_endpoint_audible
+                                .is_some_and(|t| t.elapsed() < Duration::from_secs(5));
+                            let bound_silent =
+                                last_sys_audible.elapsed() >= Duration::from_secs(5);
+                            let problem = if sys_capture.is_none() {
+                                !pending_sys_build.is_pending()
+                                    && missing_capture_is_a_problem(playing_now)
+                            } else {
+                                bound_silent
+                                    && silent_capture_is_a_problem(
+                                        playing_for,
+                                        windows_endpoint_audible,
+                                    )
+                            };
+                            if problem {
+                                // 🔴 Varningen loggas. Den emitterades tidigare bara som
+                                // Tauri-event, så när en användare 2026-09-08 rapporterade
+                                // en gul banner gick det inte att se i loggen ATT den
+                                // fyrat — bara att räkna ut det ur diagnosradens indata.
+                                // Ett larm som inte lämnar spår är svårt att felsöka av
+                                // exakt samma skäl som en tyst degradering är det.
+                                println!(
+                                    "AUDIO: tystnadsvarning fyrar (fångst={}, uppspelning_i={:?}, bunden_tystnad={:.0}s)",
+                                    sys_capture.is_some(),
+                                    playing_for,
+                                    last_sys_audible.elapsed().as_secs_f32()
+                                );
+                                let _ = app_handle_main
+                                    .emit("audio-warning", rec.fire_silence_warning());
+                            }
                         }
                     }
                 }
              }
-             println!("DEBUG: Audio listener loop exited");
+             // Städa flaggan — men BARA om vi fortfarande är den aktuella motorn.
+             //
+             // Två skäl. En tråd som avslutas för att en nyare motor startat får inte
+             // släcka den nyares flagga. Och utan städningen alls fanns hålet åt andra
+             // hållet: bryter loopen av något annat skäl än stop() står `is_running`
+             // kvar på true, och varje senare `init_audio_engine` blir en tyst no-op —
+             // appen har då ingen ljudmotor och inget sätt att få en.
+             //
+             // Kontrollen sker UNDER låset, inte bredvid det. Utanför fanns ett fönster
+             // där start() hann läsa flaggan som true (och returnera "kör redan") strax
+             // innan vi satte den till false — resultatet hade blivit noll motorer och
+             // en flagga som sa att allt var i sin ordning. Med båda under samma lås är
+             // de två utfallen de enda möjliga: antingen hinner start() först och har
+             // då redan bumpat generationen (vi rör inget), eller så hinner vi först och
+             // start() ser ett ärligt false.
+             {
+                 let mut running = is_running.lock().unwrap();
+                 if engine_generation_is_current(my_gen) {
+                     *running = false;
+                 }
+             }
+             println!("DEBUG: Audio listener loop exited (generation {})", my_gen);
         });
 
         Ok(())
@@ -850,7 +1263,12 @@ impl AudioMonitor {
     pub fn stop(&self) {
         let mut running = self.is_running.lock().unwrap();
         *running = false;
-        println!("DEBUG: Stop signal sent");
+        // Bumpa generationen: det är DEN som faktiskt avslutar trådarna. Flaggan här
+        // säger bara till en framtida start() att den får spawna på nytt.
+        // `gen` som variabelnamn undviks med flit: det blir ett nyckelord i
+        // Rust-edition 2024, och en editionsbump ska inte fälla en orelaterad fil.
+        let ny_generation = bump_engine_generation();
+        println!("DEBUG: Stop signal sent (motorgeneration nu {})", ny_generation);
     }
 }
 
@@ -1127,11 +1545,101 @@ type SysStream = cpal::Stream;
 #[cfg(target_os = "macos")]
 type SysStream = crate::mac_sysaudio::MacSysStream;
 
-/// Väntetid innan MÖTET-fångsten får försöka igen efter ett misslyckande.
+/// Avkodar HTML-entiteter som KB-Whisper matar ut i klartext.
 ///
-/// 5 s → 15 s → 60 s → tak 5 min. Taket finns för att ett fel som inte går över
-/// av sig själv (ingen utenhet, nekad TCC, trasig drivrutin) annars kostar ett
-/// aggregat var 14:e sekund resten av sessionen.
+/// # Varför den behövs
+///
+/// Modellen skriver ibland ut bokstavliga entiteter i stället för tecknet. Uppmätt
+/// 2026-08-30 med den bundlade `whisper-cli` och `ggml-kb-whisper-small.bin`:
+///
+/// ```text
+/// talat:  "Intäkterna ligger nio procent över plan"
+/// utdata: "Intäkterna ligger 9&nbsp;% över plan"
+/// ```
+///
+/// Råa bytes bekräftade med `xxd`: `39 26 6e 62 73 70 3b 25` — alltså ASCII-tecknen
+/// `&nbsp;`, inte ett U+00A0. Ingenting städade dem, och eftersom React escapar text
+/// såg användaren strängen `&nbsp;` mitt i sitt transkript.
+///
+/// Felet är **indataberoende, inte slumpmässigt**: samma ljud ger samma utdata
+/// (beam-size 1 är deterministisk). Ett testklipp gav entiteten i två av två
+/// körningar, ett annat gav vanligt mellanslag i samma position. Sällsynt men
+/// reproducerbart per inspelning — alltså inget man kan vänta ut.
+///
+/// `&nbsp;` blir U+00A0, inte ett vanligt mellanslag: det är vad entiteten betyder,
+/// och hårt mellanslag före `%` är dessutom typografiskt korrekt på svenska.
+///
+/// # Varför en enda genomgång och inte kedjade `replace`
+///
+/// Kedjade ersättningar måste avkoda `&amp;` sist, annars blir `&amp;nbsp;` — den
+/// korrekta kodningen av den BOKSTAVLIGA texten `&nbsp;` — felaktigt till ett
+/// mellanslag. En genomgång vänster till höger kan inte göra det misstaget.
+///
+/// # ⚠️ Täcker BARA den lokala vägen
+///
+/// Funktionen appliceras där `whisper-cli`:s stdout tolkas. **Molnvägen (Pro) går via
+/// backend och passerar aldrig här.** Molnet kör KB-Whisper Large — samma modellfamilj
+/// som den lokala small-modellen — så samma entitetsbeteende är rimligt att vänta sig,
+/// men det är **overifierat**: molnmodellen har inte kunnat köras vid skrivandet.
+///
+/// Står här i stället för att antas, just därför att skillnaden är lätt att missa: en
+/// Pro-användare kan se `9&nbsp;%` trots den här fixen, och felet ser då ut att vara
+/// olöst. Rätt lösning är antingen samma avkodning i backend eller en gemensam punkt
+/// som båda vägarna passerar.
+fn avkoda_entiteter(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut ut = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('&') {
+        ut.push_str(&rest[..start]);
+        let efter = &rest[start..];
+        // En entitet är kort. Ligger nästa `;` längre bort är `&` bara ett vanligt
+        // et-tecken i texten, och får inte sluka resten av meningen.
+        match efter[1..].find(';').filter(|p| *p <= 8) {
+            Some(p) => {
+                let namn = &efter[1..1 + p];
+                match entitet_till_tecken(namn) {
+                    Some(c) => ut.push(c),
+                    // Okänd entitet lämnas ORÖRD. Att gissa vore värre än att låta den
+                    // stå: transkriptet är användarens ord, inte våra.
+                    None => {
+                        ut.push('&');
+                        ut.push_str(namn);
+                        ut.push(';');
+                    }
+                }
+                rest = &efter[p + 2..];
+            }
+            None => {
+                ut.push('&');
+                rest = &efter[1..];
+            }
+        }
+    }
+    ut.push_str(rest);
+    ut
+}
+
+fn entitet_till_tecken(namn: &str) -> Option<char> {
+    match namn {
+        "nbsp" => Some('\u{00A0}'),
+        "amp" => Some('&'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        _ => namn.strip_prefix('#').and_then(|n| {
+            let kod = match n.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => n.parse::<u32>().ok()?,
+            };
+            char::from_u32(kod)
+        }),
+    }
+}
+
 /// Får MÖTET-fångsten byggas om nu, givet backoffen?
 ///
 /// Egen ren funktion i stället för ett inline-villkor: grinden satt tidigare mitt
@@ -1139,6 +1647,194 @@ type SysStream = crate::mac_sysaudio::MacSysStream;
 /// vänta på att felet skulle inträffa. Nu går den att testa.
 fn sys_rebuild_allowed(retry_at: Option<Instant>, now: Instant) -> bool {
     retry_at.map_or(true, |t| now >= t)
+}
+
+/// Ett loopvarv som tagit längre tid än så har inte varit långsamt — det har stått
+/// stilla. Övervakningsloopen tickar var ~20 ms (`recv_timeout`) och dess tyngsta
+/// planerade arbete är 2s-pollen, så tröskeln ligger med bred marginal över allt
+/// normalt och under den ~14 s ett misslyckat CoreAudio-bygge kostar.
+const LOOP_STALL_AFTER: Duration = Duration::from_secs(5);
+
+/// Ovanför det här är gapet inte ett blockerande anrop längre.
+///
+/// ⚠️ Taket finns för en fråga jag inte kunnat KÖRA: om `Instant` på macOS räknar
+/// tid då datorn varit i vila. Gör den det, får varje uppvaknande ur lockläge ett
+/// gap på timmar, och detektorn skulle skriva "loopen stod stilla i 28 800 s" —
+/// ett självsäkert påstående om något som aldrig hänt, i just den logg den här
+/// ändringen städar. Att verifiera det kräver att maskinen faktiskt sover, vilket
+/// inte gick att göra här.
+///
+/// Taket gör frågan betydelselös i stället för besvarad: allt loopen realistiskt
+/// kan blockera på ligger under det. Uppmätt tak i praktiken är CoreAudios
+/// starttimeout (~15 s) och det värsta observerade fallet 34,3 s
+/// (`build_mic_capture`, 2026-08-30) — 120 s är 3,5× det. Ett gap däröver kommer
+/// från omvärlden, inte från ett anrop, och tigs därför ihjäl. Priset är att en
+/// hypotetisk blockering längre än två minuter inte får någon egen rad; den syns
+/// fortfarande som ett hål i livstecknet.
+const LOOP_STALL_CEILING: Duration = Duration::from_secs(120);
+
+/// Har övervakningsloopen stått stilla mellan två varv?
+fn loop_stalled(gap: Duration) -> bool {
+    gap >= LOOP_STALL_AFTER && gap <= LOOP_STALL_CEILING
+}
+
+/// Hur ofta loopens livstecken (`RMS Levels`) skrivs.
+///
+/// Under inspelning varje sekund: nivåerna per kanal ÄR diagnosen. En kanal som
+/// ligger på 0.0000 hela sessionen är skillnaden mellan "tyst möte" och "mikrofonen
+/// spelade aldrig in något", och den syns ingen annanstans i loggen.
+///
+/// I vila var 30:e sekund. Raden skrevs tidigare en gång per sekund oavsett läge,
+/// och det gjorde loggen närmast obrukbar för sitt syfte — uppmätt på den
+/// installerade appen 2026-09-01, efter drygt två dygns körning:
+///
+/// ```text
+/// 43 644 av 43 851 rader (99,5 %) var det här livstecknet i viloläge
+/// 207 rader var allt annat — fem inspelningar, en enhetsbindning, en rebind
+/// ```
+///
+/// Rotationen vid 5 MB tar därmed ~ett dygns overksam körning, och en användare
+/// som hör av sig om gårdagens möte har redan fått incidenten överskriven av
+/// tystnadsrader. Med 30 s i vila räcker samma 5 MB en månad, medan takten under
+/// inspelning — den enda tid nivåerna säger något — är oförändrad.
+///
+/// Loopens liveness täcks inte av den här raden längre utan av `loop_stalled`,
+/// som rapporterar hål aktivt i stället för att lämna dem åt en läsare att upptäcka.
+fn heartbeat_interval(recording: bool) -> Duration {
+    if recording {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
+/// Ska MÖTET-fångsten hållas vid liv just nu?
+///
+/// **macOS: bara under inspelning.** En levande tap håller `PreventUserIdleSystemSleep`
+/// och den I2S-motor som högtalare och `Digital Mic` delar — uppmätt 2026-09-01 höll en
+/// overksam app båda i två dygn.
+///
+/// **Windows: alltid, som förut.** WASAPI-loopbacken har ingen motsvarande kostnad.
+///
+/// Det stod här som ett ANTAGANDE när gaten skrevs 2026-09-02, och antagandet var
+/// motiveringen för hela plattformsgränsen — vilket var en rad för mycket att lita på.
+/// Uppmätt 2026-09-08 på en Windows-maskin med `powercfg /requests`, med loopbacken
+/// bunden och appen overksam i 41 minuter:
+///
+/// ```text
+/// overksam, loopback bunden:  SYSTEM: None
+/// under inspelning:           SYSTEM: Driver: Realtek High Definition Audio
+/// ```
+///
+/// Den bundna loopbacken hindrar alltså inte systemet från att sova, och begäran under
+/// inspelning är korrekt — då ska datorn hållas vaken. Ingen motsvarighet till macOS
+/// `PreventUserIdleSystemSleep`, som hölls i två dygn av en overksam app.
+///
+/// (`powercfg /requests` har ingen `AUDIO`-rubrik; det är `SYSTEM` som gäller.)
+///
+/// Ett macOS-fix ska ändå inte ändra beteendet på plattformen det inte handlar om —
+/// men nu vilar gränsen på en mätning i stället för på min gissning.
+#[cfg(target_os = "macos")]
+fn sys_capture_wanted(recording: bool) -> bool {
+    recording
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sys_capture_wanted(_recording: bool) -> bool {
+    true
+}
+
+/// Spelar någon ANNAN process ut ljud just nu? `None` = går inte att avgöra.
+///
+/// Guardrail-varningen behöver veta om det finns något att fånga. På Windows besvaras
+/// den frågan av metersvepet (`last_any_endpoint_audible`); på macOS returnerar svepet
+/// alltid tom vektor, och fältet var därför ALLTID `None` — varningen blev binär:
+/// falsklarm vid ren diktering, och helt tyst när tappen fanns men gav nollor.
+///
+/// `None` på Windows är därför inte ett fel utan ett "den här plattformen svarar på
+/// frågan någon annanstans", och anropsplatsen faller tillbaka på exakt det beteende
+/// som gällde innan sonden fanns. Detsamma gäller en macOS-version där process-API:t
+/// inte går att läsa.
+#[cfg(target_os = "macos")]
+fn someone_else_is_playing() -> Option<bool> {
+    crate::mac_sysaudio::other_process_is_playing()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn someone_else_is_playing() -> Option<bool> {
+    None
+}
+
+/// Ska en SAKNAD MÖTET-fångst varna användaren just nu?
+///
+/// Ja om vi inte vet bättre. Nej bara när vi VET att ingen spelar något — då finns
+/// inget mötesljud att missa, och en banner vore ett falsklarm på det vanligaste av
+/// alla lägen (diktering utan uppspelning). Att ett `None` varnar är avsiktligt: det
+/// bevarar Windows-beteendet ("urdragen utgång ska ge banner även om inget råkar
+/// spelas just då") oförändrat.
+fn missing_capture_is_a_problem(playing: Option<bool>) -> bool {
+    playing != Some(false)
+}
+
+/// Hur länge någon annan måste ha spelat innan vår tystnad blir ett bevis.
+///
+/// 🔴 Utan den här fördröjningen fyrade varningen på ljudets FRAMKANT. Uppmätt på den
+/// signerade betan 2026-09-08:
+///
+/// ```text
+/// 15:24:23.117  fångst=true, annan_uppspelning=Some(true), bunden_tystnad=6s  → varning
+/// 15:24:23.177  Speech TRIGGERED on MÖTET at RMS: 0.0617   <- 60 ms senare hörde vi det
+/// ```
+///
+/// Sonden ser att en process börjat mata ut ljud innan vårt eget resamplade 50 ms-block
+/// hunnit fram. I det glappet ser tillståndet exakt ut som "de spelar och vi är döva",
+/// och 2s-pollen råkar sampla där. Med intermittent ljud — någon som talar med pauser
+/// längre än fem sekunder, alltså ett helt vanligt möte — träffar den regelbundet.
+const SUSTAINED_PLAYBACK: Duration = Duration::from_secs(5);
+
+/// Ska en TYST men existerande fångst varna?
+///
+/// Bara när någon annan spelat SAMMANHÄNGANDE en stund och vi ändå inte hört något. Det
+/// är TCC-fallet: macOS nekar systemljud helt tyst — varje anrop returnerar noErr och
+/// varje sampel är 0.0 — så "det låter i datorn men vår ström är digitalt tyst" är den
+/// enda observerbara skillnaden mellan ett återkallat medgivande och ett tyst möte.
+///
+/// `playing_for` = hur länge den nuvarande uppspelningen pågått, `None` = ingen pågår.
+/// Windows-vägen skickar i stället `windows_endpoint_audible`, som redan är utjämnad:
+/// metersvepet svarar "någon endpoint hördes inom 5 s", inte "hörs just nu". Det var
+/// den asymmetrin som gjorde macOS-grenen känslig för framkanten.
+fn silent_capture_is_a_problem(
+    playing_for: Option<Duration>,
+    windows_endpoint_audible: bool,
+) -> bool {
+    windows_endpoint_audible || playing_for.is_some_and(|d| d >= SUSTAINED_PLAYBACK)
+}
+
+/// Hur länge en MÖTET-fångst måste ha levt för att räknas som fungerande.
+const SYS_STABLE_AFTER: Duration = Duration::from_secs(30);
+
+/// Hann fångsten bli stabil innan den föll?
+///
+/// Skiljer två fall som ser exakt likadana ut i `failed`-flaggan:
+///
+/// * en ström som körde i minuter och sedan dog (hörluren drogs ur, samplerate
+///   omförhandlades) — en genuin händelse som ska ge en omedelbar ombyggnad, och
+///
+/// * en ström som dog i samma andetag som den byggdes — vilket betyder att bygget
+///   aldrig fungerade, hur `Ok` det än såg ut.
+///
+/// 🔴 Skillnaden är hela poängen med funktionen. Backoffen som infördes 2026-08-30
+/// sitter på armen `(SysTarget::Default, None)` i `needs_rebind`, alltså på fallet
+/// "ingen fångst finns". Det andra fallet ovan går aldrig genom den armen: bygget
+/// returnerar `Some`, streaken nollställs som efter ett lyckat försök, och nästa
+/// 2s-poll ser `failed`-flaggan och river och bygger om — var annan sekund, i all
+/// evighet, utan att någon räknare någonsin växer. Det är samma felform som gav 53
+/// aggregat på tre timmar, fast med sju gånger tätare kadens, och den fanns kvar i
+/// samma `match` som fixen skrevs in i.
+///
+/// `None` (inget bygge gjort) är per definition inte stabilt.
+fn sys_capture_was_stable(built_at: Option<Instant>, now: Instant) -> bool {
+    built_at.map_or(false, |t| now.saturating_duration_since(t) >= SYS_STABLE_AFTER)
 }
 
 /// Är det meningsfullt att försöka bygga MÖTET-fångsten just nu?
@@ -1178,6 +1874,11 @@ fn sys_capture_worth_attempting() -> bool {
     true
 }
 
+/// Väntetid innan MÖTET-fångsten får försöka igen efter ett misslyckande.
+///
+/// 5 s → 15 s → 60 s → tak 5 min. Taket finns för att ett fel som inte går över
+/// av sig själv (ingen utenhet, nekad TCC, trasig drivrutin) annars kostar ett
+/// aggregat var 14:e sekund resten av sessionen.
 fn sys_retry_backoff(streak: u32) -> Duration {
     match streak {
         0 | 1 => Duration::from_secs(5),
@@ -1185,6 +1886,144 @@ fn sys_retry_backoff(streak: u32) -> Duration {
         3 => Duration::from_secs(60),
         _ => Duration::from_secs(300),
     }
+}
+
+/// Allt ett MÖTET-bygge behöver, i ägd form så att det kan flyttas till en egen tråd.
+#[derive(Clone)]
+struct SysBuildCtx {
+    app: AppHandle,
+    level_tx: Sender<AudioInput>,
+    session_tx: Sender<SessionChunk>,
+    settings: Arc<Mutex<AudioSettings>>,
+    is_recording: Arc<Mutex<bool>>,
+    session_state: Arc<Mutex<SessionState>>,
+}
+
+/// Ett pågående bygge av MÖTET-fångsten.
+///
+/// # Varför bygget inte längre sker inline
+///
+/// `build_sys_capture` anropades tidigare mitt i övervakningsloopen. På macOS kan
+/// `AudioDeviceStart` på ett aggregat blockera ~15 sekunder innan det faller med
+/// `0x3C` (ETIMEDOUT), och under tiden står ALLT annat i loopen stilla — mic-reconcile,
+/// enhetspoll, nivåuppdatering. Uppmätt värsta fall 2026-08-30: **34,3 sekunder**, med
+/// tre inspelningar startade och stoppade inuti blockeringen, varav två helt utan
+/// mikrofon. Mikrofonen är den obligatoriska kanalen och får aldrig vara gisslan hos
+/// den valfria.
+///
+/// # Varför plattformarna delar tillståndsmaskin men inte tråd
+///
+/// macOS bygger på en egen tråd; Windows bygger synkront i `request()` och lämnar
+/// resultatet i kanalen, så det plockas upp av nästa `poll()` ~20 ms senare. Det ger
+/// EN kodväg i loopen i stället för två cfg-grenar mitt i beslutslogiken.
+///
+/// Windows kan inte bygga på tråd: cpal:s WASAPI-`Stream` håller en rå `HANDLE` och är
+/// inte `Send`. ⚠️ Det ledet går inte att kompilera härifrån och är alltså inte
+/// verifierat — men blockeringsproblemet är macOS-specifikt (WASAPI-loopback binder mot
+/// endpointen oavsett om någon spelar), så Windows-vägen har inget att vinna på bytet
+/// och lämnas med sitt beprövade beteende.
+struct PendingSysBuild {
+    rx: Option<Receiver<Option<SysCapture>>>,
+    /// Vilken endpoint bygget begärdes mot (follow-the-audio). Måste överleva bygget:
+    /// karantänsbeslutet efteråt behöver veta vad som försöktes.
+    pinned: Option<String>,
+}
+
+impl PendingSysBuild {
+    fn new() -> Self {
+        Self { rx: None, pinned: None }
+    }
+
+    /// Pågår ett bygge? Anroparen får aldrig starta ett andra — två samtidiga byggen
+    /// vore två aggregat, alltså exakt den churn hela historiken handlar om.
+    fn is_pending(&self) -> bool {
+        self.rx.is_some()
+    }
+
+    fn request(&mut self, ctx: SysBuildCtx, pinned: Option<String>) {
+        debug_assert!(!self.is_pending(), "två samtidiga MÖTET-byggen");
+        self.pinned = pinned.clone();
+        self.rx = Some(spawn_sys_build(ctx, pinned));
+    }
+
+    /// `None` = fortfarande pågående. `Some(resultat)` = klart, och kanalen är tömd.
+    ///
+    /// En avbruten byggtråd (kanalen nedkopplad utan värde) behandlas som ett
+    /// misslyckat bygge: det är sant, och alternativet vore ett `is_pending` som
+    /// aldrig blir falskt och en MÖTET-kanal som aldrig byggs om.
+    fn poll(&mut self) -> Option<Option<SysCapture>> {
+        let rx = self.rx.as_ref()?;
+        match rx.try_recv() {
+            Ok(result) => {
+                self.rx = None;
+                Some(result)
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.rx = None;
+                eprintln!("DEBUG: MÖTET-byggtråden försvann utan resultat");
+                Some(None)
+            }
+        }
+    }
+
+    /// Namnet bygget begärdes mot, konsumerat i samma veva som resultatet.
+    fn take_pinned(&mut self) -> Option<String> {
+        self.pinned.take()
+    }
+}
+
+fn run_sys_build(ctx: &SysBuildCtx, pinned: Option<&str>) -> Option<SysCapture> {
+    // Egen host: `cpal::Host` är en unit-struct på både macOS och Windows, så det här
+    // kostar ingenting och slipper skicka en referens över trådgränsen.
+    let host = cpal::default_host();
+    build_sys_capture(
+        &host,
+        &ctx.app,
+        &ctx.level_tx,
+        &ctx.session_tx,
+        &ctx.settings,
+        &ctx.is_recording,
+        &ctx.session_state,
+        pinned,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_sys_build(ctx: SysBuildCtx, pinned: Option<String>) -> Receiver<Option<SysCapture>> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    // Kopian finns för felvägen: `spawn` konsumerar closuren (och därmed ctx) även när
+    // den failar, så utan den hade ett misslyckat trådstart inte gått att falla tillbaka
+    // ifrån. Klonen är fyra Arc/Sender och ett AppHandle — den kostar ingenting.
+    let ctx_fallback = ctx.clone();
+    let pinned_fallback = pinned.clone();
+    let tx_fallback = tx.clone();
+
+    let spawned = thread::Builder::new()
+        .name("motet-build".into())
+        .spawn(move || {
+            // Skickas resultatet inte fram (motorn avslutades under bygget) droppas
+            // fångsten HÄR, på den här tråden. Det är hela skälet till att
+            // `MacSysStream` är `Send`.
+            let _ = tx.send(run_sys_build(&ctx, pinned.as_deref()));
+        });
+
+    if let Err(e) = spawned {
+        // Hellre en blockerad loop än ingen mötesfångst alls: trådstart failar bara vid
+        // resursbrist, och då är en sekunds blockering det minsta av problemen.
+        eprintln!("DEBUG: kunde inte starta MÖTET-byggtråden ({e}) — bygger synkront");
+        let _ = tx_fallback.send(run_sys_build(&ctx_fallback, pinned_fallback.as_deref()));
+    }
+    rx
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_sys_build(ctx: SysBuildCtx, pinned: Option<String>) -> Receiver<Option<SysCapture>> {
+    // Synkront: cpal:s WASAPI-ström är inte `Send`. Resultatet ligger i kanalen och
+    // plockas upp av nästa `poll()`, så tillståndsmaskinen ser likadan ut för anroparen.
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let _ = tx.send(run_sys_build(&ctx, pinned.as_deref()));
+    rx
 }
 
 struct SysCapture {
@@ -1623,7 +2462,32 @@ fn process_audio_stream(
                          is_speaking = false;
                          speech_buffer.clear();
                      }
-                     // Reset time tracking relative to recording start in session recorder? 
+
+                     // 🔴 PRE-ROLLEN MÅSTE TÖMMAS HÄR — den överlevde annars mellan
+                     // inspelningar och tog med sig ljud från föregående session.
+                     //
+                     // Buffertens 2 sekunder fylls bara under inspelning (raderna
+                     // nedanför den här grinden), och den här tråden lever kvar mellan
+                     // inspelningar för MÖTET-kanalen — fångsten byggs vid motorstart
+                     // och rivs först vid enhetsbyte eller fel. Utan tömningen stod
+                     // alltså slutet av föregående inspelning kvar i bufferten, och
+                     // nästa inspelning fick det inklistrat först i sitt första segment:
+                     // `speech_buffer.extend(pre_roll_buffer.iter())` vid talstart.
+                     //
+                     // Träffas när tal utlöses inom 2 s från inspelningsstart, vilket är
+                     // normalfallet — man trycker spela in och börjar prata. Följden är
+                     // att upp till två sekunder ur ett tidigare möte transkriberas in i
+                     // nästa mötes transkript, tyst och utan spår. För en produkt vars
+                     // hela löfte är att transkriptet är kundens är det fel sorts fel.
+                     //
+                     // DU-kanalen råkar vara skyddad i dag av att mic-strömmen släpps
+                     // mellan inspelningar (lat mic-livscykel) så att tråden med sin
+                     // buffert avslutas — men det är en sidoeffekt av en annan feature,
+                     // inte ett skydd. Tömningen hör hemma här, i den kanal som äger
+                     // bufferten.
+                     pre_roll_buffer.clear();
+
+                     // Reset time tracking relative to recording start in session recorder?
                      // No, process_audio_stream runs continuously. 
                      // The session recorder tracks the actual file time.
                      // But for transcription timestamps to align with the file, we need to sync with "Recording Start".
@@ -1844,6 +2708,76 @@ fn emit_cloud_chunk(data: &[f32], source: &str, app: &AppHandle, start_offset: f
     });
 }
 
+/// Räknaren `pending_transcriptions` som en RAII-guard.
+///
+/// # Varför den finns
+///
+/// Invarianten "en ökning per transkribering, exakt en minskning" hölls tidigare för
+/// hand över en 300-radig asynkron block med **tolv** minskningar, varav två gardade
+/// med `> 0`. Två felutfall, båda tysta:
+///
+/// * En väg som aldrig minskar → `pending_transcriptions` når aldrig noll →
+///   `try_save_session` sparar aldrig sessionen. Inspelningen försvinner.
+/// * En väg som minskar två gånger, eller minskar en räknare som `start_recording`
+///   just nollställt → `usize` wrappar i release till `usize::MAX`, med exakt samma
+///   följd. De fyra ogardade minskningarna på modell-, sidecar- och exe-felvägarna
+///   saknar dessutom generationskontroll, så just den kollisionen var nåbar.
+///
+/// Med en guard finns invarianten i typen: `Drop` körs på varje väg ut, inklusive
+/// tidiga returer och panik.
+struct PendingTranscription {
+    session_state: Arc<Mutex<SessionState>>,
+    app: AppHandle,
+    /// Sessionen räkningen tillhör. En uppgift från en ÖVERGIVEN session får inte
+    /// minska den nya sessionens räknare — `start_recording` nollställer den.
+    my_gen: u64,
+}
+
+impl PendingTranscription {
+    fn new(session_state: Arc<Mutex<SessionState>>, app: AppHandle, my_gen: u64) -> Self {
+        session_state.lock().unwrap().pending_transcriptions += 1;
+        Self { session_state, app, my_gen }
+    }
+}
+
+impl Drop for PendingTranscription {
+    fn drop(&mut self) {
+        {
+            let mut state = self.session_state.lock().unwrap();
+            if generation_is_current(current_session_generation(), self.my_gen) {
+                state.pending_transcriptions = decrement_pending(state.pending_transcriptions);
+            }
+        }
+        try_save_session(&self.app, &self.session_state);
+    }
+}
+
+/// Minskar räknaren utan att kunna wrappa.
+///
+/// 🔴 En `usize` som går under noll blir `usize::MAX` i release (debug panikar), och
+/// `try_save_session` väntar på att räknaren ska bli noll innan den sparar. En enda
+/// felaktig minskning betyder alltså inte "en räkning fel" utan **inspelningen sparas
+/// aldrig**, tyst, resten av sessionen. Andra lagret efter generationskontrollen: skulle
+/// invarianten ändå brytas blir följden en förlorad räkning i stället för en förlorad
+/// inspelning.
+fn decrement_pending(n: usize) -> usize {
+    n.saturating_sub(1)
+}
+
+/// Temp-WAV:en som en RAII-guard.
+///
+/// Raderingen låg sist i den asynkrona uppgiften och nåddes bara av den normala vägen.
+/// Minst sex tidiga returer sker efter att filen skrivits (saknad modell, saknad
+/// sidecar, generationsbyte i kön, generationsbyte efter körning …), så på en
+/// installation där modellen saknas läckte VARJE segment en WAV i temp-katalogen.
+struct TempWav(std::path::PathBuf);
+
+impl Drop for TempWav {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Lokal transkribering via whisper-cli-sidecarn. Alltid svenska: den enda modell som
 /// paketeras är `ggml-kb-whisper-small.bin`, KB:s SVENSKA finetune. Att skicka `-l no`
 /// eller `-l en` till den gav en svensk modell som låtsades läsa ett annat språk — tyst
@@ -1868,21 +2802,25 @@ fn transcribe(
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros();
     let filename = temp_dir.join(format!("whisper_{}_{}.wav", source, timestamp));
     
-    // Increment pending BEFORE spawning
-    {
-        let mut state = session_state.lock().unwrap();
-        state.pending_transcriptions += 1;
-    }
+    // Vilken session detta segment tillhör — om generationen ändras (ny inspelning/avbryt)
+    // innan vi kört klart slängs resultatet i stället för att läcka in i nästa session.
+    let my_gen = current_session_generation();
+
+    // Räkningen ÄGS av guarden härifrån och ut. Varje `return` nedan — och varje panik
+    // — minskar räknaren och försöker spara sessionen, utan att någon behöver komma ihåg
+    // det. Se PendingTranscription.
+    let pending = PendingTranscription::new(session_state.clone(), app.clone(), my_gen);
 
     let mut writer = match hound::WavWriter::create(&filename, spec) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("ERROR: Failed to create wav writer: {}", e);
-            let mut state = session_state.lock().unwrap();
-            state.pending_transcriptions -= 1;
             return;
         }
     };
+
+    // Filen finns nu på disk och ska bort oavsett hur vi lämnar funktionen.
+    let temp_wav = TempWav(filename.clone());
 
     let amplitude = i16::MAX as f32;
     for &sample in data {
@@ -1892,8 +2830,6 @@ fn transcribe(
         Ok(_) => {},
         Err(e) => {
             eprintln!("ERROR: Failed to finalize wav: {}", e);
-            let mut state = session_state.lock().unwrap();
-            state.pending_transcriptions -= 1;
             return;
         }
     }
@@ -1903,12 +2839,13 @@ fn transcribe(
     let source_clone = source.to_string();
     let session_state_clone = session_state.clone();
     let duration_sec = data.len() as f64 / SAMPLE_RATE as f64;
-    // Vilken session detta segment tillhör — om generationen ändras (ny inspelning/avbryt)
-    // innan vi kört klart slängs resultatet i stället för att läcka in i nästa session.
-    let my_gen = current_session_generation();
 
     tauri::async_runtime::spawn(async move {
-        
+        // Guards flyttas in i uppgiften: räkningen och temp-filen lever exakt så länge
+        // uppgiften gör, och städas på varje väg ut ur den.
+        let _pending = pending;
+        let _temp_wav = temp_wav;
+
         let path_buf = std::path::PathBuf::from(&file_path);
         let path_str = path_buf.to_string_lossy().to_string();
          let clean_filename = if path_str.starts_with("\\\\?\\") {
@@ -1924,10 +2861,6 @@ fn transcribe(
                  let err_msg = format!("Kunde inte hitta exe-sökväg: {}", e);
                  eprintln!("ERROR: {}", err_msg);
                  let _ = handle.emit("transcription-error", err_msg);
-                 let mut state = session_state_clone.lock().unwrap();
-                 state.pending_transcriptions -= 1;
-                 drop(state);
-                 try_save_session(&handle, &session_state_clone);
                  return;
              }
          };
@@ -1938,10 +2871,6 @@ fn transcribe(
                   let err_msg = "Kunde inte hitta appens modermapp.".to_string();
                   eprintln!("ERROR: {}", err_msg);
                   let _ = handle.emit("transcription-error", err_msg);
-                  let mut state = session_state_clone.lock().unwrap();
-                  state.pending_transcriptions -= 1;
-                  drop(state);
-                  try_save_session(&handle, &session_state_clone);
                   return;
               }
          };
@@ -2014,10 +2943,6 @@ fn transcribe(
              let err_msg = format!("Modell saknas. Letade i: {}", searched);
              println!("ERROR: {}", err_msg);
              let _ = handle.emit("transcription-error", err_msg);
-             let mut state = session_state_clone.lock().unwrap();
-             state.pending_transcriptions -= 1;
-             drop(state);
-             try_save_session(&handle, &session_state_clone);
              return;
         }
 
@@ -2107,10 +3032,6 @@ fn transcribe(
              let err_msg = format!("Sidecar saknas. Hittade dessa filer i mappen: {:?}", found_files);
              println!("ERROR: {}", err_msg);
              let _ = handle.emit("transcription-error", err_msg);
-             let mut state = session_state_clone.lock().unwrap();
-             state.pending_transcriptions -= 1;
-             drop(state);
-             try_save_session(&handle, &session_state_clone);
              return;
         }
 
@@ -2187,10 +3108,6 @@ fn transcribe(
         // väntade på semaforen → kör aldrig whisper-cli, släpp pending och avsluta.
         if current_session_generation() != my_gen {
             println!("[gen] Skippar köad transkribering (generation ändrad)");
-            let mut state = session_state_clone.lock().unwrap();
-            if state.pending_transcriptions > 0 { state.pending_transcriptions -= 1; }
-            drop(state);
-            try_save_session(&handle, &session_state_clone);
             return;
         }
 
@@ -2228,7 +3145,7 @@ fn transcribe(
                                 chunk_text.push_str(cleaned_text);
                             }
 
-                            let final_text = chunk_text.trim().to_string();
+                            let final_text = avkoda_entiteter(chunk_text.trim());
 
                             // Filter out common whisper boilerplate if NO timestamps were parsed
                             if !final_text.is_empty() && !final_text.starts_with("whisper_") && !final_text.starts_with("system_info:") {
@@ -2284,10 +3201,6 @@ fn transcribe(
                         // resultatet tyst: visa inget fel och spara inget segment.
                         if current_session_generation() != my_gen {
                             println!("[gen] Slänger transkriberingsresultat (generation ändrad / avbruten)");
-                            let mut state = session_state_clone.lock().unwrap();
-                            if state.pending_transcriptions > 0 { state.pending_transcriptions -= 1; }
-                            drop(state);
-                            try_save_session(&handle, &session_state_clone);
                             return;
                         }
 
@@ -2310,38 +3223,22 @@ fn transcribe(
                                 speaker: source_clone.clone(),
                             };
                             
-                            let mut state = session_state_clone.lock().unwrap();
-                            state.segments.push(segment);
-                            state.pending_transcriptions -= 1;
-                            drop(state);
-                            try_save_session(&handle, &session_state_clone);
-                        } else {
-                            let mut state = session_state_clone.lock().unwrap();
-                            state.pending_transcriptions -= 1;
-                            drop(state);
-                            try_save_session(&handle, &session_state_clone);
+                            session_state_clone.lock().unwrap().segments.push(segment);
                         }
+                        // Räkningen och sparförsöket sker när `_pending` droppas, på
+                        // vägen ut ur uppgiften — inte här, och inte i någon av de
+                        // andra elva grenarna som tidigare gjorde det för hand.
                     },
-                    Err(_) => {
-                        let mut state = session_state_clone.lock().unwrap();
-                        state.pending_transcriptions -= 1;
-                        drop(state);
-                        try_save_session(&handle, &session_state_clone);
-                    }
+                    Err(_) => {}
                 }
             },
             Err(e) => {
                 let err_msg = format!("Kunde inte starta processen. Fel: {}", e);
                 eprintln!("ERROR: {}", err_msg);
                 let _ = handle.emit("transcription-error", err_msg);
-                let mut state = session_state_clone.lock().unwrap();
-                state.pending_transcriptions -= 1;
-                drop(state);
-                try_save_session(&handle, &session_state_clone);
             }
         }
-        
-        let _ = std::fs::remove_file(filename);
+        // Temp-filen raderas av `_temp_wav` när uppgiften avslutas.
     });
 }
 
@@ -2446,16 +3343,16 @@ impl MergedVad {
 fn start_session_recorder(
     rx: Receiver<SessionChunk>,
     app: AppHandle,
-    is_running: Arc<Mutex<bool>>,
+    my_gen: u64,
     is_recording: Arc<Mutex<bool>>,
     session_state: Arc<Mutex<SessionState>>,
     settings: Arc<Mutex<AudioSettings>>,
 ) {
-    println!("DEBUG: Session recorder thread started");
+    println!("DEBUG: Session recorder thread started (generation {})", my_gen);
 
     loop {
         // 1. Idle Loop: Drain channel but don't record
-        while *is_running.lock().unwrap() && !*is_recording.lock().unwrap() {
+        while engine_generation_is_current(my_gen) && !*is_recording.lock().unwrap() {
             // Drain queue so it doesn't grow indefinitely
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(_) => {}, // Drop data
@@ -2464,7 +3361,7 @@ fn start_session_recorder(
         }
 
         // Check if we should exit entire thread
-        if !*is_running.lock().unwrap() {
+        if !engine_generation_is_current(my_gen) {
              break;
         }
 
@@ -2486,8 +3383,29 @@ fn start_session_recorder(
         let mut writer = match hound::WavWriter::create(&filename, spec) {
             Ok(w) => w,
             Err(e) => {
+                // 🔴 Här stod `return`, och det avslutade HELA sessions-tråden.
+                // Följden var inte att en inspelning misslyckades utan att alla
+                // gjorde det, resten av appens körning: kanalen kopplas ner, ingen
+                // sessions-WAV skrivs, `session-complete` emitteras aldrig och
+                // ingenting sparas till databasen — utan ett enda tecken i
+                // gränssnittet. Ett fullt disk-utrymme eller en temp-katalog som
+                // inte gick att skriva till i ett ögonblick gjorde alltså appen
+                // permanent oförmögen att spela in, och det syntes först när
+                // användaren letade efter sin inspelning efteråt.
                 eprintln!("ERROR: Failed to create session wav writer: {}", e);
-                return;
+                let _ = app.emit(
+                    "audio-error",
+                    format!("Inspelningen kunde inte skapas på disk: {}. Kontrollera ledigt utrymme.", e),
+                );
+                // Vänta ut inspelningen innan vi går tillbaka till idle-loopen.
+                // `recv_timeout` i stället för `sleep`: kanalen måste dräneras under
+                // tiden, annars växer den obegränsat med ~128 KB/s så länge
+                // användaren tror att inspelningen pågår. Och utan väntan skulle
+                // `continue` skapa en ny writer varje varv — en retry utan tak.
+                while *is_recording.lock().unwrap() && engine_generation_is_current(my_gen) {
+                    let _ = rx.recv_timeout(Duration::from_millis(100));
+                }
+                continue;
             }
         };
 
@@ -2504,11 +3422,22 @@ fn start_session_recorder(
         };
         let mut merged_vad = MergedVad::new();
 
+        // Uppmätt toppnivå per kanal under sessionen — underlaget för tystnadskontrollen
+        // vid finalisering. `mic_seen` skiljer "mikrofonen var öppen men gav digital
+        // tystnad" från "mikrofonen byggdes aldrig" (MÖTET-only-degraderingen, som redan
+        // har sagt sitt via `mic-unavailable` och inte ska varna en gång till).
+        let mut mic_peak: f32 = 0.0;
+        let mut sys_peak: f32 = 0.0;
+        let mut mic_seen = false;
+        // Skrivfel mitt i sessionen — bryter båda looparna och rapporteras nedan.
+        let mut write_failed = false;
+
         // 3. Recording Loop
-        while *is_recording.lock().unwrap() && *is_running.lock().unwrap() {
+        while *is_recording.lock().unwrap() && engine_generation_is_current(my_gen) {
              match rx.recv_timeout(Duration::from_millis(100)) {
                  Ok(chunk) => {
                      if chunk.source == "mic" {
+                         mic_seen = true;
                          mic_buffer.extend(chunk.data);
                      } else {
                          sys_buffer.extend(chunk.data);
@@ -2553,9 +3482,25 @@ fn start_session_recorder(
                      let mixed_f32 = (left_f32 + right_f32).clamp(-1.0, 1.0);
                      merged_vad.push(mixed_f32, vad_threshold, vad_silence_ms, &app);
                  }
+                 mic_peak = mic_peak.max(left_f32.abs());
+                 sys_peak = sys_peak.max(right_f32.abs());
                  // Stereo: skriv L (mic/DU) sedan R (sys/MÖTET) — hound interleavar i anropsordning.
-                 writer.write_sample((left_f32 * amplitude) as i16).unwrap();
-                 writer.write_sample((right_f32 * amplitude) as i16).unwrap();
+                 //
+                 // 🔴 Här stod `.unwrap()`. Ett skrivfel (full disk är det realistiska
+                 // fallet) panikade då tråden mitt i inspelningen: WAV:en finaliserades
+                 // aldrig, `session-complete` emitterades aldrig, inspelningen försvann
+                 // — och tråden kom inte tillbaka, så varje SENARE inspelning i samma
+                 // körning försvann också. Flushen längre ned hanterade redan samma fel
+                 // med `is_err()`; det var bara den här loopen som panikade.
+                 if writer.write_sample((left_f32 * amplitude) as i16).is_err()
+                     || writer.write_sample((right_f32 * amplitude) as i16).is_err()
+                 {
+                     write_failed = true;
+                     break;
+                 }
+             }
+             if write_failed {
+                 break;
              }
         }
         
@@ -2593,9 +3538,15 @@ fn start_session_recorder(
                     let mixed_f32 = (left_f32 + right_f32).clamp(-1.0, 1.0);
                     merged_vad.push(mixed_f32, vad_threshold, vad_silence_ms, &app);
                 }
+                mic_peak = mic_peak.max(left_f32.abs());
+                sys_peak = sys_peak.max(right_f32.abs());
                 // Stereo: L (mic/DU) sedan R (sys/MÖTET).
-                if writer.write_sample((left_f32 * amplitude) as i16).is_err() { break; }
-                if writer.write_sample((right_f32 * amplitude) as i16).is_err() { break; }
+                if writer.write_sample((left_f32 * amplitude) as i16).is_err()
+                    || writer.write_sample((right_f32 * amplitude) as i16).is_err()
+                {
+                    write_failed = true;
+                    break;
+                }
             }
         }
 
@@ -2616,7 +3567,63 @@ fn start_session_recorder(
         // 4. Recording Stop & Finalize
         match writer.finalize() {
             Ok(_) => println!("DEBUG: Session WAV finalized."),
-            Err(e) => eprintln!("ERROR: Failed to finalize session WAV: {}", e),
+            Err(e) => {
+                eprintln!("ERROR: Failed to finalize session WAV: {}", e);
+                write_failed = true;
+            }
+        }
+
+        if write_failed {
+            let _ = app.emit(
+                "audio-error",
+                "Inspelningen kunde inte skrivas färdigt till disk — ljudfilen kan vara \
+                 avkortad. Kontrollera ledigt utrymme.",
+            );
+        }
+
+        // --- Tystnadskontroll: sessionen som inte innehöll något ljud ---
+        //
+        // 🔴 Det här är bristen som gjorde alla tre felen den 30 augusti 2026 osynliga.
+        // En inspelning där mikrofonen aldrig kom igång gick hela vägen igenom kedjan
+        // utan ett enda meddelande: VAD utlöste aldrig, segmenten föll bort mot
+        // MIN_RECORDING_DURATION_MS, transkriptet blev tomt och inspelningen sparades
+        // som vilken annan som helst. Användaren fick veta det först när hen öppnade
+        // den — i det uppmätta fallet fem gånger av nio, och först efter att en av dem
+        // gjorde appen obrukbar letade någon efter orsaken.
+        //
+        // Tröskeln behöver inte gissas: EXAKT 0.0 är digital tystnad. En öppen
+        // mikrofon ger alltid brus, om än svagt, så noll betyder att ingen ljuddata
+        // nådde fram — inte att det var tyst i rummet. Därför inget falsklarm vid
+        // diktering i ett tyst rum, och ingen tröskel att kalibrera per enhet.
+        //
+        // Placeringen här, i sessions-recordern, är avsiktlig: det är den enda punkt
+        // som ser BÅDA kanalernas samtliga sampel, och den nås oavsett läge (lokalt,
+        // moln, sammanhängande).
+        //
+        // Hoppas över efter ett skrivfel: då är sessionen redan rapporterad som
+        // avkortad, och toppvärdena säger inget om ljudet utan bara om hur långt vi
+        // hann skriva. Två röda toaster för samma händelse gör ingen klokare.
+        if !write_failed {
+            if mic_peak == 0.0 && sys_peak == 0.0 {
+                eprintln!("AUDIO: sessionen innehöll inget ljud alls (mic_seen={})", mic_seen);
+                let _ = app.emit(
+                    "audio-error",
+                    "Inspelningen innehåller inget ljud. Kontrollera att rätt mikrofon är vald \
+                     i Inställningar och att den inte är avstängd — inspelningen sparas, men \
+                     den går inte att transkribera.",
+                );
+            } else if mic_seen && mic_peak == 0.0 {
+                // Mikrofonströmmen var öppen men levererade bara nollor: enheten är
+                // hårdvarumutad, eller så revs den ur inspelningen (I2S-kollisionen på
+                // Apple Silicon). Mötesljudet finns kvar, så det här är en varning och
+                // inte ett totalhaveri — men användarens egen röst saknas i transkriptet.
+                eprintln!("AUDIO: mikrofonkanalen var digitalt tyst hela sessionen");
+                let _ = app.emit(
+                    "audio-error",
+                    "Din mikrofonkanal spelade inte in något ljud — bara mötesljudet finns med. \
+                     Kontrollera att mikrofonen inte är avstängd.",
+                );
+            }
         }
 
         let path_str = filename.to_string_lossy().to_string();
@@ -2866,8 +3873,310 @@ pub async fn delete_diarize_temp(app: AppHandle, path: String) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
-    use super::{sys_rebuild_allowed, sys_retry_backoff};
+    use super::{
+        avkoda_entiteter, generation_is_current, heartbeat_interval, loop_stalled,
+        sys_capture_was_stable,
+        sys_rebuild_allowed, sys_retry_backoff, LOOP_STALL_AFTER, LOOP_STALL_CEILING,
+        SYS_STABLE_AFTER,
+    };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn raknaren_kan_inte_wrappa_under_noll() {
+        use super::decrement_pending;
+        // 🔴 NEGATIVT TEST. Med `n - 1` panikar det här i debug och ger usize::MAX i
+        // release — och en räknare på usize::MAX når aldrig noll, så try_save_session
+        // slutar spara. Symptomet blir "inspelningen försvann", inte "räknaren är fel".
+        assert_eq!(decrement_pending(0), 0);
+        assert_eq!(decrement_pending(1), 0);
+        assert_eq!(decrement_pending(3), 2);
+    }
+
+    #[test]
+    fn en_overgiven_uppgift_ror_inte_den_nya_sessionens_raknare() {
+        // `start_recording` nollställer pending_transcriptions medan uppgifter från
+        // föregående session kan vara i flykt. Fyra av de gamla minskningarna saknade
+        // generationskontroll, så en sen modell-/sidecar-felväg kunde minska en nyss
+        // nollställd räknare — samma katastrofala utfall som testet ovan skyddar mot.
+        let sessionen_uppgiften_tillhor = 4u64;
+        let sessionen_nu = 5u64; // användaren tryckte spela in igen
+        assert!(!generation_is_current(sessionen_nu, sessionen_uppgiften_tillhor));
+        assert!(generation_is_current(sessionen_nu, sessionen_nu));
+    }
+
+    #[test]
+    fn ett_fardigt_bygge_slapps_bara_nar_fangsten_inte_ar_onskad() {
+        use super::sys_capture_wanted;
+        // 🔴 Regression, funnen av `/code-review ultra` på PR #234.
+        //
+        // Droppvillkoret i poll-hanteraren läste `!is_recording` rått medan reconcilen
+        // som BESTÄLLDE bygget läste `sys_capture_wanted`. På Windows, där predikatet
+        // alltid är sant, gav det: reconcilen beställer → bygget blir klart (synkront
+        // där) → droppvillkoret ser `!is_recording` och släpper → reconcilen beställer
+        // igen. Femtio gånger i sekunden, i viloläge.
+        //
+        // Testet fångar inte fel ANROPSSTÄLLE — bara review gör det. Det låser i
+        // stället fast egenskapen som gör felet uppenbart när man läser båda:
+        // en fångst är önskad i vila på Windows, alltså får ett färdigt bygge inte
+        // släppas då.
+        if cfg!(target_os = "macos") {
+            assert!(!sys_capture_wanted(false), "macOS släpper i vila");
+        } else {
+            assert!(
+                sys_capture_wanted(false),
+                "Windows vill ha fångsten även i vila — ett färdigt bygge får inte släppas"
+            );
+        }
+    }
+
+    #[test]
+    fn den_lata_livscykeln_ar_bara_macos() {
+        use super::sys_capture_wanted;
+        // 🔴 NEGATIVT TEST för plattformsgränsen. Motivet för att släppa tappen är
+        // macOS-specifikt (sömnspärr + delad I2S-motor); WASAPI-loopbacken har ingen
+        // motsvarande kostnad, och Windows-runtime går bara att verifiera via ett
+        // signerat CI-bygge. Ett macOS-fix får inte tyst ändra den andra plattformen.
+        if cfg!(target_os = "macos") {
+            assert!(sys_capture_wanted(true), "under inspelning ska tappen hållas");
+            assert!(!sys_capture_wanted(false), "i vila ska den släppas — hela poängen");
+        } else {
+            assert!(sys_capture_wanted(true));
+            assert!(
+                sys_capture_wanted(false),
+                "Windows behåller loopbacken mellan inspelningar, som före ändringen"
+            );
+        }
+    }
+
+    #[test]
+    fn saknad_fangst_varnar_utom_nar_vi_vet_att_ingen_spelar() {
+        use super::missing_capture_is_a_problem;
+        // 🔴 Det enda fallet som TYSTAR varningen är att vi VET att ingen spelar.
+        // Det är dagens falsklarm: ren diktering på macOS gav "Systemljud är inte
+        // tillgängligt" vid varje inspelningsstart, eftersom grinden mot vilande
+        // utgång helt korrekt avstått från att bygga tappen.
+        assert!(!missing_capture_is_a_problem(Some(false)));
+        // Någon spelar och vi fångar inget → precis vad guardrailen finns för.
+        assert!(missing_capture_is_a_problem(Some(true)));
+        // 🔴 "Vet inte" MÅSTE varna. Det är Windows-vägen (metersvepet svarar där i
+        // stället) och en macOS-version där process-API:t inte går att läsa. Tystas
+        // den här grenen försvinner bannern för urdragen ljudutgång på Windows —
+        // en tyst regression i den plattform ändringen inte ens rör.
+        assert!(missing_capture_is_a_problem(None));
+    }
+
+    #[test]
+    fn tystnadsvarningen_fyrar_inte_pa_ljudets_framkant() {
+        use super::silent_capture_is_a_problem;
+        use std::time::Duration;
+        // 🔴 DET UPPMÄTTA FALSKLARMET, 2026-09-08 på den signerade betan:
+        //
+        //   15:24:23.117  fångst=true, annan_uppspelning=Some(true), bunden_tystnad=6s
+        //   15:24:23.177  Speech TRIGGERED on MÖTET at RMS: 0.0617
+        //
+        // Sonden såg uppspelningen 60 ms innan vår egen ström hann leverera ett hörbart
+        // block. I det glappet ser tillståndet ut som "de spelar och vi är döva". Med
+        // pauser längre än fem sekunder — ett vanligt möte — träffar 2s-pollen där
+        // regelbundet, och användaren får en gul banner mitt i ett fungerande möte.
+        assert!(
+            !silent_capture_is_a_problem(Some(Duration::from_millis(60)), false),
+            "en uppspelning som just börjat är inget bevis för att vi är döva"
+        );
+        // Även ett par sekunder är för kort — vår kedja är resamplad och buffrad.
+        assert!(!silent_capture_is_a_problem(Some(Duration::from_secs(2)), false));
+        // Men har de spelat sammanhängande i fem sekunder och vi ändå inte hört något,
+        // ÄR det TCC-fallet. Då ska varningen fyra.
+        assert!(silent_capture_is_a_problem(Some(Duration::from_secs(5)), false));
+        assert!(silent_capture_is_a_problem(Some(Duration::from_secs(30)), false));
+    }
+
+    #[test]
+    fn tyst_fangst_varnar_bara_nar_nagon_faktiskt_spelar() {
+        use super::silent_capture_is_a_problem;
+        use std::time::Duration;
+        // TCC-fallet: strömmen finns, levererar nollor, och någon annan spelar ljud.
+        // macOS nekar systemljud HELT tyst — det här är den enda observerbara
+        // skillnaden mellan ett återkallat medgivande och ett tyst möte.
+        assert!(silent_capture_is_a_problem(Some(Duration::from_secs(10)), false));
+        // Windows: metersvepet är underlaget, sonden svarar inte där. Det svepet är
+        // redan utjämnat ("hördes inom 5 s"), så det behöver ingen egen varaktighet.
+        assert!(silent_capture_is_a_problem(None, true));
+        // 🔴 Tyst möte får ALDRIG varna. Under inspelning kör vår egen tap, så en
+        // sond som räknade in oss själva hade svarat "ja, någon spelar" här och
+        // flimrat bannern i varje paus i samtalet.
+        assert!(!silent_capture_is_a_problem(None, false));
+    }
+
+    #[test]
+    fn pending_bygge_ar_pending_tills_resultatet_hamtats() {
+        // 🔴 Invarianten som skyddar mot två samtidiga aggregat: så länge ett bygge är
+        // ute får loopens `needs_rebind` aldrig slå till. Före den här ändringen fanns
+        // ingen sådan invariant — bygget var synkront och alltså aldrig "ute" — så den
+        // införs och testas i samma andetag som asynkroniteten.
+        let (tx, rx) = crossbeam_channel::bounded::<Option<super::SysCapture>>(1);
+        let mut pending = super::PendingSysBuild {
+            rx: Some(rx),
+            pinned: Some("EarPods".to_string()),
+        };
+        assert!(pending.is_pending(), "ett obesvarat bygge måste räknas som pågående");
+        assert!(pending.poll().is_none(), "poll får inte påstå att bygget är klart");
+        assert!(pending.is_pending(), "en tom poll får inte avsluta bygget");
+
+        // Bygget landar — här som ett misslyckande, vilket är det utfall som går att
+        // konstruera utan en riktig CoreAudio-enhet.
+        tx.send(None).unwrap();
+        let resultat = pending.poll().expect("resultatet ska nu vara hämtbart");
+        assert!(resultat.is_none());
+        assert!(!pending.is_pending(), "efter hämtat resultat är bygget inte längre ute");
+        assert_eq!(pending.take_pinned().as_deref(), Some("EarPods"));
+        // Andra hämtningen ger ingenting: resultatet konsumeras exakt en gång.
+        assert!(pending.poll().is_none());
+    }
+
+    #[test]
+    fn en_forsvunnen_byggtrad_raknas_som_misslyckat_bygge() {
+        // 🔴 Det farliga utfallet är inte ett fel — det är ett bygge som aldrig svarar.
+        // Panikar byggtråden droppas sändaren, och utan den här grenen hade
+        // `is_pending()` varit sant för alltid: MÖTET-kanalen byggs då aldrig om, tyst,
+        // resten av appens körning. Samma familj som fynden revisionen letade efter.
+        let (tx, rx) = crossbeam_channel::bounded::<Option<super::SysCapture>>(1);
+        let mut pending = super::PendingSysBuild { rx: Some(rx), pinned: None };
+        drop(tx);
+        let resultat = pending.poll().expect("nedkopplad kanal måste ge ett resultat");
+        assert!(resultat.is_none(), "ett bygge utan svar är ett misslyckat bygge");
+        assert!(!pending.is_pending(), "annars fastnar loopen i 'bygger fortfarande'");
+    }
+
+    #[test]
+    fn generationen_overlever_en_flagga_som_vander_tillbaka() {
+        // 🔴 NEGATIVT TEST för motorgenerationen, och det modellerar exakt den
+        // kapplöpning som gav två samtidiga motorer: stop() följt av start() innan
+        // den gamla loopen hunnit läsa flaggan, vilket är normalfallet när loopen
+        // står i ett blockerande enhetsbygge.
+        let min_generation = 7u64;
+        let mut flagga = true; // is_running
+        let mut generation = min_generation;
+        // Utgångsläget: motorn kör och är den aktuella.
+        assert!(flagga);
+        assert!(generation_is_current(generation, min_generation));
+
+        // stop(): flaggan ned, generationen upp. Här är BÅDA mekanismerna ense —
+        // hade den gamla tråden läst just nu hade den avslutat sig korrekt.
+        flagga = false;
+        generation += 1;
+        assert!(!flagga);
+        assert!(!generation_is_current(generation, min_generation));
+
+        // Men den läser inte just nu: den står i ett blockerande enhetsbygge. start()
+        // hinner emellan och sätter flaggan tillbaka.
+        flagga = true;
+        generation += 1;
+
+        // Den gamla tråden vaknar ur sitt blockerande bygge och läser båda:
+        assert!(
+            flagga,
+            "flaggan säger 'kör vidare' — det ÄR det gamla felet, och testet ska \
+             dokumentera att den inte går att lita på"
+        );
+        assert!(
+            !generation_is_current(generation, min_generation),
+            "generationen får aldrig säga att en gammal tråd är aktuell"
+        );
+
+        // Och den aktuella tråden ska förstås få fortsätta.
+        assert!(generation_is_current(generation, generation));
+    }
+
+    #[test]
+    fn en_fangst_utan_bygge_ar_aldrig_stabil() {
+        assert!(!sys_capture_was_stable(None, Instant::now()));
+    }
+
+    #[test]
+    fn en_fangst_som_foll_direkt_ar_inte_stabil() {
+        // 🔴 DET NEGATIVA TESTET. Det här är fallet grinden finns för: bygget
+        // returnerade Ok, fångsten satte sin failed-flagga vid nästa 2s-poll, och
+        // före ändringen nollställde det "lyckade" bygget felräknaren — så trappan
+        // kunde aldrig klättra och ombyggnaden upprepades var annan sekund.
+        let byggd = Instant::now();
+        assert!(!sys_capture_was_stable(Some(byggd), byggd + Duration::from_secs(2)));
+        // Även strax under fönstret ska falla.
+        assert!(!sys_capture_was_stable(
+            Some(byggd),
+            byggd + SYS_STABLE_AFTER - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn en_fangst_som_levt_igenom_fonstret_ar_stabil() {
+        let byggd = Instant::now();
+        // Exakt på gränsen räknas som stabil — annars hamnar en fångst som levt
+        // precis fönstret ut i backoffen på grund av en tick.
+        assert!(sys_capture_was_stable(Some(byggd), byggd + SYS_STABLE_AFTER));
+        assert!(sys_capture_was_stable(Some(byggd), byggd + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn en_flappande_fangst_klattrar_i_trappan() {
+        // Modellerar loopens bokföring: bygge → fångsten faller vid nästa poll →
+        // bokförs som misslyckat försök eftersom den aldrig blev stabil.
+        // Före ändringen gav samma sekvens streak = 0 varje varv, alltså 5 s för
+        // alltid i bästa fall och 2 s (ingen väntan alls) i praktiken.
+        let mut streak: u32 = 0;
+        let mut vantetider = Vec::new();
+        let mut nu = Instant::now();
+        for _ in 0..4 {
+            let byggd = nu;
+            nu += Duration::from_secs(2); // faller vid nästa 2s-poll
+            assert!(
+                !sys_capture_was_stable(Some(byggd), nu),
+                "en fångst som levt 2 s får aldrig räknas som lyckad"
+            );
+            streak = streak.saturating_add(1);
+            vantetider.push(sys_retry_backoff(streak).as_secs());
+        }
+        assert_eq!(vantetider, vec![5, 15, 60, 300]);
+    }
+
+    #[test]
+    fn hangningsdetektorn_faller_pa_det_uppmatta_fallet() {
+        // 🔴 NEGATIVT TEST mot verkliga siffror. Den 30 augusti 2026 satt loopen
+        // 34,3 s inne i build_mic_capture (13:22:12.684 → 13:22:47.013 i apploggen)
+        // utan att skriva en enda rad. Detektorn ska fälla på just det gapet.
+        assert!(loop_stalled(Duration::from_millis(34_329)));
+        // Och på det ~14 s-gap ett misslyckat CoreAudio-bygge kostar.
+        assert!(loop_stalled(Duration::from_secs(14)));
+    }
+
+    #[test]
+    fn hangningsdetektorn_ar_tyst_i_normal_drift() {
+        // Ett normalt varv är ~20 ms (recv_timeout) och det tyngsta planerade
+        // arbetet är 2s-pollen. Ingen av dem får ge en falsk hängningsrad — en
+        // detektor som varnar varje varv blir bortläst inom en dag.
+        assert!(!loop_stalled(Duration::from_millis(20)));
+        assert!(!loop_stalled(Duration::from_secs(2)));
+        assert!(!loop_stalled(LOOP_STALL_AFTER - Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn hangningsdetektorn_tiger_om_gap_som_inte_kan_vara_blockeringar() {
+        // Taket, och skälet till att det finns: ett gap på timmar är datorn som
+        // sovit, inte ett anrop som hängt. Se LOOP_STALL_CEILING — frågan om
+        // `Instant` räknar vilotid på macOS gick inte att köra här, och taket gör
+        // den betydelselös i stället för gissad.
+        assert!(!loop_stalled(LOOP_STALL_CEILING + Duration::from_secs(1)));
+        assert!(!loop_stalled(Duration::from_secs(8 * 3600)));
+        // Precis på taket är fortfarande en hängning.
+        assert!(loop_stalled(LOOP_STALL_CEILING));
+    }
+
+    #[test]
+    fn livstecknet_ar_tatt_under_inspelning_och_glest_i_vila() {
+        // Nivåerna är diagnosen under inspelning; i vila var raden 99,5 % av
+        // loggfilen (43 644 av 43 851 rader, uppmätt 2026-09-01).
+        assert_eq!(heartbeat_interval(true), Duration::from_secs(1));
+        assert!(heartbeat_interval(false) >= Duration::from_secs(30));
+    }
 
     #[test]
     fn backoff_utan_vantan_slapper_igenom() {
@@ -2907,5 +4216,47 @@ mod tests {
         // Första försöket väntar kort — en tillfällig störning ska inte kosta
         // användaren fem minuter utan mötesljud.
         assert_eq!(v[1], 5);
+    }
+
+    #[test]
+    fn entiteter_det_uppmatta_fallet() {
+        // Ordagrant vad modellen gav 2026-08-30, i två av två körningar.
+        assert_eq!(
+            avkoda_entiteter("Intäkterna ligger 9&nbsp;% över plan"),
+            "Intäkterna ligger 9\u{00A0}% över plan"
+        );
+    }
+
+    #[test]
+    fn entiteter_amp_far_inte_avkodas_i_flera_steg() {
+        // 🔴 Testet som motiverar en enda genomgång i stället för kedjade `replace`.
+        // `&amp;nbsp;` ÄR den korrekta kodningen av den bokstavliga texten `&nbsp;`.
+        // En kedja som avkodar `&amp;` först producerar då `&nbsp;`, och nästa led
+        // gör om det till ett mellanslag — alltså tvärtemot vad texten sa.
+        assert_eq!(avkoda_entiteter("koden &amp;nbsp; betyder"), "koden &nbsp; betyder");
+    }
+
+    #[test]
+    fn entiteter_okanda_och_losa_lamnas_ororda() {
+        // Transkriptet är användarens ord. Gissa aldrig.
+        assert_eq!(avkoda_entiteter("Bolaget &finns; kvar"), "Bolaget &finns; kvar");
+        assert_eq!(avkoda_entiteter("Ada & Bertil"), "Ada & Bertil");
+        // Ett `;` längre bort än en entitet kan vara får inte sluka meningen.
+        assert_eq!(
+            avkoda_entiteter("Han sa & sedan tystnade han; sedan gick han"),
+            "Han sa & sedan tystnade han; sedan gick han"
+        );
+    }
+
+    #[test]
+    fn entiteter_ovriga_former() {
+        assert_eq!(avkoda_entiteter("Ada &amp; Bertil"), "Ada & Bertil");
+        assert_eq!(avkoda_entiteter("&quot;citat&quot;"), "\"citat\"");
+        assert_eq!(avkoda_entiteter("&lt;taggen&gt;"), "<taggen>");
+        assert_eq!(avkoda_entiteter("&#229;&#228;&#246;"), "åäö");
+        assert_eq!(avkoda_entiteter("&#xE5;"), "å");
+        // Snabbvägen: text utan & ska komma tillbaka oförändrad.
+        assert_eq!(avkoda_entiteter("helt vanlig mening"), "helt vanlig mening");
+        assert_eq!(avkoda_entiteter(""), "");
     }
 }
