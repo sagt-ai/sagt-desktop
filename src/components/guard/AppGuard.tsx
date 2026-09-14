@@ -29,7 +29,6 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
     // Hämtas från /system/config så att vi kan byta CDN-URL utan ny release.
     // Faller tillbaka på sagt.ai/downloads om backend inte returnerar fältet.
     const [downloadUrl, setDownloadUrl] = useState("https://sagt.ai/downloads")
-    const setStripePaymentLink = useConfigStore((s) => s.setStripePaymentLink)
     const setMotd = useConfigStore((s) => s.setMotd)
     const setLatestVersion = useConfigStore((s) => s.setLatestVersion)
     const setDownloadUrlStore = useConfigStore((s) => s.setDownloadUrl)
@@ -44,7 +43,6 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
             setDownloadUrl(data.download_url)
             setDownloadUrlStore(data.download_url)
         }
-        if (data.stripe_payment_link) setStripePaymentLink(data.stripe_payment_link)
         if (data.motd) setMotd(data.motd)
         if (data.latest_version) setLatestVersion(data.latest_version)
     }

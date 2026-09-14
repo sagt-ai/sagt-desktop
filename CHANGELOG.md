@@ -7,6 +7,26 @@ Changeloggen börjar vid 0.9.41. Äldre versioner finns inte dokumenterade här.
 
 ---
 
+## 0.10.3 — 2026-09-14
+
+### Fixat
+
+- **Uppgradering från provperiodsbannern kopplades inte till ditt konto.** Betalade
+  du via knappen i bannern kunde Pro utebli efter köpet. Nu hör köpet alltid ihop med
+  kontot du är inloggad med, oavsett var i appen du uppgraderar.
+
+- **Priset i uppgraderingsrutan stod som "ex. moms".** Pro kostar 199 kr i månaden
+  inklusive moms, precis som på sagt.ai.
+
+### Ändrat
+
+- **Du kan inte längre råka köpa Pro två gånger.** Har du redan en prenumeration —
+  eller har du nyss betalat och Pro inte hunnit synas i appen — får du besked i stället
+  för en ny betalning.
+
+- **Uppgraderingsknapparna visar att betalningen öppnas**, och säger tydligt till om
+  du behöver logga in eller saknar internetanslutning.
+
 ## 0.10.2 — 2026-09-02
 
 ### Fixat

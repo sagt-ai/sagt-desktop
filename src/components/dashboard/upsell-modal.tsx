@@ -1,9 +1,8 @@
 import { X, Check, CloudLightning, Shield, Loader2, CheckCircle2, Sparkles, RefreshCw } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
 import { useAuthStore } from "@/store/auth-store";
-import { useConfigStore } from "@/store/config-store";
 import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
 import { useBrowserAuth } from "@/hooks/use-browser-auth";
+import { useCheckout } from "@/hooks/use-checkout";
 import { selectUpsellView, shouldAutoClose, shouldCelebrate } from "@/lib/upsell-state";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
@@ -16,9 +15,9 @@ interface UpsellModalProps {
 export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
     const userId = useAuthStore((s) => s.userId);
     const isPro = useAuthStore((s) => s.isPro());
-    const stripePaymentLink = useConfigStore((s) => s.stripePaymentLink);
     const { isWaiting, startPolling, stopPolling, manualRefresh } = usePaymentRefresh();
     const { startAuth, isAuthenticating } = useBrowserAuth();
+    const { openCheckout: openCheckoutInBrowser, isOpening } = useCheckout();
     const [pendingUpgrade, setPendingUpgrade] = useState(false);
     const [isChecking, setIsChecking] = useState(false);
 
@@ -42,21 +41,13 @@ export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
     // varje omrendering fyra av en ny toast och skjuta stängningen framför sig.
     const celebratedRef = useRef(false);
 
-    // Öppna Stripe-checkout (kräver inloggad userId för kundreferens)
+    // Öppna Stripe-checkout. Backend kräver inloggning och knyter köpet till kontot;
+    // fel visas av useCheckout, så här återstår bara att starta väntan när det lyckats.
     const openCheckout = async () => {
-        const uid = useAuthStore.getState().userId;
-        if (!stripePaymentLink || !uid) {
-            toast.error("Betalningslänk ej tillgänglig. Försök starta om appen.");
-            return;
-        }
-        try {
-            await invoke('plugin:shell|open', { path: `${stripePaymentLink}?client_reference_id=${uid}` });
-            celebratedRef.current = false; // nytt försök ska kunna firas igen
-            setPaymentAttempted(true);
-            startPolling();
-        } catch (err) {
-            console.error("Failed to open payment link:", err);
-        }
+        if (!(await openCheckoutInBrowser())) return;
+        celebratedRef.current = false; // nytt försök ska kunna firas igen
+        setPaymentAttempted(true);
+        startPolling();
     };
 
     // Uttrycklig avfärdning — nollställer betalförsöket så nästa öppning visar säljsidan.
@@ -236,9 +227,10 @@ export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
                             {view === 'confirmation-stalled' && (
                                 <button
                                     onClick={openCheckout}
-                                    className="text-xs text-ink-soft hover:text-ink underline underline-offset-2"
+                                    disabled={isOpening}
+                                    className="text-xs text-ink-soft hover:text-ink underline underline-offset-2 disabled:opacity-60"
                                 >
-                                    Öppna betalningen igen
+                                    {isOpening ? "Öppnar betalningen..." : "Öppna betalningen igen"}
                                 </button>
                             )}
                             <button
@@ -258,7 +250,9 @@ export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
                             <div className="bg-paper-dim border border-line rounded-xl p-5 mb-6">
                                 <div className="flex items-center justify-between font-semibold text-ink mb-4 pb-4 border-b border-line">
                                     <span>Sagt.ai Pro</span>
-                                    <span className="text-brand">199 kr<span className="text-xs text-ink-muted font-normal"> / mån ex. moms</span></span>
+                                    {/* Samma formulering som webbens PRO_PRICE (frontend/content/pricing.ts). Här stod
+                                        "ex. moms" fram till 2026-09-14, i strid med sajten och KOSTNADER.md. */}
+                                    <span className="text-brand">199 kr<span className="text-xs text-ink-muted font-normal"> / mån inkl. moms</span></span>
                                 </div>
                                 <ul className="space-y-3">
                                     {/* Ledargument — större modell = högre kvalitet (ryms inte lokalt → moln) */}
@@ -302,11 +296,13 @@ export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
                                 </button>
                                 <button
                                     onClick={handleUpgrade}
-                                    disabled={isAuthenticating}
+                                    disabled={isAuthenticating || isOpening}
                                     className="flex-[2] py-2.5 px-4 rounded-lg bg-brand border border-brand text-sm font-semibold text-paper hover:bg-brand-deep hover:border-brand-deep shadow-sm transition-colors disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                                 >
                                     {isAuthenticating ? (
                                         <><Loader2 className="w-4 h-4 animate-spin" /> Loggar in...</>
+                                    ) : isOpening ? (
+                                        <><Loader2 className="w-4 h-4 animate-spin" /> Öppnar betalningen...</>
                                     ) : (
                                         "Uppgradera nu"
                                     )}

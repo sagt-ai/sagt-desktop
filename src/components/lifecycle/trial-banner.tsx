@@ -2,12 +2,14 @@ import { useState } from "react"
 import { X, Clock, AlertTriangle } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useAuthStore } from "@/store/auth-store"
-import { useConfigStore } from "@/store/config-store"
+import { useCheckout } from "@/hooks/use-checkout"
 
 export function TrialBanner() {
     const trialEndsAt = useAuthStore((s) => s.trialEndsAt)
     const isPro = useAuthStore((s) => s.isPro())
-    const stripePaymentLink = useConfigStore((s) => s.stripePaymentLink)
+    // Bannern öppnade tidigare Payment Link-URL:en utan client_reference_id, så ett
+    // köp härifrån kopplades aldrig till kontot. Via backend bär varje köp identiteten.
+    const { openCheckout, isOpening } = useCheckout()
     const [dismissed, setDismissed] = useState(false)
 
     if (!trialEndsAt || isPro) return null
@@ -31,9 +33,10 @@ export function TrialBanner() {
                 <Button
                     size="sm"
                     className="h-7 px-3 bg-red-600 hover:bg-red-700 text-white text-xs shrink-0"
-                    onClick={() => stripePaymentLink && window.open(stripePaymentLink, "_blank")}
+                    disabled={isOpening}
+                    onClick={() => { void openCheckout() }}
                 >
-                    Uppgradera
+                    {isOpening ? "Öppnar..." : "Uppgradera"}
                 </Button>
             </div>
         )
@@ -49,9 +52,10 @@ export function TrialBanner() {
                 size="sm"
                 variant="outline"
                 className="h-7 px-3 border-ochre/30 text-ochre hover:bg-ochre-soft text-xs shrink-0"
-                onClick={() => stripePaymentLink && window.open(stripePaymentLink, "_blank")}
+                disabled={isOpening}
+                onClick={() => { void openCheckout() }}
             >
-                Uppgradera
+                {isOpening ? "Öppnar..." : "Uppgradera"}
             </Button>
             <button
                 onClick={() => setDismissed(true)}

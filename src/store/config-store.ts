@@ -13,25 +13,24 @@ function semverGt(a: string, b: string): boolean {
     return false
 }
 
+// Ingen stripePaymentLink längre: köp går via POST /billing/checkout-session
+// (hooks/use-checkout.ts). Backend skickar fortfarande fältet i /system/config,
+// men bara för klienter <= 0.10.2.
 interface ConfigStore {
-    stripePaymentLink: string | null
     motd: string | null
     latestVersion: string | null
     updateAvailable: boolean
     downloadUrl: string
-    setStripePaymentLink: (url: string) => void
     setMotd: (m: string | null) => void
     setLatestVersion: (v: string) => void
     setDownloadUrl: (url: string) => void
 }
 
 export const useConfigStore = create<ConfigStore>((set) => ({
-    stripePaymentLink: null,
     motd: null,
     latestVersion: null,
     updateAvailable: false,
     downloadUrl: "https://sagt.ai/downloads",
-    setStripePaymentLink: (url) => set({ stripePaymentLink: url }),
     setMotd: (m) => set({ motd: m }),
     setLatestVersion: (v) => set({ latestVersion: v, updateAvailable: semverGt(v, CURRENT_VERSION) }),
     setDownloadUrl: (url) => set({ downloadUrl: url }),

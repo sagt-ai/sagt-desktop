@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { InfoHint } from "@/components/ui/info-hint";
 import { invoke } from "@tauri-apps/api/core";
 import { useAuthStore } from "@/store/auth-store";
-import { useConfigStore } from "@/store/config-store";
+import { useCheckout } from "@/hooks/use-checkout";
 import { toast } from "sonner";
 
 
@@ -67,8 +67,7 @@ export function SettingsPage() {
 
     const isPro = useAuthStore((s) => s.isPro());
     const monthlyLimit = useAuthStore((s) => s.monthlyMinutesLimit);
-    const userId = useAuthStore((s) => s.userId);
-    const stripePaymentLink = useConfigStore((s) => s.stripePaymentLink);
+    const { openCheckout, isOpening: isOpeningCheckout } = useCheckout();
 
     const [availableDevices, setAvailableDevices] = useState<{ name: string, is_default: boolean }[]>([]);
     const [showAdvancedVad, setShowAdvancedVad] = useState(false);
@@ -553,17 +552,11 @@ export function SettingsPage() {
                                         variant="outline"
                                         size="sm"
                                         className="h-7 text-xs text-primary border-primary/20 bg-primary/5 hover:bg-primary/10"
-                                        onClick={async () => {
-                                            if (stripePaymentLink && userId) {
-                                                const { invoke } = await import('@tauri-apps/api/core');
-                                                invoke('plugin:shell|open', { path: `${stripePaymentLink}?client_reference_id=${userId}` });
-                                            } else {
-                                                toast.error("Betalningslänk ej tillgänglig. Försök starta om appen.");
-                                            }
-                                        }}
+                                        disabled={isOpeningCheckout}
+                                        onClick={() => { void openCheckout(); }}
                                     >
                                         <Sparkles className="w-3 h-3 mr-1" />
-                                        Uppgradera till Pro
+                                        {isOpeningCheckout ? "Öppnar betalningen..." : "Uppgradera till Pro"}
                                     </Button>
                                 )}
                             </div>
