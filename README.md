@@ -29,8 +29,8 @@ It listens to **your computer's audio** rather than integrating with a meeting p
 - **No account required** — no email, no password, no sign-up. Download, install, record
 - **Installs without administrator rights** — works on a locked-down work laptop
 - **Works offline** — no internet connection needed on the free tier
-- **Speaker separation on Pro** — "who said what", labelled automatically
-- **AI meeting protocol on Pro** — summaries, decisions and action items via Llama 3.3 on Berget.ai's Swedish servers. Never outside Europe
+- **You and the meeting on separate channels** — your microphone and the computer's audio are transcribed apart, so the transcript shows what you said and what was said in the meeting
+- **AI meeting protocol on Pro** — summaries, decisions and action items via Gemma 4 31B on Berget.ai's Swedish servers. Never outside Europe
 
 ## Free vs Pro
 
@@ -43,7 +43,7 @@ It listens to **your computer's audio** rather than integrating with a meeting p
 | Account required | ❌ None | Yes |
 | AI meeting summary | — | ✅ |
 | Key decisions & action items | — | ✅ |
-| Speaker separation ("who said what") | — | ✅ |
+| You and the meeting on separate channels | ✅ | ✅ |
 | KB-Whisper Large (higher accuracy, cloud) | — | ✅ |
 | Cloud transcription quota | n/a | 1,500 min/month |
 | Data ever leaves the EU | ❌ Never | ❌ Never |
@@ -113,6 +113,7 @@ Stated plainly, so you can decide before downloading:
 
 - **Apple Silicon Macs only.** The Mac build is arm64 — there is no Intel Mac build and no universal binary. macOS 14.2 or later is required, because the API used to capture meeting audio does not exist before it. No Linux build exists.
 - **No file export.** Transcripts and summaries are copied to the clipboard; PDF and Word export are not implemented yet.
+- **Speakers are told apart by channel only.** Everyone on the same channel appears as one speaker: the other people on a call as "Mötet" (the meeting), and people in the room with you as "Du" (you). Acoustic speaker separation ("Speaker 1, 2, 3") was switched off on 2026-09-18.
 - **Swedish-first.** The bundled on-device model handles Swedish only. Norwegian and English are available through the cloud tier (Pro).
 - **Public beta.** Expect rough edges.
 
@@ -122,7 +123,7 @@ Stated plainly, so you can decide before downloading:
 Yes, and with anything else that makes sound. Sagt captures your computer's audio output rather than integrating with a specific platform, so the meeting tool is irrelevant — including a conversation happening in the room.
 
 **Do I need an account?**
-Not for the free tier. No email address, no password, no sign-up. An account is only needed for Pro features (AI protocol, speaker separation, cloud sync).
+Not for the free tier. No email address, no password, no sign-up. An account is only needed for Pro features (AI protocol, cloud sync).
 
 **Does my audio leave my computer?**
 Not on the free tier — transcription runs on your own CPU. On Pro, only the recordings you choose to process are uploaded, to servers in Sweden, and the audio files are deleted within 24 hours.
@@ -193,7 +194,7 @@ npx tsc --noEmit
 - [KB-Whisper](https://huggingface.co/KBLab) via local `whisper-cli` sidecar (beam-size 1, VAD-gated)
 - System audio captured as a channel separate from the microphone — WASAPI loopback on Windows, Core Audio taps on macOS
 - SQLite for local recording storage
-- Cloud tier: KB-Whisper Large and Llama 3.3 via [Berget.ai](https://berget.ai) (Swedish servers), speaker diarization via pyannoteAI
+- Cloud tier: KB-Whisper Large and Gemma 4 31B via [Berget.ai](https://berget.ai) (Swedish servers). Acoustic speaker diarization via pyannoteAI is switched off since 2026-09-18
 
 ---
 
