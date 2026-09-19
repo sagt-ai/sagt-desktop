@@ -15,6 +15,7 @@ import { applyInlineCloudResult, cloudSegmentsJsonFromJob, segmentsHaveDiarizati
 import { speakerKey, mergeSuggestions, parseSpeakerData, serializeSpeakerData } from "@/lib/speaker-naming";
 import { AnalysisData } from "@/store/sync-store";
 import { useAuthStore, WAS_PRO_KEY } from "@/store/auth-store";
+import { useConfigStore } from "@/store/config-store";
 import { toast } from "sonner";
 import { ModePill } from "./mode-pill";
 import { UpsellModal } from "./upsell-modal";
@@ -45,6 +46,9 @@ export function SplitView() {
     const isSignedIn = useAuthStore((s) => s.isSignedIn);
     const getToken = useAuthStore((s) => s.getToken);
     const isPro = useAuthStore((s) => s.isPro());
+    // Backendens kill switch för talarseparering. Av → "Transkribera om med talarseparering"
+    // döljs, eftersom servern släpper `diarize` utan felsvar och valet vore en tyst no-op.
+    const diarizeEnabled = useConfigStore((s) => s.diarizeEnabled);
     const email = useAuthStore((s) => s.email);
     const clearSession = useAuthStore((s) => s.clearSession);
     const events = usePostHogEvents();
@@ -436,6 +440,20 @@ export function SplitView() {
         setAutoKeys(parsed.auto);
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [activeJob?.id, activeJob?.speaker_map]);
+
+    // Efter ett livestopp (inte historik) läser effekten ovan inte om speaker_map. Namn som
+    // auto-finalize sparar vid stopp syntes därför först när mötet öppnades igen, och ett
+    // flikbyte tömde vyns namn. Spegla dem hit. null betyder att inget sparats för mötet än:
+    // vyn behåller då namnen från inspelningen i stället för att tömmas.
+    useEffect(() => {
+        if (isRecording || activeJobFromHistory) return;
+        const raw = activeJob?.speaker_map;
+        if (!raw) return;
+        const parsed = parseSpeakerData(raw);
+        setSpeakerMap(parsed.map);
+        setParticipants(parsed.participants);
+        setAutoKeys(parsed.auto);
+    }, [isRecording, activeJobFromHistory, activeJob?.speaker_map]);
 
     // STEG 2: under LIVE (inspelning pågår, ej ett historik-jobb) speglar SplitView store:ns
     // liveSpeakerMap/liveAutoKeys — den alltid-monterade hook:en skriver namn dit och de dyker
@@ -1050,9 +1068,10 @@ export function SplitView() {
                         )}
                         {/* §13.2: ETT åtgärdsmenyvalv i stället för tre separata knappar (toggle +
                             omtranskribera + identifiera). "Det bara fungerar" — omtranskribering
-                            med/utan talarseparering + manuell "Namnge talare igen" (auto-kedjan kör
-                            annars namngivningen av sig själv efter en diarisering). Döljs helt när
-                            ingen åtgärd är möjlig (t.ex. ljudet gallrat + inga talare att namnge). */}
+                            med/utan talarseparering (med: bara när backendens kill switch är på)
+                            + manuell "Namnge talare igen" (auto-kedjan kör annars namngivningen av
+                            sig själv efter en diarisering). Döljs helt när ingen åtgärd är möjlig
+                            (t.ex. ljudet gallrat + inga talare att namnge). */}
                         {(() => {
                             const canRetranscribe = segments.length > 0 && !isRecording && !uploadedJobId &&
                                 !isRetranscribing && !activeJob?.audio_deleted &&
@@ -1078,14 +1097,17 @@ export function SplitView() {
                                     <DropdownMenuContent align="start" className="w-64">
                                         {canRetranscribe && (
                                             <>
-                                                <DropdownMenuItem onClick={() => handleRetranscribe(true)} className="gap-2 cursor-pointer">
-                                                    <Users className="h-3.5 w-3.5 text-brand" />
-                                                    <span className="flex-1">Transkribera om med talarseparering</span>
-                                                    <span className="rounded bg-brand/10 px-1 py-0.5 text-[9px] font-semibold text-brand">Beta</span>
-                                                </DropdownMenuItem>
+                                                {diarizeEnabled && (
+                                                    <DropdownMenuItem onClick={() => handleRetranscribe(true)} className="gap-2 cursor-pointer">
+                                                        <Users className="h-3.5 w-3.5 text-brand" />
+                                                        <span className="flex-1">Transkribera om med talarseparering</span>
+                                                        <span className="rounded bg-brand/10 px-1 py-0.5 text-[9px] font-semibold text-brand">Beta</span>
+                                                    </DropdownMenuItem>
+                                                )}
                                                 <DropdownMenuItem onClick={() => handleRetranscribe(false)} className="gap-2 cursor-pointer">
                                                     <RefreshCw className="h-3.5 w-3.5 text-ink-muted" />
-                                                    Transkribera om (standard)
+                                                    {/* "(standard)" skiljer valet från talarsepareringen ovanför. Utan den finns inget att skilja från. */}
+                                                    {diarizeEnabled ? "Transkribera om (standard)" : "Transkribera om"}
                                                 </DropdownMenuItem>
                                             </>
                                         )}

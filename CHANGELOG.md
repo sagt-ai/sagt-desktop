@@ -7,6 +7,20 @@ Changeloggen börjar vid 0.9.41. Äldre versioner finns inte dokumenterade här.
 
 ---
 
+## 0.10.4 — 2026-09-19
+
+### Ändrat
+
+- **Talarseparering är avstängd tills vidare.** Valen för den visas inte, och appen
+  laddar inte längre upp mötesljudet i onödan efter varje inspelning. Du och Mötet
+  skiljs åt som förut.
+
+### Fixat
+
+- **Talarnamn efter korta möten (Pro).** Namn på talarna föreslås nu även när du
+  stoppar en inspelning som är kortare än en och en halv minut, och de syns direkt
+  i transkriptet.
+
 ## 0.10.3 — 2026-09-14
 
 ### Fixat

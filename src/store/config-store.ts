@@ -21,9 +21,15 @@ interface ConfigStore {
     latestVersion: string | null
     updateAvailable: boolean
     downloadUrl: string
+    // /system/config → diarize_enabled, tolkat av diarizeAvailable. Styr auto-diariseringen
+    // vid stopp och om talarsepareringens val visas. false tills ett svar sagt exakt true:
+    // storen persisteras inte, så varje start börjar avstängd, och en app som startat
+    // offline laddar aldrig upp MÖTET-kanalen på chans.
+    diarizeEnabled: boolean
     setMotd: (m: string | null) => void
     setLatestVersion: (v: string) => void
     setDownloadUrl: (url: string) => void
+    setDiarizeEnabled: (enabled: boolean) => void
 }
 
 export const useConfigStore = create<ConfigStore>((set) => ({
@@ -31,7 +37,9 @@ export const useConfigStore = create<ConfigStore>((set) => ({
     latestVersion: null,
     updateAvailable: false,
     downloadUrl: "https://sagt.ai/downloads",
+    diarizeEnabled: false,
     setMotd: (m) => set({ motd: m }),
     setLatestVersion: (v) => set({ latestVersion: v, updateAvailable: semverGt(v, CURRENT_VERSION) }),
     setDownloadUrl: (url) => set({ downloadUrl: url }),
+    setDiarizeEnabled: (enabled) => set({ diarizeEnabled: enabled }),
 }))

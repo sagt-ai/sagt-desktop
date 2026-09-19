@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { InfoHint } from "@/components/ui/info-hint";
 import { invoke } from "@tauri-apps/api/core";
 import { useAuthStore } from "@/store/auth-store";
+import { useConfigStore } from "@/store/config-store";
 import { useCheckout } from "@/hooks/use-checkout";
 import { toast } from "sonner";
 
@@ -67,6 +68,8 @@ export function SettingsPage() {
 
     const isPro = useAuthStore((s) => s.isPro());
     const monthlyLimit = useAuthStore((s) => s.monthlyMinutesLimit);
+    // Backendens kill switch för talarseparering: styr vilka av valen nedan som visas.
+    const diarizeEnabled = useConfigStore((s) => s.diarizeEnabled);
     const { openCheckout, isOpening: isOpeningCheckout } = useCheckout();
 
     const [availableDevices, setAvailableDevices] = useState<{ name: string, is_default: boolean }[]>([]);
@@ -378,63 +381,71 @@ export function SettingsPage() {
                                     </p>
                                 </div>
 
-                                {/* §13.4 mic-kanal-hint — en talare vid mikrofonen (default på) */}
-                                <div className="space-y-3 pt-1">
-                                    <div>
-                                        <SettingLabel hint={<>Håller din mikrofonkanal som en enda röst så att du inte delas upp i &quot;Du 1&quot; och &quot;Du 2&quot;. Stäng av om ni sitter flera vid samma mikrofon.<br /><br />Påverkar inte den automatiska talarsepareringen efter mötet — den delar bara upp mötesljudet, aldrig din mikrofon.</>}>
-                                            Talare i din mikrofon
-                                        </SettingLabel>
-                                        <p className="text-xs text-muted-foreground mt-1">
-                                            Gäller när hela inspelningen omtranskriberas med talarseparering.
-                                        </p>
-                                    </div>
-                                    <div className="grid grid-cols-2 gap-3">
-                                        {([
-                                            { value: true, label: 'En talare' },
-                                            { value: false, label: 'Flera talare' },
-                                        ] as { value: boolean; label: string }[]).map(({ value, label }) => (
-                                            <button
-                                                key={String(value)}
-                                                onClick={() => setMicIsSingleSpeaker(value)}
-                                                className={`px-3 py-2 rounded-md border text-sm font-medium transition-all ${micIsSingleSpeaker === value
-                                                    ? 'border-primary bg-primary/5 text-primary ring-1 ring-primary'
-                                                    : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
-                                                }`}
-                                            >
-                                                {label}
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
+                                {/* De två valen nedan gäller bara talarsepareringen. "Talare i din mikrofon"
+                                    skickas bara vid omtranskribering med separering, och "Talarseparering efter
+                                    möte" är auto-diariseringen vid stopp. Med backendens kill switch av påverkar
+                                    de ingenting, så de döljs. Värdena ligger kvar i storen. */}
+                                {diarizeEnabled && (
+                                    <>
+                                        {/* §13.4 mic-kanal-hint — en talare vid mikrofonen (default på) */}
+                                        <div className="space-y-3 pt-1">
+                                            <div>
+                                                <SettingLabel hint={<>Håller din mikrofonkanal som en enda röst så att du inte delas upp i &quot;Du 1&quot; och &quot;Du 2&quot;. Stäng av om ni sitter flera vid samma mikrofon.<br /><br />Påverkar inte den automatiska talarsepareringen efter mötet — den delar bara upp mötesljudet, aldrig din mikrofon.</>}>
+                                                    Talare i din mikrofon
+                                                </SettingLabel>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    Gäller när hela inspelningen omtranskriberas med talarseparering.
+                                                </p>
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-3">
+                                                {([
+                                                    { value: true, label: 'En talare' },
+                                                    { value: false, label: 'Flera talare' },
+                                                ] as { value: boolean; label: string }[]).map(({ value, label }) => (
+                                                    <button
+                                                        key={String(value)}
+                                                        onClick={() => setMicIsSingleSpeaker(value)}
+                                                        className={`px-3 py-2 rounded-md border text-sm font-medium transition-all ${micIsSingleSpeaker === value
+                                                            ? 'border-primary bg-primary/5 text-primary ring-1 ring-primary'
+                                                            : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
+                                                        }`}
+                                                    >
+                                                        {label}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
 
-                                {/* §steg 5 — automatik efter möte (opt-out, default på) */}
-                                <div className="space-y-3 pt-1">
-                                    <div>
-                                        <SettingLabel hint="I manuellt läge kör du samma separering via knappen i transkriptet, när du vill. Kräver att ljudfilen finns kvar på datorn.">
-                                            Talarseparering efter möte
-                                        </SettingLabel>
-                                        <p className="text-xs text-muted-foreground mt-1">
-                                            Delar mötesljudet i Talare 1, 2, 3 när du stoppar inspelningen.
-                                        </p>
-                                    </div>
-                                    <div className="grid grid-cols-2 gap-3">
-                                        {([
-                                            { value: true, label: 'Automatiskt' },
-                                            { value: false, label: 'Manuellt' },
-                                        ] as { value: boolean; label: string }[]).map(({ value, label }) => (
-                                            <button
-                                                key={String(value)}
-                                                onClick={() => setAutoDiarize(value)}
-                                                className={`px-3 py-2 rounded-md border text-sm font-medium transition-all ${autoDiarize === value
-                                                    ? 'border-primary bg-primary/5 text-primary ring-1 ring-primary'
-                                                    : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
-                                                }`}
-                                            >
-                                                {label}
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
+                                        {/* §steg 5 — automatik efter möte (opt-out, default på) */}
+                                        <div className="space-y-3 pt-1">
+                                            <div>
+                                                <SettingLabel hint="I manuellt läge kör du samma separering via knappen i transkriptet, när du vill. Kräver att ljudfilen finns kvar på datorn.">
+                                                    Talarseparering efter möte
+                                                </SettingLabel>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    Delar mötesljudet i Talare 1, 2, 3 när du stoppar inspelningen.
+                                                </p>
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-3">
+                                                {([
+                                                    { value: true, label: 'Automatiskt' },
+                                                    { value: false, label: 'Manuellt' },
+                                                ] as { value: boolean; label: string }[]).map(({ value, label }) => (
+                                                    <button
+                                                        key={String(value)}
+                                                        onClick={() => setAutoDiarize(value)}
+                                                        className={`px-3 py-2 rounded-md border text-sm font-medium transition-all ${autoDiarize === value
+                                                            ? 'border-primary bg-primary/5 text-primary ring-1 ring-primary'
+                                                            : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
+                                                        }`}
+                                                    >
+                                                        {label}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    </>
+                                )}
 
                                 <div className="space-y-3 pt-1">
                                     <div>
@@ -658,7 +669,9 @@ export function SettingsPage() {
                         {/* Lokal lagring — diskanvändning + gallringspolicy */}
                         <div className="border-t pt-6 space-y-3">
                             <div>
-                                <SettingLabel hint="Transkript och analyser behålls alltid — bara ljudet gallras. Ljudfilen behövs för att kunna köra om transkriberingen eller talarsepareringen i efterhand.">
+                                <SettingLabel hint={diarizeEnabled
+                                    ? "Transkript och analyser behålls alltid — bara ljudet gallras. Ljudfilen behövs för att kunna köra om transkriberingen eller talarsepareringen i efterhand."
+                                    : "Transkript och analyser behålls alltid — bara ljudet gallras. Ljudfilen behövs för att kunna köra om transkriberingen i efterhand."}>
                                     Ljudfiler på den här datorn
                                 </SettingLabel>
                                 <p className="text-xs text-muted-foreground">

@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button"
 import { ShieldAlert, Loader2 } from "lucide-react"
 import { useConfigStore } from "@/store/config-store"
 import { CURRENT_VERSION } from "@/lib/version"
+import { diarizeAvailable } from "@/lib/system-config"
 
 function compareSemver(a: string, b: string): number {
     const pa = a.split(".").map(Number)
@@ -32,12 +33,21 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
     const setMotd = useConfigStore((s) => s.setMotd)
     const setLatestVersion = useConfigStore((s) => s.setLatestVersion)
     const setDownloadUrlStore = useConfigStore((s) => s.setDownloadUrl)
+    const setDiarizeEnabled = useConfigStore((s) => s.setDiarizeEnabled)
 
     useEffect(() => {
         validateAccess()
     }, [])
 
-    // Delad config-applicering — används av både första kollen och bakgrundsuppdateringen.
+    // Hämta om configen när nätet kommer tillbaka. diarizeEnabled börjar som false, så en
+    // app som startat offline hade annars haft talarsepareringen avstängd tills omstart.
+    useEffect(() => {
+        const onOnline = () => { refreshConfigInBackground() }
+        window.addEventListener("online", onOnline)
+        return () => window.removeEventListener("online", onOnline)
+    }, [])
+
+    // Delad config-applicering: används av första kollen och av bakgrundsuppdateringarna.
     const applyConfig = (data: any) => {
         if (data.download_url) {
             setDownloadUrl(data.download_url)
@@ -45,12 +55,16 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
         }
         if (data.motd) setMotd(data.motd)
         if (data.latest_version) setLatestVersion(data.latest_version)
+        // Utan if, till skillnad från fälten ovan: ett svar som saknar fältet (en backend
+        // före diarize_enabled) ska stänga av talarsepareringen, inte lämna ett gammalt true.
+        setDiarizeEnabled(diarizeAvailable(data))
     }
 
     // Hämta config i bakgrunden (utan timeout) efter att användaren släppts in via
     // offline-toleransen — uppdaterar motd/version/länkar utan att blockera starten.
     // Poängen är cold start-fallet: första fetchens 4s-timeout hinner inte vänta ut
     // Cloud Run (min-0), men denna hämtning utan timeout lyckas när containern vaknat.
+    // Körs också när nätet kommer tillbaka (online-effekten ovan).
     // Rör aldrig guard-state (ingen oväntad UPDATE_REQUIRED mitt i sessionen).
     const refreshConfigInBackground = async () => {
         try {

@@ -14,7 +14,7 @@ name = "sagt"
 # strängen. Att hålla fältet utanför synken gjorde alltså inte problemet ofarligt — det
 # gjorde det osynligt. Rätt svar på en fil som måste vara i synk är att lägga den under
 # grinden, vilket den nu är.
-version = "0.10.3"
+version = "0.10.4"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"

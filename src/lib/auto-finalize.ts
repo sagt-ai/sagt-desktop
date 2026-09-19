@@ -5,19 +5,23 @@
 //   2. PARALLELLT (oberoende indata): auto-analys (§5) på texten + auto-diarisering (§4) som
 //      delar MÖTET-kanalen i Talare 1/2/3 och namnger dem. Analysen läser bara `text`,
 //      diariseringen bara `speaker` → ingen kapplöpning om samma fält, snabbast till "allt klart".
+//      Är backendens kill switch av körs bara namngivningen, på Du/Mötet som de strömmades.
+//      Live-loopen namnger var 90:e sekund, så ett kortare möte fick annars aldrig några namn.
 //
-// All automatik är GATEAD på molnläge + structured + Pro + online + respektive toggle. Aldrig
+// All automatik är GATEAD på molnläge + structured + Pro + online + respektive toggle, och
+// diariseringen dessutom på backendens kill switch (config-store.diarizeEnabled). Aldrig
 // i lokal-läge (integritetslöftet). Fel degraderar TYST till dagens Du/Mötet-läge — de manuella
-// reparationsmenyerna ("Transkribera om med talarseparering", "Namnge talare igen", "Starta
-// analys") finns kvar i SplitView.
+// reparationsmenyerna ("Transkribera om med talarseparering" när kill switchen är på, "Namnge
+// talare igen", "Starta analys") finns kvar i SplitView.
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore } from "@/store/settings-store";
 import { useSyncStore } from "@/store/sync-store";
 import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
 import { useAuthStore } from "@/store/auth-store";
+import { useConfigStore } from "@/store/config-store";
 import { diarizeMeeting, reanalyzeTranscript } from "@/lib/api";
 import { applyDiarizationTurns } from "@/lib/diarize-relabel";
-import { autoIdentify, mergeSuggestions, parseSpeakerData, serializeSpeakerData, speakerKey } from "@/lib/speaker-naming";
+import { autoIdentify, buildTurnsFromSegments, mergeSuggestions, parseSpeakerData, serializeSpeakerData, speakerKey } from "@/lib/speaker-naming";
 import { stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
 import { captureEvent } from "@/hooks/use-posthog-events";
 import { waitForCloudStreamIdle } from "@/hooks/use-cloud-stream";
@@ -51,6 +55,17 @@ function isViewingRecording(recordingId: number | null): boolean {
 }
 
 /**
+ * Gällande talarkarta för mötet. Medan det visas är activeJob sanningskällan: SplitView skriver
+ * en namnändring dit och till DB i samma steg. Annars gäller värdet som fångades vid
+ * finalize-start. Att läsa activeJob då vore fel, eftersom det kan vara ett annat möte.
+ */
+function latestSpeakerMapRaw(recordingId: number | null, captured: string | null): string | null {
+    return isViewingRecording(recordingId)
+        ? (useSyncStore.getState().activeJob?.speaker_map ?? null)
+        : captured;
+}
+
+/**
  * Kör auto-analysen (§steg 5) på den strömmade texten. Egen felhantering: analysfel får
  * ALDRIG påverka diariseringen eller den redan persisterade texten. Tyst degradering.
  */
@@ -77,38 +92,45 @@ async function runAutoAnalysis(recordingId: number | null, segs: UISegment[], to
 }
 
 /**
- * Efter en lyckad diarisering: föreslå namn på de nya MÖTET N-talarna och persistera.
- * R4: strippa instabila (omnumrerbara) nycklar ur gällande map INNAN merge så gamla namn
- * inte hänger kvar på fel omnumrerad röst. Provenance bevaras (mergeSuggestions).
+ * Föreslå namn på talarna i `segs` och persistera. Två anropare vid stopp:
+ *  - efter en lyckad diarisering, med `renumbered: true`: de nya MÖTET N-talarna. R4: strippa
+ *    instabila (omnumrerbara) nycklar ur gällande map INNAN merge så gamla namn inte hänger
+ *    kvar på fel omnumrerad röst.
+ *  - när kill switchen stoppat diariseringen, med `renumbered: false`: Du/Mötet som de
+ *    strömmades. Inget har numrerats om, så map:en används som den är. En strippning här
+ *    hade kastat namn som användaren skrivit in under mötet.
+ * Provenance bevaras i båda fallen (mergeSuggestions).
  */
-async function autoNameAfterDiarize(
+async function autoNameSpeakers(
     recording: StoppedRecording,
-    relabeled: UISegment[],
+    segs: UISegment[],
     baseSpeakerMapRaw: string | null,
     token: string,
+    { renumbered }: { renumbered: boolean },
 ): Promise<void> {
-    // Basen läses från det VÄRDE som fångades vid finalize-start (då activeJob garanterat var
-    // detta möte, efter flushen). Att läsa activeJob här sent vore fel om användaren öppnat ett
-    // annat historikjobb under diariseringen.
-    const current = parseSpeakerData(baseSpeakerMapRaw);
+    const hints = parseSpeakerData(latestSpeakerMapRaw(recording.id, baseSpeakerMapRaw)).participants;
+    const suggested = await autoIdentify(segs, hints, token);
 
-    // R4: ta bort MÖTET N / DU N / TALARE N ur basen (den nya diariseringen numrerar om).
-    const strippedMap = stripUnstableSpeakerMapKeys(current.map);
-    const strippedAuto = current.auto.filter(k => k in strippedMap);
+    // Merga mot FÄRSK state, som live-loopen: användaren kan ha döpt om en talare eller lagt
+    // till en deltagare medan dräneringen, diariseringen och anropet pågick, och det ska vinna.
+    const current = parseSpeakerData(latestSpeakerMapRaw(recording.id, baseSpeakerMapRaw));
 
-    const suggested = await autoIdentify(relabeled, current.participants, token);
-    // Ingen namnhärledning → behåll strippade basen (men persistera ändå strippningen nedan
-    // så en tidigare namngiven, nu omnumrerad talare inte visar fel namn).
+    // R4: ta bort MÖTET N / DU N / TALARE N ur basen när diariseringen numrerat om dem.
+    const baseMap = renumbered ? stripUnstableSpeakerMapKeys(current.map) : current.map;
+    const baseAuto = current.auto.filter(k => k in baseMap);
+
+    // Ingen namnhärledning → behåll basen (men persistera ändå en strippning nedan så en
+    // tidigare namngiven, nu omnumrerad talare inte visar fel namn).
     const merged = suggested
-        ? mergeSuggestions(strippedMap, suggested, strippedAuto)
-        : { map: strippedMap, autoKeys: strippedAuto };
+        ? mergeSuggestions(baseMap, suggested, baseAuto)
+        : { map: baseMap, autoKeys: baseAuto };
 
     // Ingen namnhärledning OCH inga instabila nycklar strippade → payloaden är identisk med
     // det redan sparade (stripping tar bara bort nycklar; lika längd ⇒ inget borttaget). Hoppa
     // persistensen så vi undviker en onödig DB-skrivning + activeJob-re-render.
     const nothingChanged =
         suggested == null &&
-        Object.keys(strippedMap).length === Object.keys(current.map).length;
+        Object.keys(baseMap).length === Object.keys(current.map).length;
     if (nothingChanged) return;
 
     const payload = serializeSpeakerData({
@@ -164,7 +186,7 @@ async function runAutoDiarize(
             useTranscriptionStore.getState().setSegments(relabeled);
         }
 
-        await autoNameAfterDiarize(recording, relabeled, baseSpeakerMapRaw, token);
+        await autoNameSpeakers(recording, relabeled, baseSpeakerMapRaw, token, { renumbered: true });
     } catch (e: any) {
         console.warn("Auto-diarisering vid stopp misslyckades:", e?.message || e);
         captureEvent("diarization_failed", { reason: e?.message || "unknown", source: "auto_stop" });
@@ -182,11 +204,14 @@ async function runAutoDiarize(
     }
 }
 
-/** True om auto-diarisering ska köras: molnläge + structured + Pro + online + autoDiarize +
- *  ljudfil + minst ett MÖTET-segment att dela + token. */
+/** True om auto-diarisering ska köras: kill switchen på + molnläge + structured + Pro + online +
+ *  autoDiarize + ljudfil + minst ett MÖTET-segment att dela + token. */
 function shouldAutoDiarize(isCloudMode: boolean, recording: StoppedRecording, segs: UISegment[], token: string | null): boolean {
     const s = useSettingsStore.getState();
     return (
+        // Kill switchen måste stoppa oss här, före extraktionen. POST /diarize svarar visserligen
+        // 503 när den är av, men först när hela MÖTET-kanalen (~110 MB/h) laddats upp.
+        useConfigStore.getState().diarizeEnabled &&
         isCloudMode &&
         s.cloudDiarizationMode === "structured" &&
         s.autoDiarize &&
@@ -200,10 +225,57 @@ function shouldAutoDiarize(isCloudMode: boolean, recording: StoppedRecording, se
 }
 
 /**
+ * Namngivning vid stopp när kill switchen stoppat diariseringen. Live-loopen
+ * (use-live-speaker-naming.ts) namnger var 90:e sekund, så utan detta fick en inspelning
+ * kortare än 90 s aldrig några namn automatiskt. Samma anrop som efter en diarisering, på
+ * Du/Mötet-segmenten som de strömmades. Tyst degradering vid fel, som live-loopen.
+ */
+async function runAutoNameWithoutDiarize(
+    recording: StoppedRecording,
+    segs: UISegment[],
+    baseSpeakerMapRaw: string | null,
+    token: string,
+): Promise<void> {
+    try {
+        await autoNameSpeakers(recording, segs, baseSpeakerMapRaw, token, { renumbered: false });
+    } catch (e: any) {
+        console.warn("Namngivning vid stopp misslyckades:", e?.message || e);
+    }
+}
+
+/** True om namngivningen ska köras utan diarisering: kill switchen av + live-loopens villkor
+ *  (molnläge + structured + Pro + online) + token + inspelning + minst en talare vars namn
+ *  saknas eller bara är auto-satt. */
+function shouldAutoNameWithoutDiarize(
+    isCloudMode: boolean,
+    recording: StoppedRecording,
+    segs: UISegment[],
+    token: string | null,
+    baseSpeakerMapRaw: string | null,
+): boolean {
+    const s = useSettingsStore.getState();
+    if (
+        useConfigStore.getState().diarizeEnabled ||
+        !isCloudMode ||
+        s.cloudDiarizationMode !== "structured" ||
+        !useAuthStore.getState().isPro() ||
+        !navigator.onLine ||
+        !token ||
+        recording.id == null
+    ) return false;
+    // Samma vila som live-loopen: har användaren redan namngett varje talare finns inget att
+    // föreslå (mergeSuggestions rör aldrig ett användarsatt namn), så anropet kan sparas.
+    const { map, auto } = parseSpeakerData(latestSpeakerMapRaw(recording.id, baseSpeakerMapRaw));
+    const speakers = new Set(buildTurnsFromSegments(segs).map(t => t.speaker));
+    return [...speakers].some(k => !(k in map) || auto.includes(k));
+}
+
+/**
  * Post-stop-pipelinen för en STRÖMMAD molnsession. Anropas av ControlBar i history-updated
  * när `cloudStreamingActive`. Persisterar strömmade segment, kör sedan analys + diarisering
- * parallellt. Blockerar inte UI:t med toaster — texten är redan läsbar; en diskret
- * "Förfinar talare…"-indikator styrs via isProcessing i anroparen.
+ * (eller bara namngivning, när kill switchen är av) parallellt. Blockerar inte UI:t med
+ * toaster — texten är redan läsbar; en diskret "Förfinar talare…"-indikator styrs via
+ * isProcessing i anroparen.
  */
 export async function finalizeStreamingSession(params: {
     recording: StoppedRecording;
@@ -214,8 +286,8 @@ export async function finalizeStreamingSession(params: {
     const tStore = useTranscriptionStore.getState();
     tStore.setIsProcessing(true);
     // Fånga talarmap-basen NU, medan activeJob garanterat är detta möte (satt + flushat i
-    // history-updated före detta anrop). autoNameAfterDiarize läser detta värde, inte en sent
-    // omläst activeJob som kan ha bytts av en ny session/historiköppning under diariseringen.
+    // history-updated före detta anrop). autoNameSpeakers faller tillbaka på detta värde när
+    // activeJob har bytts av en ny session/historiköppning under diariseringen.
     const baseSpeakerMapRaw: string | null = useSyncStore.getState().activeJob?.speaker_map ?? null;
     try {
         // Vänta tills moln-kön dränerats så de sista chunkarna hinner in (analysen ska köra
@@ -235,7 +307,8 @@ export async function finalizeStreamingSession(params: {
         }
 
         // Analys (§5) + diarisering (§4) parallellt — oberoende indata. allSettled: den ena
-        // får misslyckas utan att stoppa den andra.
+        // får misslyckas utan att stoppa den andra. Med kill switchen av tar namngivningen
+        // diariseringens plats.
         const settings = useSettingsStore.getState();
         const tasks: Promise<void>[] = [];
         if (isCloudMode && settings.autoAnalyze && segs.length > 0 && token) {
@@ -243,6 +316,8 @@ export async function finalizeStreamingSession(params: {
         }
         if (shouldAutoDiarize(isCloudMode, recording, segs, token)) {
             tasks.push(runAutoDiarize(recording, segs, baseSpeakerMapRaw, token as string));
+        } else if (shouldAutoNameWithoutDiarize(isCloudMode, recording, segs, token, baseSpeakerMapRaw)) {
+            tasks.push(runAutoNameWithoutDiarize(recording, segs, baseSpeakerMapRaw, token as string));
         }
         if (tasks.length > 0) await Promise.allSettled(tasks);
     } catch (e: any) {
