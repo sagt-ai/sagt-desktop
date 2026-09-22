@@ -1,10 +1,11 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
+import { useTranscriptionStore } from "@/store/transcription-store";
 import { useAuthStore } from "@/store/auth-store";
 import { useSyncStore } from "@/store/sync-store";
 import { transcribeChunk } from "@/lib/api";
+import { MissingTokenError, insertCloudSegment, isRetryableChunkError, retryDelayMs } from "@/lib/cloud-chunks";
 import posthog from "posthog-js";
 import { showError } from "@/hooks/use-posthog-events";
 
@@ -26,6 +27,11 @@ let pending = 0;
 let cancelRequested = false;
 let wasBusy = false;
 let errored = false;
+// Räknas upp vid varje ny session, avbrott och avmontering. En bit tar sin generation när
+// den plockas ur kön och släpps tyst om den har bytts: med omförsök kan en bit leva ~12 s,
+// och resetCloudStream() nollställer cancelRequested vid nästa start — utan generationen
+// hade en bit från förra mötet kunnat landa i det nya efter clearSegments().
+let generation = 0;
 
 export function cloudStreamBusy(): boolean {
     return pending > 0 || queue.length > 0;
@@ -41,6 +47,7 @@ export async function waitForCloudStreamIdle(timeoutMs = 60000): Promise<void> {
 // #11: Avbryt ska bita på moln-kön — töm den, släpp in inga fler chunks och släck "Bearbetar".
 export function cancelCloudStream() {
     cancelRequested = true;
+    generation++;
     queue = [];
     wasBusy = false;
     useTranscriptionStore.getState().setIsProcessing(false);
@@ -48,6 +55,7 @@ export function cancelCloudStream() {
 
 // Nollställs vid varje inspelningsstart (control-bar) så en ny session inte ärver avbrottet.
 export function resetCloudStream() {
+    generation++;
     cancelRequested = false;
     queue = [];
     wasBusy = false;
@@ -77,23 +85,6 @@ async function persistSegments() {
     }
 }
 
-// #7: Lead-in:en (#5B) kan transkriberas i både chunk N och N+1 → sista orden i ett stycke
-// blir samma som första i nästa. Trimma nya segmentets ledande ord som dubblerar föregående
-// (samma talare) segments avslutande ord. Skiftläges-/skiljeteckensokänslig, ≥2 ord.
-function stripOverlap(prevText: string, newText: string): string {
-    const norm = (w: string) => w.toLowerCase().replace(/[.,!?;:]/g, "");
-    const prev = prevText.trim().split(/\s+/).filter(Boolean);
-    const next = newText.trim().split(/\s+/).filter(Boolean);
-    if (prev.length === 0 || next.length === 0) return newText;
-    const maxOverlap = Math.min(6, prev.length, next.length);
-    for (let k = maxOverlap; k >= 2; k--) {
-        const tail = prev.slice(prev.length - k).map(norm).join(" ");
-        const head = next.slice(0, k).map(norm).join(" ");
-        if (tail === head) return next.slice(k).join(" ");
-    }
-    return newText;
-}
-
 /**
  * Lyssnar på Rust `cloud-chunk-ready` (PRO live-molnströmning), POSTar varje VAD-segment
  * till /transcribe-chunk och matar in resultatet i transcription-store med talar-tag.
@@ -108,48 +99,64 @@ export function useCloudStream() {
         wasBusy = false;
         errored = false;
 
-        const handleChunk = async (chunk: CloudChunkEvent, attempt: number): Promise<void> => {
-            try {
-                const token = useAuthStore.getState().getToken();
-                if (!token) throw new Error("Ingen autentiseringstoken");
-                const res = await transcribeChunk(chunk.audio, chunk.speaker, chunk.start, token);
-                if (cancelRequested) return; // #11: avbrutet medan POST var i luften — släng resultatet
-                const text = (res.text || "").trim();
-                if (text) {
-                    const store = useTranscriptionStore.getState();
-                    let prevSame: UISegment | undefined;
-                    for (let i = store.segments.length - 1; i >= 0; i--) {
-                        if (store.segments[i].speaker === chunk.speaker) { prevSame = store.segments[i]; break; }
-                    }
-                    const deduped = (prevSame ? stripOverlap(prevSame.text, text) : text).trim();
-                    if (deduped) {
-                        store.addSegment({
-                            text: deduped,
+        const stale = (gen: number) => !active || cancelRequested || gen !== generation;
+
+        // Väntan före omförsök, som släpper sin plats i kön inom 100 ms när biten blivit
+        // inaktuell. Annars håller en bit från ett avbrutet möte en av MAX_CONCURRENT platser
+        // i upp till ~8 s, och nästa mötes första bitar får vänta (code review 2026-09-21).
+        const sleepUnlessStale = async (ms: number, gen: number) => {
+            const until = Date.now() + ms;
+            while (!stale(gen) && Date.now() < until) {
+                await new Promise((r) => setTimeout(r, Math.min(100, until - Date.now())));
+            }
+        };
+
+        const handleChunk = async (chunk: CloudChunkEvent, gen: number): Promise<void> => {
+            for (let attempt = 0; ; attempt++) {
+                try {
+                    const token = useAuthStore.getState().getToken();
+                    if (!token) throw new MissingTokenError();
+                    const res = await transcribeChunk(chunk.audio, chunk.speaker, chunk.start, token);
+                    if (stale(gen)) return; // #11: avbrutet eller ny session medan POST var i luften
+                    const text = (res.text || "").trim();
+                    if (text) {
+                        const store = useTranscriptionStore.getState();
+                        const next = insertCloudSegment(store.segments, {
+                            text,
                             start_time: chunk.start,
                             end_time: chunk.start + chunk.duration,
                             timestamp: chunk.start * 1000,
                             speaker: chunk.speaker,
                         });
+                        if (next) store.setSegments(next);
+                        posthog?.capture?.("cloud_chunk_ok", { speaker: chunk.speaker, attempts: attempt + 1 });
+                        errored = false; // #8 re-arm: lyckad chunk → tillåt ny felnotis senare
+                    } else {
+                        posthog?.capture?.("cloud_chunk_empty", { speaker: chunk.speaker, attempts: attempt + 1 });
                     }
-                    posthog?.capture?.("cloud_chunk_ok", { speaker: chunk.speaker });
-                    errored = false; // #8 re-arm: lyckad chunk → tillåt ny felnotis senare
-                } else {
-                    posthog?.capture?.("cloud_chunk_empty", { speaker: chunk.speaker });
-                }
-            } catch (e: any) {
-                const msg = String(e?.message || e);
-                // #8 retry en gång vid transient fel (ej auth/quota/payment).
-                if (attempt === 0 && !/Payment Required|Quota|autentisering/i.test(msg)) {
-                    await new Promise((r) => setTimeout(r, 400));
-                    return handleChunk(chunk, 1);
-                }
-                console.error("Cloud chunk failed:", msg);
-                posthog?.capture?.("cloud_chunk_error", { speaker: chunk.speaker, message: msg.slice(0, 140) });
-                if (!errored) {
-                    errored = true;
-                    if (msg.includes("Payment Required")) showError('not_pro', "Molntranskribering kräver aktiv Pro-prenumeration.", { action: 'cloud_stream' });
-                    else if (msg.includes("Quota")) showError('quota_exceeded', "Månadsgränsen för molntranskribering är nådd.", { action: 'cloud_stream' });
-                    else showError('unavailable', "Molntranskribering avbröts (nätverk/server). Försöker igen automatiskt.", { action: 'cloud_stream' }, { duration: 6000 });
+                    return;
+                } catch (e: any) {
+                    if (stale(gen)) return;
+                    const msg = String(e?.message || e);
+                    // #8: omförsök vid fel som kan gå över (nätverk, 5xx), med växande väntan.
+                    // Aldrig vid auth, Pro, kvot eller en trasig bit — samma svar kommer igen.
+                    const delay = isRetryableChunkError(e) ? retryDelayMs(attempt) : null;
+                    if (delay !== null) {
+                        await sleepUnlessStale(delay, gen);
+                        if (stale(gen)) return;
+                        continue;
+                    }
+                    console.error("Cloud chunk failed:", msg);
+                    posthog?.capture?.("cloud_chunk_error", {
+                        speaker: chunk.speaker, message: msg.slice(0, 140), attempts: attempt + 1,
+                    });
+                    if (!errored) {
+                        errored = true;
+                        if (msg.includes("Payment Required")) showError('not_pro', "Molntranskribering kräver aktiv Pro-prenumeration.", { action: 'cloud_stream' });
+                        else if (msg.includes("Quota")) showError('quota_exceeded', "Månadsgränsen för molntranskribering är nådd.", { action: 'cloud_stream' });
+                        else showError('unavailable', "Molntranskribering avbröts (nätverk/server). Försöker igen automatiskt.", { action: 'cloud_stream' }, { duration: 6000 });
+                    }
+                    return;
                 }
             }
         };
@@ -169,10 +176,11 @@ export function useCloudStream() {
         const pump = () => {
             while (active && !cancelRequested && pending < MAX_CONCURRENT && queue.length > 0) {
                 const chunk = queue.shift()!;
+                const gen = generation;
                 pending++;
                 wasBusy = true;
                 void (async () => {
-                    await handleChunk(chunk, 0);
+                    await handleChunk(chunk, gen);
                     pending--;
                     pump();
                     onMaybeDrained();
@@ -193,6 +201,7 @@ export function useCloudStream() {
 
         return () => {
             active = false;
+            generation++;
             queue = [];
             pending = 0;
             wasBusy = false;

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore } from "@/store/settings-store";
+import { ChunkHttpError } from "./cloud-chunks";
 
 // Re-export så alla `import { errorSlug } from "@/lib/api"` fungerar; själva funktionen
 // bor i en ren fil utan Tauri-beroenden (error-slug.ts) → enhetstestbar i node.
@@ -65,10 +66,12 @@ export async function transcribeChunk(
         const errText = await response.text();
         let detail = errText;
         try { const p = JSON.parse(errText); if (p.detail) detail = p.detail; } catch { }
-        if (response.status === 401) throw new Error(`Unauthorized: ${detail}`);
-        if (response.status === 402) throw new Error(`Payment Required: ${detail}`);
-        if (response.status === 429) throw new Error(`Quota: ${detail}`);
-        throw new Error(`Chunk-transkribering misslyckades: ${detail}`);
+        // Status följer med felet, så att kön kan avgöra vad som är värt ett omförsök
+        // (cloud-chunks.ts). Meddelandena är oförändrade: felnotisen läser dem.
+        if (response.status === 401) throw new ChunkHttpError(`Unauthorized: ${detail}`, 401);
+        if (response.status === 402) throw new ChunkHttpError(`Payment Required: ${detail}`, 402);
+        if (response.status === 429) throw new ChunkHttpError(`Quota: ${detail}`, 429);
+        throw new ChunkHttpError(`Chunk-transkribering misslyckades: ${detail}`, response.status);
     }
 
     return await response.json();

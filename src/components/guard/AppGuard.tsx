@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button"
 import { ShieldAlert, Loader2 } from "lucide-react"
 import { useConfigStore } from "@/store/config-store"
 import { CURRENT_VERSION } from "@/lib/version"
-import { diarizeAvailable } from "@/lib/system-config"
+import { diarizeAvailable, liveDiarizeAvailable } from "@/lib/system-config"
 
 function compareSemver(a: string, b: string): number {
     const pa = a.split(".").map(Number)
@@ -34,6 +34,7 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
     const setLatestVersion = useConfigStore((s) => s.setLatestVersion)
     const setDownloadUrlStore = useConfigStore((s) => s.setDownloadUrl)
     const setDiarizeEnabled = useConfigStore((s) => s.setDiarizeEnabled)
+    const setLiveDiarizeEnabled = useConfigStore((s) => s.setLiveDiarizeEnabled)
 
     useEffect(() => {
         validateAccess()
@@ -58,6 +59,7 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
         // Utan if, till skillnad från fälten ovan: ett svar som saknar fältet (en backend
         // före diarize_enabled) ska stänga av talarsepareringen, inte lämna ett gammalt true.
         setDiarizeEnabled(diarizeAvailable(data))
+        setLiveDiarizeEnabled(liveDiarizeAvailable(data))
     }
 
     // Hämta config i bakgrunden (utan timeout) efter att användaren släppts in via

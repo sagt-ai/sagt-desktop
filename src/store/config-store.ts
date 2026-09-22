@@ -26,10 +26,15 @@ interface ConfigStore {
     // storen persisteras inte, så varje start börjar avstängd, och en app som startat
     // offline laddar aldrig upp MÖTET-kanalen på chans.
     diarizeEnabled: boolean
+    // /system/config → live_diarize_enabled, tolkat av liveDiarizeAvailable. Grindar
+    // mint-anropet i use-live-diarize. Samma default och samma skäl som diarizeEnabled:
+    // false tills ett svar sagt exakt true.
+    liveDiarizeEnabled: boolean
     setMotd: (m: string | null) => void
     setLatestVersion: (v: string) => void
     setDownloadUrl: (url: string) => void
     setDiarizeEnabled: (enabled: boolean) => void
+    setLiveDiarizeEnabled: (enabled: boolean) => void
 }
 
 export const useConfigStore = create<ConfigStore>((set) => ({
@@ -38,8 +43,10 @@ export const useConfigStore = create<ConfigStore>((set) => ({
     updateAvailable: false,
     downloadUrl: "https://sagt.ai/downloads",
     diarizeEnabled: false,
+    liveDiarizeEnabled: false,
     setMotd: (m) => set({ motd: m }),
     setLatestVersion: (v) => set({ latestVersion: v, updateAvailable: semverGt(v, CURRENT_VERSION) }),
     setDownloadUrl: (url) => set({ downloadUrl: url }),
     setDiarizeEnabled: (enabled) => set({ diarizeEnabled: enabled }),
+    setLiveDiarizeEnabled: (enabled) => set({ liveDiarizeEnabled: enabled }),
 }))

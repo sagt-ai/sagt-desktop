@@ -1,195 +1,220 @@
-# Ändringar i Sagt.ai Desktop
+# Sagt.ai Desktop changelog
 
-Den här filen är **för användare**. Den beskriver vad som ändrats i appen, inte
-hur eller varför det byggdes. Varje post skrivs för hand.
+This file is **for users**. It describes what has changed in the app, not how or
+why it was built. Every entry is written by hand.
 
-Changeloggen börjar vid 0.9.41. Äldre versioner finns inte dokumenterade här.
+The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.10.5 — 2026-09-22
+
+### Fixed
+
+- **Cloud transcription could lose a passage when the server had trouble (Pro).**
+  If the connection or the server failed for a few seconds, a passage could go
+  missing from the transcript. The app now tries again for up to about 12 seconds
+  before it gives up.
+
+- **A passage that arrived late could end up out of order (Pro).** The transcript
+  on screen was in the right order, but the saved text and the meeting analysis
+  could have the late passage in the wrong place.
+
+- **Text from the previous meeting could appear in the next one (Pro).** If you
+  started a new recording right after stopping one, a late passage from the
+  earlier meeting could end up in the new one.
+
 ## 0.10.4 — 2026-09-19
 
-### Ändrat
+### Changed
 
-- **Talarseparering är avstängd tills vidare.** Valen för den visas inte, och appen
-  laddar inte längre upp mötesljudet i onödan efter varje inspelning. Du och Mötet
-  skiljs åt som förut.
+- **Speaker separation is switched off for now.** Its options are hidden, and the
+  app no longer uploads the meeting audio after every recording for no purpose.
+  You and the meeting are still told apart as before.
 
-### Fixat
+### Fixed
 
-- **Talarnamn efter korta möten (Pro).** Namn på talarna föreslås nu även när du
-  stoppar en inspelning som är kortare än en och en halv minut, och de syns direkt
-  i transkriptet.
+- **Speaker names after short meetings (Pro).** Names for the speakers are now
+  suggested even when you stop a recording shorter than a minute and a half, and
+  they appear in the transcript right away.
 
 ## 0.10.3 — 2026-09-14
 
-### Fixat
+### Fixed
 
-- **Uppgradering från provperiodsbannern kopplades inte till ditt konto.** Betalade
-  du via knappen i bannern kunde Pro utebli efter köpet. Nu hör köpet alltid ihop med
-  kontot du är inloggad med, oavsett var i appen du uppgraderar.
+- **Upgrading from the trial banner was not tied to your account.** If you paid
+  through the button in the banner, Pro could fail to appear after the purchase.
+  The purchase is now always tied to the account you are signed in with, wherever
+  in the app you upgrade.
 
-- **Priset i uppgraderingsrutan stod som "ex. moms".** Pro kostar 199 kr i månaden
-  inklusive moms, precis som på sagt.ai.
+- **The upgrade dialog showed the price as excluding VAT.** Pro costs 199 kr a
+  month including VAT, just as on sagt.ai.
 
-### Ändrat
+### Changed
 
-- **Du kan inte längre råka köpa Pro två gånger.** Har du redan en prenumeration —
-  eller har du nyss betalat och Pro inte hunnit synas i appen — får du besked i stället
-  för en ny betalning.
+- **You can no longer buy Pro twice by mistake.** If you already have a
+  subscription — or have just paid and Pro has not shown up in the app yet — you
+  are told so instead of being taken to a new payment.
 
-- **Uppgraderingsknapparna visar att betalningen öppnas**, och säger tydligt till om
-  du behöver logga in eller saknar internetanslutning.
+- **The upgrade buttons show that the payment page is opening**, and say clearly
+  when you need to sign in or have no internet connection.
 
-## 0.10.2 — 2026-09-02
+## 0.10.2 — 2026-09-08
 
-### Fixat
+### Fixed
 
-- **Datorn kunde inte somna när appen var öppen.** Sagt.ai höll ljudkanalen för
-  mötesljud igång hela tiden, även när ingen inspelning pågick — vilket hindrade
-  Macen från att gå i viloläge och höll högtalarens ljudmotor vaken dygnet runt.
-  Mötesljudet kopplas nu in när du börjar spela in och släpps när du slutar.
+- **The computer could not go to sleep while the app was open.** Sagt.ai kept the
+  meeting-audio channel running all the time, even when nothing was being
+  recorded — which stopped the Mac from going to sleep and kept the speaker's
+  audio engine awake around the clock. Meeting audio is now connected when you
+  start recording and released when you stop.
 
-- **Ljud från en tidigare inspelning kunde hamna i nästa.** Upp till två sekunder
-  från slutet av föregående inspelning kunde följa med in i början av nästa
-  transkription. Det gick inte att se i appen.
+- **Audio from a previous recording could end up in the next one.** Up to two
+  seconds from the end of the previous recording could carry over into the start
+  of the next transcript. There was no way to see this in the app.
 
-- **Falsk varning om systemljud.** Startade du en inspelning utan att något
-  spelades på datorn — vanlig diktering — varnade appen för att mötesljud inte
-  fångades, trots att det inte fanns något att fånga. Varningen kommer nu bara när
-  det faktiskt spelas ljud som appen missar.
+- **False warning about system audio.** If you started a recording with nothing
+  playing on the computer — ordinary dictation — the app warned that meeting audio
+  was not being captured, even though there was nothing to capture. The warning
+  now appears only when audio is actually playing and the app is missing it.
 
-- **Inspelningar som försvann utan förklaring.** Om skrivningen till disk
-  misslyckades kunde inspelningen tystna helt, och alla senare inspelningar under
-  samma körning gjorde det också tills appen startades om. Nu får du ett tydligt
-  fel, och det som hunnit spelas in sparas.
+- **Recordings that were lost without explanation.** If writing to disk failed,
+  the recording could go completely silent, and so could every later recording
+  until the app was restarted. You now get a clear error, and what has been
+  recorded so far is saved.
 
-- **En inspelning som inte innehöll något ljud sa ingenting.** Nu får du veta
-  direkt när inspelningen är tom eller när din egen mikrofonkanal var tyst, i
-  stället för att upptäcka det när du öppnar transkriptet.
+- **A recording with no sound in it said nothing.** You are now told right away
+  when a recording is empty or when your own microphone channel was silent,
+  instead of finding out when you open the transcript.
 
-### Nytt
+### Added
 
-- **Loggfil även på Windows.** Appen sparar nu samma slags loggfil på Windows som
-  på Mac sedan förra versionen, under `AppData\Roaming\com.sagt.ai\logs\`. Den
-  beskriver vad appen gör — vilka ljudenheter som används och när något
-  misslyckas — så att ett problem går att felsöka i efterhand i stället för att
-  behöva återskapas. **Den innehåller aldrig ditt ljud och aldrig texten ur dina
-  inspelningar.** Filen roterar vid 5 MB och lämnar aldrig datorn av sig själv.
+- **A log file on Windows too.** The app now keeps the same kind of log file on
+  Windows that the Mac has had since the previous version, under
+  `AppData\Roaming\com.sagt.ai\logs\`. It describes what the app does — which
+  audio devices are used and when something fails — so a problem can be diagnosed
+  afterwards instead of having to be reproduced. **It never contains your audio or
+  the text of your recordings.** The file rotates at 5 MB and never leaves your
+  computer on its own.
 
-### Ändrat
+### Changed
 
-- **Loggfilen skriver mycket mindre i viloläge.** Den fylldes tidigare av en rad
-  per sekund även när ingenting hände, vilket gjorde att verkliga fel skrevs över
-  inom ett dygn. Nu räcker samma utrymme i ungefär en månad.
+- **The log file writes much less when idle.** It used to fill up with one line
+  per second even when nothing was happening, which meant real errors were
+  overwritten within a day. The same space now lasts about a month.
 
 ## 0.10.1 — 2026-08-30
 
-### Fixat
+### Fixed
 
-- **Inspelningar som inte gav något.** På Mac kunde mikrofonen låta bli att starta
-  om inget annat ljud spelades på datorn. Inspelningen såg ut att komma igång, men
-  gav varken ljudnivåer eller text, och den orange mikrofonsymbolen dök aldrig upp
-  i menyraden. Började något spela — en video, ett möte — vaknade den plötsligt
-  mitt i. Ett nytt försök fungerade ofta, vilket gjorde felet svårt att känna igen.
+- **Recordings that produced nothing.** On the Mac, the microphone could fail to
+  start if no other sound was playing on the computer. The recording appeared to
+  start but showed no audio levels and produced no text, and the orange
+  microphone indicator never appeared in the menu bar. If something started
+  playing — a video, a meeting — it would suddenly wake up mid-recording. Trying
+  again often worked, which made the fault hard to recognise.
 
-  Mikrofonen startar nu direkt, oavsett om något annat låter.
+  The microphone now starts right away, whether or not anything else is making
+  sound.
 
-### Ändrat
+### Changed
 
-- **Appen sparar en loggfil** under `Bibliotek/Application Support/com.sagt.ai/logs/`.
-  Den beskriver vad appen gör — vilka ljudenheter som används och när något
-  misslyckas — så att ett fel går att felsöka i efterhand i stället för att behöva
-  återskapas. **Den innehåller aldrig ditt ljud och aldrig texten ur dina
-  inspelningar.** Filen roterar vid 5 MB och lämnar aldrig datorn av sig själv.
+- **The app keeps a log file** under `Library/Application Support/com.sagt.ai/logs/`.
+  It describes what the app does — which audio devices are used and when
+  something fails — so a fault can be diagnosed afterwards instead of having to be
+  reproduced. **It never contains your audio or the text of your recordings.** The
+  file rotates at 5 MB and never leaves your computer on its own.
 
 ## 0.10.0 — 2026-08-29
 
-### Nytt
+### Added
 
-- **Sagt.ai finns nu för Mac.** Samma app som på Windows: inspelning, lokal
-  transkribering med KB-Whisper och mötesljud från Teams, Zoom och Meet — utan att
-  någon bot ansluter till samtalet.
+- **Sagt.ai is now available for the Mac.** The same app as on Windows:
+  recording, on-device transcription with KB-Whisper, and meeting audio from
+  Teams, Zoom and Meet — without a bot joining the call.
 
-  Kräver **macOS 14.2 eller senare** och en Mac med **Apple Silicon** (M1 eller
-  senare). Intel-Macar stöds inte.
+  Requires **macOS 14.2 or later** and a Mac with **Apple Silicon** (M1 or
+  later). Intel Macs are not supported.
 
-  Vid första start frågar macOS om mikrofon, och om systemljud första gången du
-  spelar in ett möte. Båda behövs för att mötets övriga deltagare ska komma med.
+  On first launch macOS asks for access to the microphone, and to system audio
+  the first time you record a meeting. Both are needed for the other people in
+  the meeting to be included.
 
-  Appen är godkänd av Apple, så den öppnas utan säkerhetsvarning — även utan
-  internetanslutning.
+  The app is notarised by Apple, so it opens without a security warning — even
+  without an internet connection.
 
-### Ändrat
+### Changed
 
-- **Nedladdningssidan visar rätt fil för din dator.** Båda versionerna finns
-  alltid tillgängliga, så du kan hämta Mac-filen från en Windows-dator och tvärtom.
-- **Installationsfilens storlek anges nu korrekt.** Sidan sa tidigare 165 MB;
-  Windows-installern är 172 MB och Mac-filen 178 MB.
+- **The download page shows the right file for your computer.** Both versions are
+  always available, so you can download the Mac file from a Windows computer and
+  vice versa.
+- **The installer size is now stated correctly.** The page used to say 165 MB; the
+  Windows installer is 172 MB and the Mac file 178 MB.
 
-### För dig som använder Windows
+### For Windows users
 
-Ingenting har ändrats i appen. Den här versionen finns för att Windows och Mac
-släpps tillsammans, med samma versionsnummer.
+Nothing has changed in the app. This version exists because Windows and the Mac
+are released together, with the same version number.
 
 ---
 
 ## 0.9.44 — 2026-08-05
 
-### Fixat
+### Fixed
 
-- **Pro syntes inte alltid direkt efter betalning.** Tog betalningen längre än
-  fem minuter slutade appen leta, och uppgraderingserbjudandet kunde ligga kvar i
-  upp till en halvtimme trots att köpet gått igenom. Appen fortsätter nu att
-  kontrollera, och knappen "Uppdatera status" ger besked om vad den hittade.
-- **Ingen bekräftelse vid lyckat köp.** Uppgraderingsdialogen visade prislistan
-  igen i stället för att bekräfta att Pro aktiverats.
-- **Nätverksfel beskrevs som utebliven prenumeration.** Den som saknade
-  internetanslutning fick meddelandet "ingen prenumeration hittades" och kunde
-  tro att köpet misslyckats.
+- **Pro did not always show up right after payment.** If the payment took longer
+  than five minutes, the app stopped checking, and the upgrade offer could stay
+  for up to half an hour even though the purchase had gone through. The app now
+  keeps checking, and the refresh-status button tells you what it found.
+- **No confirmation after a successful purchase.** The upgrade dialog showed the
+  price list again instead of confirming that Pro had been activated.
+- **Network errors were described as a missing subscription.** Anyone without an
+  internet connection was told that no subscription was found, and could believe
+  the purchase had failed.
 
 ---
 
 ## 0.9.43 — 2026-08-01
 
-### Fixat
+### Fixed
 
-- **Ljudinställningarna tillämpades inte förrän du öppnat Inställningar.** Hade
-  du ställt in tystnadströskel eller paustolerans men aldrig besökt fliken efter
-  omstart körde appen sina egna standardvärden — medan gränssnittet visade dina.
-- **Lokal transkribering körde svensk modell oavsett valt språk.** Norska och
-  engelska gav därför tyst sämre text lokalt. Lokal transkribering är nu alltid
-  svensk, och det framgår i gränssnittet. Molntranskribering (Pro) byter modell
-  på riktigt.
+- **Audio settings were not applied until you opened Settings.** If you had set a
+  silence threshold or pause tolerance but had not visited the tab after a
+  restart, the app used its own defaults — while the interface showed yours.
+- **On-device transcription ran the Swedish model whatever language you chose.**
+  Norwegian and English therefore quietly gave poorer text on-device. On-device
+  transcription is now always Swedish, and the interface says so. Cloud
+  transcription (Pro) really does switch model.
 
-### Ändrat
+### Changed
 
-- **Inställningarna skrevs om.** Varje inställning har nu en kort synlig rad, och
-  konsekvenserna ligger bakom ⓘ i stället för i löpande text.
-- **Hem-vyn visade läget på tre ställen samtidigt** under inspelning. Nu på ett.
+- **The settings were rewritten.** Every setting now has one short visible line,
+  and the consequences sit behind ⓘ instead of in running text.
+- **The home view showed the mode in three places at once** while recording. Now
+  it shows it in one.
 
-### Nytt
+### Added
 
-- **"Öppna mapp"** i Lokal lagring och på Inspelningar-sidan.
+- **"Open folder"** in Local storage and on the Recordings page.
 
 ---
 
 ## 0.9.42 — 2026-07-24
 
-### Fixat
+### Fixed
 
-- **Mikrofonen hölls öppen så länge appen var igång**, inte bara under
-  inspelning. Det blockerade andra program — bland annat webbappen — från att
-  spela in, med felet "Could not start audio source", ända tills Sagt stängdes.
-  Mikrofonen öppnas nu bara när den behövs.
+- **The microphone was held open for as long as the app was running**, not just
+  while recording. That stopped other programs — including the web app — from
+  recording, with the error "Could not start audio source", until Sagt was closed.
+  The microphone is now opened only when it is needed.
 
 ---
 
 ## 0.9.41 — 2026-07-16
 
-### Ändrat
+### Changed
 
-- **Felrapportering i skrivbordsappen.** Tidigare syntes det inte för oss när
-  något gick sönder hos en användare — en misslyckad transkribering gav en röd
-  ruta och inget mer. Appen rapporterar nu felkoder utan innehåll, så att
-  återkommande problem går att hitta och åtgärda.
+- **Error reporting in the desktop app.** Until now we could not see when
+  something broke for a user — a failed transcription gave a red box and nothing
+  more. The app now reports error codes without any content, so that recurring
+  problems can be found and fixed.
