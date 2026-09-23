@@ -2,7 +2,7 @@
  * Tillståndsval för uppgraderingsmodalen.
  *
  * Modalens beteende styrdes tidigare av lösa booleans inflätade direkt i JSX. Två
- * code review-rundor i följd hittade buggar där — rubrik och kropp kunde hamna i
+ * buggar i följd satt där — rubrik och kropp kunde hamna i
  * konflikt, och auto-stängningen kunde kopplas ur permanent — eftersom varje villkor
  * läste flaggorna på sitt eget sätt. Här bor besluten i stället som rena funktioner
  * med ett gemensamt tillståndsbegrepp, så de kan testas uttömmande och inte kan glida
@@ -75,3 +75,32 @@ export function shouldAutoClose(f: UpsellActivation & { isOpen: boolean }): bool
 export function shouldCelebrate(f: UpsellActivation & { alreadyCelebrated: boolean }): boolean {
     return f.isPro && f.paymentAttempted && !f.alreadyCelebrated
 }
+
+/**
+ * Varifrån uppgraderingsmodalen öppnades. Skickas som `source` på modalens PostHog-events
+ * (`upsell_modal_opened`, `upgrade_clicked`, `checkout_opened`, `upsell_modal_dismissed`),
+ * så tratten kan delas upp per ingång. Stabila slugs, aldrig fri text.
+ *
+ * `*_402`-varianterna betyder att klienten släppte igenom anropet men servern svarade 402.
+ * I dag släpper klienten bara igenom Pro-användare, och för dem stänger auto-stängningen
+ * modalen direkt utan att öppningen räknas (upsell-modal.tsx) — varianterna syns alltså
+ * först om ett flöde släpper igenom gratisanvändare till servern. Glappet mellan klientens
+ * och serverns bild av prenumerationen syns under tiden i `error_shown` / `analysis_failed`.
+ */
+export type UpsellSource =
+    /** Långsamhetstipset "Därför tar det tid" → "Se Pro". */
+    | 'slow_hint'
+    /** Låsöverlägget över Protokoll-panelen → "Lås upp med Pro". */
+    | 'locked_panel'
+    /** Lägesväljaren i headern: gratisanvändare valde Moln. */
+    | 'mode_pill'
+    /** "Starta analys" / "Analysera igen" utan Pro. */
+    | 'analysis'
+    /** Analysen fick 402 från servern. */
+    | 'analysis_402'
+    /** Omtranskribering i molnet utan Pro. */
+    | 'retranscribe'
+    /** "Identifiera talare" utan Pro. */
+    | 'identify_speakers'
+    /** Talaridentifieringen fick 402 från servern. */
+    | 'identify_speakers_402'

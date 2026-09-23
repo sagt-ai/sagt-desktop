@@ -101,9 +101,8 @@ pub fn init(app_data_dir: &Path) -> std::io::Result<PathBuf> {
 /// plattformarna är hur pipen skapas och hur std-strömmarna pekas om; allt
 /// härifrån och ned — UTF-8-skyddet, att aldrig avbryta vid fel, rotationen — är
 /// identiskt. Kopierat i två exemplar hade en framtida rättelse i den ena armen
-/// tyst missat den andra, och det är en felform repot redan betalat för: se
-/// `AI_KNOWLEDGE_BASE.md` §4, *"Plattformsgrinden gjorde två anropsställen oense"*
-/// (2026-09-03). En generisk `BufRead` kostar ingenting och tar bort möjligheten.
+/// tyst missat den andra, och det är en felform repot redan betalat för: en
+/// plattformsgrind som gjorde två anropsställen oense (2026-09-03). En generisk `BufRead` kostar ingenting och tar bort möjligheten.
 #[cfg(any(unix, windows))]
 fn pump<R: std::io::BufRead>(mut reader: R, path: PathBuf, mut file: File, mut written: u64) {
     use std::io::Write;

@@ -20,10 +20,9 @@ export class MissingTokenError extends Error {
     }
 }
 
-// 502 är backendens svar när Berget fallerar (transcribe_chunk.py). 2026-09-19 gav Bergets
-// engelska modell 503 i några sekunder och minst en bit föll bort, eftersom kön bara gjorde
-// ett omförsök efter 400 ms (AI_KNOWLEDGE_BASE §4). 429 är kvoten, inte en rate limit:
-// Cloudflares regel gäller bara POST /api/v1/jobs (terraform/cloudflare.tf).
+// 502 är backendens svar när Berget fallerar. 2026-09-19 gav Bergets engelska modell 503 i
+// några sekunder och minst en bit föll bort, eftersom kön bara gjorde ett omförsök efter
+// 400 ms. 429 är kvoten, inte en rate limit: endpointen har ingen rate limit.
 const RETRY_STATUS = new Set([408, 500, 502, 503, 504]);
 
 /** Ett fel som kan gå över: nätverksfel (fetch kastar utan status) och serverfel. Aldrig

@@ -6,11 +6,10 @@ import { usePaymentRefresh } from '@/hooks/use-payment-refresh';
 /**
  * Säkerhetsnät för appen som står öppen och orörd.
  *
- * Måste vara **längre än Cloud Runs idle-fönster (~15 min)**. En kortare beat hindrar
- * backend-instansen från att någonsin skala till noll: med `concurrency: 1` och
- * 2 vCPU/2 GiB kostar en varmhållen instans ~1,4 kr/timme, oavsett hur billig
- * själva requesten är. Det var den ursprungliga 60-sekundersvarianten som drev hela
- * GCP-budgetlarmet i augusti 2026 (se KOSTNADER.md §2e).
+ * Måste vara **längre än backendens idle-fönster (~15 min)**. En kortare beat hindrar
+ * servern från att någonsin skala till noll, och en varmhållen instans kostar per timme
+ * oavsett hur billig själva requesten är. Den ursprungliga 60-sekundersvarianten höll
+ * den vaken dygnet runt.
  */
 const SAFETY_NET_MS = 30 * 60_000;
 

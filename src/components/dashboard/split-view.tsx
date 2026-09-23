@@ -19,6 +19,7 @@ import { useConfigStore } from "@/store/config-store";
 import { toast } from "sonner";
 import { ModePill } from "./mode-pill";
 import { UpsellModal } from "./upsell-modal";
+import type { UpsellSource } from "@/lib/upsell-state";
 import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-events";
 import { useSlowLocalHint } from "@/hooks/use-slow-local-hint";
 
@@ -53,6 +54,13 @@ export function SplitView() {
     const clearSession = useAuthStore((s) => s.clearSession);
     const events = usePostHogEvents();
     const [showUpsellModal, setShowUpsellModal] = useState(false);
+    // Varifrån modalen senast öppnades. Sätts i samma händelse som showUpsellModal, så
+    // modalen ser rätt källa redan vid öppningen (React batchar de två uppdateringarna).
+    const [upsellSource, setUpsellSource] = useState<UpsellSource>('locked_panel');
+    const openUpsell = (source: UpsellSource) => {
+        setUpsellSource(source);
+        setShowUpsellModal(true);
+    };
     const [showUserMenu, setShowUserMenu] = useState(false);
     const userMenuRef = useRef<HTMLDivElement>(null);
 
@@ -350,7 +358,7 @@ export function SplitView() {
     // §13.2: `diarize` skickas explicit från dropdown-valen (inte via async toggle-state) → immun
     // mot att en state-uppdatering inte hunnit landa vid klick.
     const handleRetranscribe = async (diarize: boolean = false) => {
-        if (!isSignedIn || !isPro) { setShowUpsellModal(true); return; }
+        if (!isSignedIn || !isPro) { openUpsell('retranscribe'); return; }
         if (!navigator.onLine) { toast.error("Denna funktion kräver internetanslutning."); return; }
         if (activeJob?.audio_deleted) {
             toast.error("Ljudfilen är raderad — molntranskribering kräver ljudet. Transkript och analys finns kvar.");
@@ -619,7 +627,7 @@ export function SplitView() {
         opts: { silent?: boolean } = {},
     ) => {
         const silent = !!opts.silent;
-        if (!isSignedIn || !isPro) { if (!silent) setShowUpsellModal(true); return; }
+        if (!isSignedIn || !isPro) { if (!silent) openUpsell('identify_speakers'); return; }
         if (!navigator.onLine) { if (!silent) toast.error("Denna funktion kräver internetanslutning."); return; }
         const token = getToken();
         if (!token) { if (!silent) toast.error("Kunde inte hämta autentiseringstoken. Logga in igen."); return; }
@@ -660,7 +668,7 @@ export function SplitView() {
             } else if (error?.message?.includes("Payment Required")) {
                 // Visar upsell-modal i stället för toast → capture-only (ingen showError).
                 captureEvent('error_shown', { surface: 'desktop', code: 'not_pro', action: 'identify_speakers' });
-                setShowUpsellModal(true);
+                openUpsell('identify_speakers_402');
             } else {
                 showError(errorSlug(error), "Talaridentifiering misslyckades: " + (error?.message || "Okänt fel"), { action: 'identify_speakers' });
             }
@@ -684,7 +692,7 @@ export function SplitView() {
         }
 
         if (!isSignedIn || !isPro) {
-            setShowUpsellModal(true);
+            openUpsell('analysis');
             return;
         }
 
@@ -746,7 +754,7 @@ export function SplitView() {
                 console.error("Re-analyze failed:", e);
                 events.analysisFailed(e?.message || 'unknown');
                 if (e.message?.includes("Payment Required")) {
-                    setShowUpsellModal(true);
+                    openUpsell('analysis_402');
                 } else {
                     toast.error("Kunde inte uppdatera analys.");
                 }
@@ -1124,7 +1132,7 @@ export function SplitView() {
                         })()}
                     </h2>
                     <div className="flex items-center gap-3">
-                        <ModePill onUpsellClick={() => setShowUpsellModal(true)} />
+                        <ModePill onUpsellClick={() => openUpsell('mode_pill')} />
                     </div>
                 </div>
 
@@ -1419,7 +1427,7 @@ export function SplitView() {
                                 <Button
                                     size="sm"
                                     className="mt-3 h-8 text-xs bg-brand text-paper hover:bg-brand-deep"
-                                    onClick={() => setShowUpsellModal(true)}
+                                    onClick={() => openUpsell('slow_hint')}
                                 >
                                     Se Pro
                                 </Button>
@@ -1693,7 +1701,7 @@ export function SplitView() {
                                 oåtkomlig, eftersom overlayen (z-51) bara syns när modalen (z-100) är
                                 stängd, och varje väg som stänger modalen anropar stopPolling(). */}
                             <button
-                                onClick={() => setShowUpsellModal(true)}
+                                onClick={() => openUpsell('locked_panel')}
                                 className="inline-flex items-center gap-2 rounded-full bg-ink text-paper text-xs font-semibold px-4 py-2 hover:bg-ink/90 transition-colors shadow-md"
                             >
                                 <Lock className="w-3.5 h-3.5" />
@@ -1705,8 +1713,9 @@ export function SplitView() {
             </div >
 
             <UpsellModal
-                isOpen={showUpsellModal} 
-                onClose={() => setShowUpsellModal(false)} 
+                isOpen={showUpsellModal}
+                onClose={() => setShowUpsellModal(false)}
+                source={upsellSource}
             />
         </div >
     );

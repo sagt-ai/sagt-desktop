@@ -10,10 +10,19 @@ const HOST = (import.meta.env.VITE_POSTHOG_HOST as string | undefined) ?? 'https
 if (KEY) {
     posthog.init(KEY, {
         api_host: HOST,
+        // Samma lagring som webben: `distinct_id` och `$device_id` i WebViewns
+        // localStorage, som överlever omstarter (licensen ligger där av samma
+        // skäl). LEK 9 kap. 28 § gäller även appar, inte bara webbläsare, så
+        // samtyckesfrågan är öppen här också.
         persistence: 'localStorage',
         capture_pageview: false,
         capture_pageleave: false,
         autocapture: false,
+        // Ska stå kvar. Utan raden avgör PostHog-projektets inställning. Med
+        // inspelning påslagen där laddar 1.372.1 inspelaren (CSP:n i
+        // tauri.conf.json släpper igenom den) och skickar vyernas text,
+        // transkript inräknade. Kört i en harness 2026-09-22. Webben fick
+        // samma rad 2026-09-23.
         disable_session_recording: true,
         loaded: (ph) => {
             ph.register({ platform: 'desktop', app_version: CURRENT_VERSION })
@@ -26,22 +35,19 @@ export function PostHogProvider({ children }: { children: React.ReactNode }) {
     useEffect(() => {
         if (!KEY) return
 
+        // Dataminimering: identify bär bara Clerk-id:t och planen, ingen e-post. Belagt i en
+        // harness 2026-09-23: `$set` på `$identify` innehöll `email` före ändringen och
+        // bara `plan` efter.
         // Identify immediately if session is already persisted on startup
-        const { isSignedIn, userId, email, isPro } = useAuthStore.getState()
+        const { isSignedIn, userId, isPro } = useAuthStore.getState()
         if (isSignedIn && userId) {
-            posthog.identify(userId, {
-                email: email ?? undefined,
-                plan: isPro() ? 'pro' : 'free',
-            })
+            posthog.identify(userId, { plan: isPro() ? 'pro' : 'free' })
         }
 
         // Keep identify/reset in sync with auth state changes
         return useAuthStore.subscribe((state, prev) => {
             if (state.isSignedIn && !prev.isSignedIn && state.userId) {
-                posthog.identify(state.userId, {
-                    email: state.email ?? undefined,
-                    plan: state.isPro() ? 'pro' : 'free',
-                })
+                posthog.identify(state.userId, { plan: state.isPro() ? 'pro' : 'free' })
                 captureEvent('sign_in_completed')
             } else if (!state.isSignedIn && prev.isSignedIn) {
                 captureEvent('sign_out')

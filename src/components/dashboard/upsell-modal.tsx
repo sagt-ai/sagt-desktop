@@ -3,16 +3,20 @@ import { useAuthStore } from "@/store/auth-store";
 import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
 import { useBrowserAuth } from "@/hooks/use-browser-auth";
 import { useCheckout } from "@/hooks/use-checkout";
-import { selectUpsellView, shouldAutoClose, shouldCelebrate } from "@/lib/upsell-state";
+import { usePostHogEvents } from "@/hooks/use-posthog-events";
+import { selectUpsellView, shouldAutoClose, shouldCelebrate, type UpsellSource } from "@/lib/upsell-state";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 interface UpsellModalProps {
     isOpen: boolean;
     onClose: () => void;
+    /** Varifrån modalen öppnades — följer med på tratt-eventen nedan. */
+    source: UpsellSource;
 }
 
-export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
+export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
+    const events = usePostHogEvents();
     const userId = useAuthStore((s) => s.userId);
     const isPro = useAuthStore((s) => s.isPro());
     const { isWaiting, startPolling, stopPolling, manualRefresh } = usePaymentRefresh();
@@ -45,6 +49,7 @@ export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
     // fel visas av useCheckout, så här återstår bara att starta väntan när det lyckats.
     const openCheckout = async () => {
         if (!(await openCheckoutInBrowser())) return;
+        events.checkoutOpened(source);
         celebratedRef.current = false; // nytt försök ska kunna firas igen
         setPaymentAttempted(true);
         startPolling();
@@ -52,6 +57,7 @@ export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
 
     // Uttrycklig avfärdning — nollställer betalförsöket så nästa öppning visar säljsidan.
     const dismiss = () => {
+        events.upsellModalDismissed(source, selectUpsellView({ isPro, paymentAttempted, isWaiting }));
         setPaymentAttempted(false);
         stopPolling();
         onClose();
@@ -120,9 +126,19 @@ export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
         if (!isOpen) stopPolling();
     }, [isOpen, stopPolling]);
 
+    // Tratten börjar här: en gång per öppning, med källan den öppnades från. Beror medvetet
+    // bara på isOpen — source och userId läses vid öppningen, en senare inloggning i samma
+    // öppning ska inte räknas som en ny. Pro-kunder räknas inte: auto-stängningen ovan
+    // stänger modalen direkt för dem, så där finns ingen visning att mäta.
+    useEffect(() => {
+        if (isOpen && !isPro) events.upsellModalOpened(source, !!userId);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isOpen]);
+
     if (!isOpen) return null;
 
     const handleUpgrade = async () => {
+        events.upgradeClicked(source, !!userId);
         // Ej inloggad → logga in först (konto krävs för Stripe-kundreferens),
         // fortsätt sedan automatiskt till checkout via pendingUpgrade-effekten.
         if (!userId) {
@@ -250,8 +266,8 @@ export function UpsellModal({ isOpen, onClose }: UpsellModalProps) {
                             <div className="bg-paper-dim border border-line rounded-xl p-5 mb-6">
                                 <div className="flex items-center justify-between font-semibold text-ink mb-4 pb-4 border-b border-line">
                                     <span>Sagt.ai Pro</span>
-                                    {/* Samma formulering som webbens PRO_PRICE (frontend/content/pricing.ts). Här stod
-                                        "ex. moms" fram till 2026-09-14, i strid med sajten och KOSTNADER.md. */}
+                                    {/* Samma formulering som prissidan på sagt.ai. Här stod "ex. moms" fram till
+                                        2026-09-14, i strid med sajten. */}
                                     <span className="text-brand">199 kr<span className="text-xs text-ink-muted font-normal"> / mån inkl. moms</span></span>
                                 </div>
                                 <ul className="space-y-3">

@@ -32,7 +32,7 @@ describe("diarizeAvailable", () => {
 });
 
 // Live-diariseringens kill switch. Samma fall igen, därför att felet de skyddar mot är
-// olika: ett falskt true här ger en 503 per inspelningsstart i 5xx-larmet.
+// olika: ett falskt true här ger en 503 per inspelningsstart.
 describe("liveDiarizeAvailable", () => {
     it("på när backend svarar true", () => {
         expect(liveDiarizeAvailable({ live_diarize_enabled: true })).toBe(true);

@@ -227,7 +227,7 @@ export async function getJob(jobId: string, token: string): Promise<Job> {
 }
 
 /**
- * Kör om analysen på ett SYNKAT moln-jobb. Backend uppdaterar job.analysis i Firestore
+ * Kör om analysen på ett SYNKAT moln-jobb. Backend uppdaterar det sparade jobbets analys
  * → dashboard speglar senaste versionen. Använd endast för persisterade jobb (cloud_job_id).
  * Osynkade/lokala jobb använder reanalyzeTranscript (stateless).
  */
@@ -333,8 +333,8 @@ export interface IdentifySpeakersResult {
 }
 
 /**
- * POSTar turbaserat transkript + valfria deltagar-hints till /identify-speakers (Pro-gatad
- * under pro_router) → LLM-infererad namnmappning. Kastar vid 401/402/413 så anroparen kan
+ * POSTar turbaserat transkript + valfria deltagar-hints till /identify-speakers (kräver
+ * Pro) → LLM-infererad namnmappning. Kastar vid 401/402/413 så anroparen kan
  * hantera auth/Pro/storlek. Speglar reanalyzeTranscript (JSON-body, Bearer-token).
  */
 export async function identifySpeakers(
@@ -380,8 +380,8 @@ export interface DiarizeTurn {
 }
 
 /**
- * POSTar MÖTET-kanalen (mono-WAV, extraherad i Rust) till /diarize (diarize-only, Pro-gatad
- * under pro_router) → färdig-omdöpta akustiska turer. INGEN transkribering, INGEN kvot,
+ * POSTar MÖTET-kanalen (mono-WAV, extraherad i Rust) till /diarize (diarize-only, kräver
+ * Pro) → färdig-omdöpta akustiska turer. INGEN transkribering, INGEN kvot,
  * INGET lagrat ljud. Anroparen (auto-finalize) mappar turerna på de
  * redan strömmade segmenten via `applyDiarizationTurns`.
  *

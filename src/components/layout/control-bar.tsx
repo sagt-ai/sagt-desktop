@@ -15,8 +15,9 @@ import { serializeSpeakerData } from "@/lib/speaker-naming";
 import { finalizeStreamingSession } from "@/lib/auto-finalize";
 import { useSyncStore } from "@/store/sync-store";
 import { useTranscriptionStore } from "@/store/transcription-store";
-import { usePostHogEvents, showError } from "@/hooks/use-posthog-events";
+import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-events";
 import { resetCloudStream } from "@/hooks/use-cloud-stream";
+import { transcriptOutcomeProps, type SessionDiagnostics } from "@/lib/session-diagnostics";
 
 interface Recording {
     id: number | null;
@@ -27,6 +28,8 @@ interface Recording {
     sync_status: string;
     cloud_job_id: string | null;
     audio_deleted: boolean;
+    /** Sätts av sessions-recordern i Rust. Saknas i payloads från andra vägar. */
+    diagnostics?: SessionDiagnostics;
 }
 
 interface ControlBarProps {
@@ -141,11 +144,25 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                 // (whisper-cli, pending=0). PRO live-molnströmning har egna server-events
                 // (transcription_chunk_completed/cloud_chunk_ok) och hanteras i grenen nedan —
                 // fyra därför bara när vi INTE strömmar mot molnet, annars dubbelräknas sessionen.
+                //
+                // Storen fylls bara medan SplitView är monterad (use-transcription lyssnar
+                // där). En inspelning gjord medan användaren stod i Inspelningar eller
+                // Inställningar sparades med text men räknades då som tom, och en där vyn
+                // byttes halvvägs fick för lågt ordantal. Därför räknas det Rust sparade
+                // (`diagnostics`) när det finns, och storen bara som reserv.
                 if (!useSyncStore.getState().cloudStreamingActive) {
                     const segs = useTranscriptionStore.getState().segments;
-                    if (segs.length > 0) {
+                    const d = recording.diagnostics;
+                    if (d) {
+                        if (d.segments_saved > 0) events.transcriptionCompleted(d.word_count);
+                    } else if (segs.length > 0) {
                         const wordCount = segs.reduce((n, s) => n + s.text.split(" ").length, 0);
                         events.transcriptionCompleted(wordCount);
+                    }
+                    // Utfallet för varje lokal inspelning, med eller utan text, så att de
+                    // tomma kan jämföras med de lyckade (nivåer, VAD, whisper).
+                    if (d && !d.cloud_streaming) {
+                        captureEvent('local_transcript_outcome', transcriptOutcomeProps(d, durationRef.current));
                     }
                 }
                 
@@ -227,6 +244,15 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
 
         return () => { unlistenPromise.then(f => f()); };
     }, [setSession, setUploadStatus, setActiveJob, setUploadProgress, setErrorMessage, getToken, isPro]);
+
+    // Ett lokalt segment som blev klart efter att inspelningen sparats. Texten syntes
+    // live men finns inte i den sparade inspelningen. Ska vara noll.
+    useEffect(() => {
+        const unlistenPromise = listen("transcription-after-save", () => {
+            captureEvent('local_segment_after_save');
+        });
+        return () => { unlistenPromise.then(f => f()); };
+    }, []);
 
     const toggleRecording = async () => {
         try {

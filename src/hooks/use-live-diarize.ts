@@ -59,9 +59,8 @@ function gatesPass(): boolean {
         useAuthStore.getState().isPro() &&
         navigator.onLine &&
         // Backendens kill switch, hämtad av AppGuard. Utan den här raden mintade varje
-        // inspelningsstart mot en endpoint som svarar 503 när flaggan är av. Kill
-        // switch-grenen (live_diarize.py:51-52) loggar ingenting — 503:an blir ett
-        // Sentry-ärende genom HTTPException-fångsten, och en post i 5xx-larmet.
+        // inspelningsstart mot en endpoint som svarar 503 när flaggan är av, och varje
+        // sådant svar räknas som ett serverfel.
         // Defaulten är false, så en app som startat offline frågar inte på chans.
         useConfigStore.getState().liveDiarizeEnabled &&
         settings.cloudDiarizationMode === "structured"

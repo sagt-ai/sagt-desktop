@@ -65,7 +65,7 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
     // Hämta config i bakgrunden (utan timeout) efter att användaren släppts in via
     // offline-toleransen — uppdaterar motd/version/länkar utan att blockera starten.
     // Poängen är cold start-fallet: första fetchens 4s-timeout hinner inte vänta ut
-    // Cloud Run (min-0), men denna hämtning utan timeout lyckas när containern vaknat.
+    // en backend som skalat till noll, men denna hämtning utan timeout lyckas när den vaknat.
     // Körs också när nätet kommer tillbaka (online-effekten ovan).
     // Rör aldrig guard-state (ingen oväntad UPDATE_REQUIRED mitt i sessionen).
     const refreshConfigInBackground = async () => {
@@ -108,8 +108,8 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
     const validateAccess = async () => {
         ensureLicense()
         try {
-            // Cloud Run kör min-0 → första anropet efter inaktivitet är en cold start (10–30 s).
-            // Utan timeout frös appen i CHECKING tills containern vaknat ("not responding"). Vänta
+            // Backend skalar till noll vid inaktivitet → första anropet är en cold start (10–30 s).
+            // Utan timeout frös appen i CHECKING tills servern vaknat ("not responding"). Vänta
             // max 4 s; därefter släpps en redan registrerad användare in direkt (offline-tolerans)
             // och config hämtas i bakgrunden. Offline/nätfel går samma väg.
             const controller = new AbortController()

@@ -5,17 +5,10 @@ import { useTranscriptionStore } from "@/store/transcription-store";
 import { useAuthStore } from "@/store/auth-store";
 import { useSyncStore } from "@/store/sync-store";
 import { transcribeChunk } from "@/lib/api";
-import { MissingTokenError, insertCloudSegment, isRetryableChunkError, retryDelayMs } from "@/lib/cloud-chunks";
+import { insertCloudSegment } from "@/lib/cloud-chunks";
+import { processCloudChunk, type CloudChunkEvent } from "@/lib/cloud-chunk-handler";
 import posthog from "posthog-js";
 import { showError } from "@/hooks/use-posthog-events";
-
-// Matchar Rust `CloudChunk` (serde) — audio är WAV-bytes som number[].
-interface CloudChunkEvent {
-    audio: number[];
-    speaker: string;  // "DU" | "MÖTET" | "MOLN"
-    start: number;    // sekunder
-    duration: number; // segmentlängd i sekunder → end_time = start + duration
-}
 
 // Begränsa samtidiga moln-POST så vi inte översvämmar Berget vid snabb segmentering.
 const MAX_CONCURRENT = 3;
@@ -103,7 +96,7 @@ export function useCloudStream() {
 
         // Väntan före omförsök, som släpper sin plats i kön inom 100 ms när biten blivit
         // inaktuell. Annars håller en bit från ett avbrutet möte en av MAX_CONCURRENT platser
-        // i upp till ~8 s, och nästa mötes första bitar får vänta (code review 2026-09-21).
+        // i upp till ~8 s, och nästa mötes första bitar får vänta.
         const sleepUnlessStale = async (ms: number, gen: number) => {
             const until = Date.now() + ms;
             while (!stale(gen) && Date.now() < until) {
@@ -111,55 +104,31 @@ export function useCloudStream() {
             }
         };
 
-        const handleChunk = async (chunk: CloudChunkEvent, gen: number): Promise<void> => {
-            for (let attempt = 0; ; attempt++) {
-                try {
-                    const token = useAuthStore.getState().getToken();
-                    if (!token) throw new MissingTokenError();
-                    const res = await transcribeChunk(chunk.audio, chunk.speaker, chunk.start, token);
-                    if (stale(gen)) return; // #11: avbrutet eller ny session medan POST var i luften
-                    const text = (res.text || "").trim();
-                    if (text) {
-                        const store = useTranscriptionStore.getState();
-                        const next = insertCloudSegment(store.segments, {
-                            text,
-                            start_time: chunk.start,
-                            end_time: chunk.start + chunk.duration,
-                            timestamp: chunk.start * 1000,
-                            speaker: chunk.speaker,
-                        });
-                        if (next) store.setSegments(next);
-                        posthog?.capture?.("cloud_chunk_ok", { speaker: chunk.speaker, attempts: attempt + 1 });
-                        errored = false; // #8 re-arm: lyckad chunk → tillåt ny felnotis senare
-                    } else {
-                        posthog?.capture?.("cloud_chunk_empty", { speaker: chunk.speaker, attempts: attempt + 1 });
-                    }
-                    return;
-                } catch (e: any) {
-                    if (stale(gen)) return;
-                    const msg = String(e?.message || e);
-                    // #8: omförsök vid fel som kan gå över (nätverk, 5xx), med växande väntan.
-                    // Aldrig vid auth, Pro, kvot eller en trasig bit — samma svar kommer igen.
-                    const delay = isRetryableChunkError(e) ? retryDelayMs(attempt) : null;
-                    if (delay !== null) {
-                        await sleepUnlessStale(delay, gen);
-                        if (stale(gen)) return;
-                        continue;
-                    }
+        // Flödet (anrop, omförsök, infogning) ligger i lib/cloud-chunk-handler.ts så att det
+        // går att testa. Här kopplas det till storen, PostHog och felnotisen.
+        const handleChunk = (chunk: CloudChunkEvent, gen: number): Promise<void> =>
+            processCloudChunk(chunk, {
+                getToken: () => useAuthStore.getState().getToken(),
+                transcribe: transcribeChunk,
+                isStale: () => stale(gen),
+                sleep: (ms) => sleepUnlessStale(ms, gen),
+                apply: (seg) => {
+                    const store = useTranscriptionStore.getState();
+                    const next = insertCloudSegment(store.segments, seg);
+                    if (next) store.setSegments(next);
+                },
+                capture: (event, props) => { posthog?.capture?.(event, props); },
+                onSuccess: () => { errored = false; },
+                onFailure: (msg) => {
                     console.error("Cloud chunk failed:", msg);
-                    posthog?.capture?.("cloud_chunk_error", {
-                        speaker: chunk.speaker, message: msg.slice(0, 140), attempts: attempt + 1,
-                    });
                     if (!errored) {
                         errored = true;
                         if (msg.includes("Payment Required")) showError('not_pro', "Molntranskribering kräver aktiv Pro-prenumeration.", { action: 'cloud_stream' });
                         else if (msg.includes("Quota")) showError('quota_exceeded', "Månadsgränsen för molntranskribering är nådd.", { action: 'cloud_stream' });
                         else showError('unavailable', "Molntranskribering avbröts (nätverk/server). Försöker igen automatiskt.", { action: 'cloud_stream' }, { duration: 6000 });
                     }
-                    return;
-                }
-            }
-        };
+                },
+            });
 
         // Körs efter varje avslutad chunk: när kön är ÄKTA tom post-stop → persistera (#12)
         // och släck "Bearbetar…" (#11). wasBusy gör att den bara fyrar en gång per dränering.
@@ -180,10 +149,17 @@ export function useCloudStream() {
                 pending++;
                 wasBusy = true;
                 void (async () => {
-                    await handleChunk(chunk, gen);
-                    pending--;
-                    pump();
-                    onMaybeDrained();
+                    // finally: ett undantag ur felvägen (toasten, PostHog) fick annars
+                    // `pending` att aldrig räknas ned, och kön stod som upptagen för alltid.
+                    try {
+                        await handleChunk(chunk, gen);
+                    } catch (e) {
+                        console.error("Cloud chunk handler threw:", e);
+                    } finally {
+                        pending--;
+                        pump();
+                        onMaybeDrained();
+                    }
                 })();
             }
         };

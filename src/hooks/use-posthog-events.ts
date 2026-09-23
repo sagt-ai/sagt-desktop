@@ -1,5 +1,6 @@
 import posthog from 'posthog-js'
 import { toast } from 'sonner'
+import type { UpsellSource, UpsellView } from '@/lib/upsell-state'
 
 const enabled = !!import.meta.env.VITE_POSTHOG_KEY
 
@@ -50,8 +51,23 @@ export function usePostHogEvents() {
         upsellShown: (trigger: string) =>
             captureEvent('upsell_shown', { trigger }),
 
-        upgradeClicked: () =>
-            captureEvent('upgrade_clicked'),
+        // Uppgraderingstratten i desktop: modal öppnad → "Uppgradera nu" → (inloggning,
+        // sign_in_completed) → Stripe öppnad i webbläsaren → payment_succeeded (server).
+        // `source` säger varifrån modalen öppnades, se UpsellSource. `signed_in` skiljer
+        // den som måste logga in först, eftersom det är ett eget steg där folk kan falla bort.
+        upsellModalOpened: (source: UpsellSource, signedIn: boolean) =>
+            captureEvent('upsell_modal_opened', { source, signed_in: signedIn }),
+
+        upgradeClicked: (source: UpsellSource, signedIn: boolean) =>
+            captureEvent('upgrade_clicked', { source, signed_in: signedIn }),
+
+        checkoutOpened: (source: UpsellSource) =>
+            captureEvent('checkout_opened', { source }),
+
+        // view: vilket läge modalen stod i när den stängdes (UpsellView) — säljsidan,
+        // eller väntan på Stripe-bekräftelse efter att betalningen öppnats.
+        upsellModalDismissed: (source: UpsellSource, view: UpsellView) =>
+            captureEvent('upsell_modal_dismissed', { source, view }),
 
         cloudSyncStarted: () =>
             captureEvent('cloud_sync_started'),

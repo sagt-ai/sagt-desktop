@@ -7,6 +7,37 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.10.6 — 2026-09-23
+
+### Fixed
+
+- **A short recording could end up with an empty transcript.** When you stopped
+  a recording, the last thing said could be shown on screen but missing from the
+  saved recording. In a short recording that could be all of it. The app now
+  waits for the last passage before it saves.
+
+- **Recordings without speech were listed as transcribed.** When there was no
+  speech to find, the local model returned a placeholder instead of nothing. It
+  was hidden in the transcript view but saved with the recording. Such
+  recordings are now listed without a transcript.
+
+- **Microphones and outputs that deliver 16-bit integer audio were read at the
+  wrong level.** Transcription from such a device could be garbled or empty.
+
+- **A cloud passage could be sent more than once (Pro).** If the app hit an
+  error while adding a transcribed passage to the transcript, it sent the same
+  passage again, up to four more times. Each time counted against your monthly
+  cloud quota.
+
+### Changed
+
+- **Your e-mail address is no longer sent to our usage statistics.** When you
+  are signed in, usage events are linked to your account ID and your plan only.
+
+- **Usage statistics now say why a local recording has no text.** They include
+  the audio level per channel and how many passages were transcribed, came back
+  empty or failed. They never include the audio or the text.
+
 ## 0.10.5 — 2026-09-22
 
 ### Fixed
