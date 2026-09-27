@@ -6,7 +6,7 @@
 
 [sagt.ai](https://sagt.ai) · Windows 10/11 · macOS 14.2+ (Apple Silicon) · MIT licensed
 
-![Sagt.ai Desktop — real-time Swedish transcription](assets/screenshot.png)
+![Sagt.ai Desktop — a meeting transcribed in real time, split into Du (you) and Mötet (the meeting)](assets/demo.gif)
 
 Sagt.ai transcribes meetings in Swedish using **KB-Whisper**, the speech model trained by [KBLab](https://huggingface.co/KBLab) at Kungliga Biblioteket — the National Library of Sweden. On the free tier the model runs entirely on your own CPU: no audio upload, no account, no internet connection required.
 
