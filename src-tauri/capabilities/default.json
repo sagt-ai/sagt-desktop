@@ -18,6 +18,8 @@
     "updater:allow-check",
     "updater:allow-download-and-install",
     "process:allow-restart",
+    "dialog:allow-save",
+    "fs:allow-write-file",
     "core:window:allow-start-dragging",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",

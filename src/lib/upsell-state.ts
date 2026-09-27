@@ -104,3 +104,5 @@ export type UpsellSource =
     | 'identify_speakers'
     /** Talaridentifieringen fick 402 från servern. */
     | 'identify_speakers_402'
+    /** "Exportera" (transkriptvyn eller Inspelningar) utan Pro. */
+    | 'export'

@@ -196,7 +196,7 @@ export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
                             <div className="space-y-1">
                                 <p className="text-sm font-medium text-ink">Betalningen är bekräftad</p>
                                 <p className="text-xs text-ink-muted">
-                                    Molntranskribering, AI-protokoll och synk är upplåsta. Kvitto kommer via e-post.
+                                    Molntranskribering, AI-protokoll, synk och export är upplåsta. Kvitto kommer via e-post.
                                 </p>
                             </div>
                         </div>
@@ -289,6 +289,12 @@ export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
                                             <Check className="w-2.5 h-2.5" />
                                         </div>
                                         Synk mellan enheter
+                                    </li>
+                                    <li className="flex items-start gap-3 text-sm text-ink-soft">
+                                        <div className="mt-0.5 w-4 h-4 rounded-full bg-verified/10 text-verified flex items-center justify-center flex-shrink-0">
+                                            <Check className="w-2.5 h-2.5" />
+                                        </div>
+                                        Export till Word, Markdown och text
                                     </li>
                                     <li className="flex items-start gap-3 text-sm text-ink-soft">
                                         <div className="mt-0.5 w-4 h-4 rounded-full bg-verified/10 text-verified flex items-center justify-center flex-shrink-0">

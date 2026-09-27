@@ -2,7 +2,7 @@
 
 **Free, private meeting transcription for Swedish. Runs on your own machine.**
 
-[Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) (172 MB) · [Download for Mac →](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (178 MB)
+[Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) (173 MB) · [Download for Mac →](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (179 MB)
 
 [sagt.ai](https://sagt.ai) · Windows 10/11 · macOS 14.2+ (Apple Silicon) · MIT licensed
 
@@ -112,7 +112,7 @@ We hold **neither ISO 27001 nor SOC 2**, and do not claim to. What we offer inst
 Stated plainly, so you can decide before downloading:
 
 - **Apple Silicon Macs only.** The Mac build is arm64 — there is no Intel Mac build and no universal binary. macOS 14.2 or later is required, because the API used to capture meeting audio does not exist before it. No Linux build exists.
-- **No file export.** Transcripts and summaries are copied to the clipboard; PDF and Word export are not implemented yet.
+- **Export is part of Pro, and there is no PDF.** Free users copy transcripts and summaries to the clipboard. Pro exports one or many meetings as Word (.docx), Markdown or plain text, saved where you choose, offline.
 - **Speakers are told apart by channel only.** Everyone on the same channel appears as one speaker: the other people on a call as "Mötet" (the meeting), and people in the room with you as "Du" (you). Acoustic speaker separation ("Speaker 1, 2, 3") was switched off on 2026-09-18.
 - **Swedish-first.** The bundled on-device model handles Swedish only. Norwegian and English are available through the cloud tier (Pro).
 - **Public beta.** Expect rough edges.
@@ -144,7 +144,7 @@ No. It installs per-user, which means it works on a managed work laptop.
 Yes, since v0.10.0 — the same app, released from the same version tag as Windows. It needs macOS 14.2 or later on an Apple Silicon Mac (M1 or newer); Intel Macs are not supported.
 
 **Can I export to Word or PDF?**
-Not yet — text is copied to the clipboard.
+Word, Markdown and plain text, yes, with Pro (since v0.10.7): one meeting from the transcript view, or several at once from Recordings, as a zip or one combined file. PDF is not available. Free users copy the text to the clipboard.
 
 ## Installation
 
@@ -152,13 +152,13 @@ Not yet — text is copied to the clipboard.
 
 ### Windows
 
-1. [Download the signed installer](https://downloads.sagt.ai/Sagt.ai-setup.exe) (172 MB)
+1. [Download the signed installer](https://downloads.sagt.ai/Sagt.ai-setup.exe) (173 MB)
 2. Run `Sagt.ai-setup.exe` — signed with Azure Trusted Signing, so Windows shows a verified publisher: **EDI Labs AB**. No administrator rights needed
 3. Launch Sagt.ai and start recording — no account, no email address
 
 ### macOS
 
-1. [Download the disk image](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (178 MB)
+1. [Download the disk image](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (179 MB)
 2. Open it and drag Sagt.ai to Applications. The app is signed with an Apple Developer ID and notarised by Apple, so it opens without a security warning — including on a machine that is offline
 3. On first launch macOS asks for microphone access, and for system audio the first time you record a meeting. Both are needed for the other participants to be captured
 

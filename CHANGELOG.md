@@ -7,6 +7,18 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.10.7 — 2026-09-27
+
+### Added
+
+- **Export transcripts and meeting notes to a file (Pro).** Save a meeting as
+  Word (.docx), Markdown or plain text from the transcript view. In Recordings
+  you can tick several meetings and export them together, either as one file
+  per meeting in a zip or as one combined file in date order. You choose what to
+  include: the transcript, the meeting notes, or both. Files are created on your
+  computer and saved where you choose, so export works offline. Without Pro you
+  can still copy the text to the clipboard.
+
 ## 0.10.6 — 2026-09-23
 
 ### Fixed

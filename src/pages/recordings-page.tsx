@@ -1,13 +1,18 @@
 import { format } from "date-fns";
 import { sv } from "date-fns/locale";
-import { Cloud, CloudUpload, Trash2, FileAudio, FileText, FolderOpen } from "lucide-react";
+import { Cloud, CloudUpload, Trash2, FileAudio, FileText, FolderOpen, Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { openRecordingsFolder } from "@/lib/storage";
 import { useSyncStore } from "@/store/sync-store";
 import { useAuthStore } from "@/store/auth-store";
 import { uploadJob, errorSlug } from "@/lib/api";
-import { showError } from "@/hooks/use-posthog-events";
-import { useState, useEffect } from "react";
+import { showError, usePostHogEvents } from "@/hooks/use-posthog-events";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { useSettingsStore } from "@/store/settings-store";
+import { UpsellModal } from "@/components/dashboard/upsell-modal";
+import { ExportDialog } from "@/components/dashboard/export-dialog";
+import { canExport, hasAnalysisSource, hasTranscriptSource, isExportable } from "@/lib/export/select";
+import { collectMeetings } from "@/lib/export/tauri-io";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
@@ -21,8 +26,31 @@ interface Recording {
     sync_status: 'local' | 'synced' | 'uploaded';
     cloud_job_id?: string;
     analysis_json?: string;
+    cloud_transcript?: string | null;
+    cloud_segments?: string | null;
+    speaker_map?: string | null;
     audio_deleted: boolean;
     has_segments: boolean;
+}
+
+/** "Välj alla" med tredje läget (delvis valt), som bara går att sätta via DOM:en. */
+function SelectAllCheckbox({ checked, indeterminate, disabled, onChange }: {
+    checked: boolean; indeterminate: boolean; disabled: boolean; onChange: (v: boolean) => void;
+}) {
+    const ref = useRef<HTMLInputElement>(null);
+    useEffect(() => { if (ref.current) ref.current.indeterminate = indeterminate; }, [indeterminate]);
+    return (
+        <input
+            ref={ref}
+            type="checkbox"
+            aria-label="Välj alla"
+            title="Välj alla"
+            className="h-4 w-4 accent-brand cursor-pointer disabled:cursor-not-allowed"
+            checked={checked}
+            disabled={disabled}
+            onChange={(e) => onChange(e.target.checked)}
+        />
+    );
 }
 
 export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboard' | 'settings' | 'recordings') => void }) {
@@ -33,10 +61,38 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
     const isPro = useAuthStore((s) => s.isPro());
     const [syncingId, setSyncingId] = useState<number | null>(null);
 
+    // Export (Pro): urval per rad, "välj alla", "Exportera valda".
+    const events = usePostHogEvents();
+    const exportAllowed = useAuthStore((s) => canExport(s.stripeStatus));
+    const pauseBreakMs = useSettingsStore((s) => s.pauseBreakMs);
+    const [selected, setSelected] = useState<Set<number>>(new Set());
+    const [showExport, setShowExport] = useState(false);
+    const [showUpsell, setShowUpsell] = useState(false);
+    const exportableIds = useMemo(() => recordings.filter(isExportable).map(r => r.id), [recordings]);
+    const selectedRecs = useMemo(() => recordings.filter(r => selected.has(r.id)), [recordings, selected]);
+    const allSelected = exportableIds.length > 0 && exportableIds.every(id => selected.has(id));
+    const toggleOne = (id: number, on: boolean) => setSelected(prev => {
+        const next = new Set(prev);
+        if (on) next.add(id); else next.delete(id);
+        return next;
+    });
+    const handleExportSelected = () => {
+        if (selected.size === 0) return;
+        if (!exportAllowed) {
+            events.upsellShown('export');
+            setShowUpsell(true);
+            return;
+        }
+        setShowExport(true);
+    };
+
     const loadRecordings = async () => {
         try {
             const data = await invoke<Recording[]>("get_recordings");
             setRecordings(data);
+            // Raderade eller inte längre exporterbara rader lämnar urvalet.
+            const keep = new Set(data.filter(isExportable).map(r => r.id));
+            setSelected(prev => new Set([...prev].filter(id => keep.has(id))));
         } catch (error) {
             console.error("Failed to load recordings:", error);
         }
@@ -161,6 +217,23 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
             </header>
 
             <div className="p-8 max-w-6xl">
+                {recordings.length > 0 && (
+                    <div className="flex items-center justify-end gap-3 mb-3">
+                        <span className="text-sm text-ink-muted">
+                            {selected.size > 0 ? `${selected.size} valda` : "Välj möten att exportera"}
+                        </span>
+                        <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={selected.size === 0}
+                            onClick={handleExportSelected}
+                            className="gap-1.5"
+                        >
+                            <Download className="w-4 h-4" />
+                            Exportera valda
+                        </Button>
+                    </div>
+                )}
                 <div className="bg-white rounded-lg border shadow-sm overflow-hidden">
                     {recordings.length === 0 ? (
                         <div className="p-12 text-center text-muted-foreground">
@@ -172,6 +245,14 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
                             <table className="w-full text-sm text-left">
                                 <thead className="bg-paper-dim border-b text-ink-muted font-medium">
                                     <tr>
+                                        <th className="pl-6 pr-2 py-3 w-8">
+                                            <SelectAllCheckbox
+                                                checked={allSelected}
+                                                indeterminate={selected.size > 0 && !allSelected}
+                                                disabled={exportableIds.length === 0}
+                                                onChange={(on) => setSelected(on ? new Set(exportableIds) : new Set())}
+                                            />
+                                        </th>
                                         <th className="px-6 py-3">Datum</th>
                                         <th className="px-6 py-3">Filnamn</th>
                                         <th className="px-6 py-3">Längd</th>
@@ -188,6 +269,17 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
                                             className="hover:bg-brand/5 transition-colors group cursor-pointer"
                                             onClick={() => handleLoad(rec)}
                                         >
+                                            <td className="pl-6 pr-2 py-4" onClick={(e) => e.stopPropagation()}>
+                                                <input
+                                                    type="checkbox"
+                                                    aria-label="Välj för export"
+                                                    className="h-4 w-4 accent-brand cursor-pointer disabled:cursor-not-allowed"
+                                                    checked={selected.has(rec.id)}
+                                                    disabled={!isExportable(rec)}
+                                                    title={isExportable(rec) ? "Välj för export" : "Ingen transkription eller analys att exportera"}
+                                                    onChange={(e) => toggleOne(rec.id, e.target.checked)}
+                                                />
+                                            </td>
                                             <td className="px-6 py-4 whitespace-nowrap">
                                                 {format(new Date(rec.created_at), "d MMMM yyyy, HH:mm", { locale: sv })}
                                             </td>
@@ -307,6 +399,17 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
                     )}
                 </div>
             </div>
+
+            <UpsellModal isOpen={showUpsell} onClose={() => setShowUpsell(false)} source="export" />
+            <ExportDialog
+                isOpen={showExport}
+                onClose={() => setShowExport(false)}
+                scope="selected"
+                count={selectedRecs.length}
+                transcriptCount={selectedRecs.filter(hasTranscriptSource).length}
+                analysisCount={selectedRecs.filter(hasAnalysisSource).length}
+                loadMeetings={() => collectMeetings(selectedRecs, pauseBreakMs)}
+            />
         </div>
     );
 }

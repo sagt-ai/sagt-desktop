@@ -1,6 +1,7 @@
 import posthog from 'posthog-js'
 import { toast } from 'sonner'
 import type { UpsellSource, UpsellView } from '@/lib/upsell-state'
+import type { ExportBundle, ExportContent, ExportFormat, ExportScope } from '@/lib/export/types'
 
 const enabled = !!import.meta.env.VITE_POSTHOG_KEY
 
@@ -48,8 +49,22 @@ export function usePostHogEvents() {
         speakersIdentifyRequested: () =>
             captureEvent('speakers_identify_requested'),
 
+        // Övriga anrop skickas när ett upsell-kort VISAS. trigger 'export' skickas däremot vid
+        // KLICK på Exportera utan Pro, och samma klick öppnar modalen, som skickar
+        // upsell_modal_opened { source: 'export' }. Räkna alltså inte båda som två tillfällen.
         upsellShown: (trigger: string) =>
             captureEvent('upsell_shown', { trigger }),
+
+        // En sparad exportfil. Bara val och antal, aldrig filnamn eller text ur mötet.
+        // count = antal möten; bundle = single | zip | combined; content = vad som ingick.
+        transcriptExported: (p: {
+            format: ExportFormat
+            scope: ExportScope
+            count: number
+            bundle: ExportBundle
+            content: ExportContent
+        }) =>
+            captureEvent('transcript_exported', p),
 
         // Uppgraderingstratten i desktop: modal öppnad → "Uppgradera nu" → (inloggning,
         // sign_in_completed) → Stripe öppnad i webbläsaren → payment_succeeded (server).

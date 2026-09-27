@@ -1,6 +1,6 @@
 // Removed ScrollArea import
 import { Card } from "@/components/ui/card";
-import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock, Users, X } from "lucide-react";
+import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock, Users, X, Download } from "lucide-react";
 import { useTranscription } from "@/hooks/use-transcription";
 import { cancelCloudStream } from "@/hooks/use-cloud-stream";
 import { useSyncStore } from "@/store/sync-store";
@@ -13,12 +13,24 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuIte
 import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn, Job, errorSlug } from "@/lib/api";
 import { applyInlineCloudResult, cloudSegmentsJsonFromJob, segmentsHaveDiarizationLabels, invalidateStaleSpeakerMap, stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
 import { speakerKey, mergeSuggestions, parseSpeakerData, serializeSpeakerData } from "@/lib/speaker-naming";
+import {
+    buildCopyText as buildCopyTextFromLines,
+    defaultLabel,
+    groupTurns,
+    isMergedView,
+    mergedParagraphs as buildMergedParagraphs,
+    parseCloudSegments,
+    speakerLabel as labelForSpeaker,
+    transcriptLines,
+} from "@/lib/transcript-turns";
 import { AnalysisData } from "@/store/sync-store";
 import { useAuthStore, WAS_PRO_KEY } from "@/store/auth-store";
 import { useConfigStore } from "@/store/config-store";
 import { toast } from "sonner";
 import { ModePill } from "./mode-pill";
 import { UpsellModal } from "./upsell-modal";
+import { ExportDialog } from "./export-dialog";
+import { canExport, parseAnalysis } from "@/lib/export/select";
 import type { UpsellSource } from "@/lib/upsell-state";
 import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-events";
 import { useSlowLocalHint } from "@/hooks/use-slow-local-hint";
@@ -132,24 +144,8 @@ export function SplitView() {
     // Fas 1:s namnsättning ("Identifiera talare") fungerar då även på molnresultatet.
     // Faller tillbaka till flat blob (cloud_transcript) för mono/gamla inspelningar.
     const cloudStructured = useMemo((): UISegment[] => {
-        const raw: string | undefined = activeJob?.cloud_segments;
-        if (!raw) return [];
-        try {
-            const parsed = JSON.parse(raw);
-            if (!Array.isArray(parsed)) return [];
-            return parsed
-                .filter((s: any) => String(s?.text ?? "").trim())
-                .map((s: any, i: number) => ({
-                    id: -(i + 1),
-                    start_time: s.start_time ?? 0,
-                    end_time: s.end_time ?? 0,
-                    text: String(s.text).trim(),
-                    speaker: s.speaker || "MÖTET",
-                    timestamp: 0,
-                }));
-        } catch {
-            return [];
-        }
+        return parseCloudSegments(activeJob?.cloud_segments)
+            .map((s, i) => ({ ...s, id: -(i + 1), timestamp: 0 }));
     }, [activeJob?.cloud_segments]);
 
     const hasCloudResult = !!cloudTranscript || cloudStructured.length > 0;
@@ -189,26 +185,12 @@ export function SplitView() {
 
     // Sammanhängande-läge: alla segment är "MOLN" → rendera som ETT flöde med styckesbryt
     // vid pauser (gap mellan segment ≥ pauseBreakMs). Pausbryt härleds ur Rusts VAD-timing.
-    const isMerged = segments.length > 0 && segments.every(s => s.speaker === "MOLN");
-    const mergedParagraphs = useMemo((): string[] => {
-        if (!isMerged) return [];
-        const paras: string[] = [];
-        let cur = "";
-        let prevEnd: number | null = null;
-        for (const s of segments) {
-            const t = s.text.trim();
-            if (!t) continue;
-            if (prevEnd != null && (s.start_time - prevEnd) * 1000 >= pauseBreakMs) {
-                if (cur) paras.push(cur);
-                cur = t;
-            } else {
-                cur = cur ? `${cur} ${t}` : t;
-            }
-            prevEnd = s.end_time || s.start_time;
-        }
-        if (cur) paras.push(cur);
-        return paras;
-    }, [isMerged, segments, pauseBreakMs]);
+    // Logiken bor i lib/transcript-turns så att kopiering och filexport läser samma text.
+    const isMerged = isMergedView(segments);
+    const mergedParagraphs = useMemo(
+        (): string[] => (isMerged ? buildMergedParagraphs(segments, pauseBreakMs) : []),
+        [isMerged, segments, pauseBreakMs],
+    );
 
     // Talaridentifiering (Fas 1): namnmappning (kanonisk etikett → namn) + deltagarlista.
     // Icke-förstörande — segmenten rörs aldrig, namnen appliceras ovanpå Du/Mötet i vyn.
@@ -236,20 +218,7 @@ export function SplitView() {
     // blixtsnabb återöppning + nytt merge medan första invoken är i luften).
     const mergingRef = useRef(false);
 
-    // Kanonisk etikett (mic/DU → "DU", sys/MÖTET → "MÖTET") importeras från speaker-naming.ts
-    // — delad med hook + libbet så de två varianterna aldrig splittras.
-    const defaultLabel = (sp: string) => {
-        const k = speakerKey(sp);
-        if (k === "DU") return "Du";
-        if (k === "MÖTET") return "Mötet";
-        // Fas 2: numrerade diariserings-etiketter → svensk titelform (TALARE 1 → "Talare 1").
-        const m = k.match(/^(DU|MÖTET|TALARE)\s+(\d+)$/);
-        if (m) {
-            const base = m[1] === "TALARE" ? "Talare" : m[1] === "DU" ? "Du" : "Mötet";
-            return `${base} ${m[2]}`;
-        }
-        return sp;
-    };
+    // Standardetiketten (Du/Mötet/Talare N) kommer från lib/transcript-turns.
 
     // Fas 2: deterministisk färg per talare (kanonisk nyckel) så flera röster särskiljs visuellt.
     // Full literala Tailwind-klasser (JIT måste se dem). Nyckeln — inte råetiketten — så DU/mic
@@ -272,24 +241,13 @@ export function SplitView() {
     // #9: gruppera på varandra följande segment med SAMMA talare till en "tur" (som mockupen
     // på startsidan): fet "Mötet:"/"Du:" inline + text, ny tur bara vid talarbyte eller paus.
     // Namnet hämtas ur speakerMap (kanonisk nyckel), annars Du/Mötet-default.
-    const speakerLabel = (sp: string) => speakerMap[speakerKey(sp)] || defaultLabel(sp);
-    const turns = useMemo(() => {
-        const out: { speaker: string; text: string; start_time: number; end_time: number }[] = [];
-        for (const s of segments) {
-            if (s.text.includes('<|nospeech|>')) continue;
-            const t = s.text.trim();
-            if (!t) continue;
-            const last = out[out.length - 1];
-            const gap = last ? (s.start_time - last.end_time) * 1000 : 0;
-            if (last && last.speaker === s.speaker && gap < pauseBreakMs) {
-                last.text += " " + t;
-                last.end_time = s.end_time || s.start_time;
-            } else {
-                out.push({ speaker: s.speaker, text: t, start_time: s.start_time, end_time: s.end_time || s.start_time });
-            }
-        }
-        return out;
-    }, [segments, pauseBreakMs]);
+    const speakerLabel = (sp: string) => labelForSpeaker(sp, speakerMap);
+    const turns = useMemo(() => groupTurns(segments, pauseBreakMs), [segments, pauseBreakMs]);
+    // Raderna som visas, kopieras och exporteras — en källa för alla tre.
+    const transcriptRows = useMemo(
+        () => transcriptLines(segments, speakerMap, pauseBreakMs),
+        [segments, speakerMap, pauseBreakMs],
+    );
 
     // Det finns talaretiketter att namnsätta (Du/Mötet/Talare-N) — inte sammanhängande
     // molntext (MOLN, ett enda flöde utan talare). Styr chips-raden + "Identifiera talare".
@@ -297,14 +255,22 @@ export function SplitView() {
 
     // Kopiera EXAKT det som visas i vyn: samma turer (gruppering per talare) som renderas,
     // inte ett prefix per råsegment/mening. Merged-läget kopierar styckena.
-    const buildCopyText = (): string => {
-        if (isMerged) return mergedParagraphs.join("\n\n");
-        return turns
-            .map(turn => {
-                const label = turn.speaker === "MOLN" ? "" : speakerLabel(turn.speaker);
-                return label ? `${label}: ${turn.text}` : turn.text;
-            })
-            .join("\n\n");
+    const buildCopyText = (): string => buildCopyTextFromLines(transcriptRows);
+
+    // Filexport (Pro). Protokollet exporteras bara när det har innehåll.
+    const [showExport, setShowExport] = useState(false);
+    const exportAllowed = useAuthStore((s) => canExport(s.stripeStatus));
+    const exportAnalysis = useMemo(
+        () => (analysisData ? parseAnalysis(JSON.stringify(analysisData)) : null),
+        [analysisData],
+    );
+    const handleExportClick = () => {
+        if (!exportAllowed) {
+            events.upsellShown('export');
+            openUpsell('export');
+            return;
+        }
+        setShowExport(true);
     };
 
     useEffect(() => {
@@ -1074,6 +1040,20 @@ export function SplitView() {
                                 {copiedKey === "transcript" ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
                             </Button>
                         )}
+                        {/* Export ingår i Pro. Gratisanvändaren ser knappen och får uppgraderingen. */}
+                        {(transcriptRows.length > 0 || exportAnalysis) && (
+                            <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6 text-ink-muted hover:text-ink-soft rounded-full"
+                                onClick={(e) => { e.currentTarget.blur(); handleExportClick(); }}
+                                disabled={isRecording || isProcessing}
+                                title="Exportera"
+                                aria-label="Exportera"
+                            >
+                                <Download className="h-3.5 w-3.5" />
+                            </Button>
+                        )}
                         {/* §13.2: ETT åtgärdsmenyvalv i stället för tre separata knappar (toggle +
                             omtranskribera + identifiera). "Det bara fungerar" — omtranskribering
                             med/utan talarseparering (med: bara när backendens kill switch är på)
@@ -1716,6 +1696,20 @@ export function SplitView() {
                 isOpen={showUpsellModal}
                 onClose={() => setShowUpsellModal(false)}
                 source={upsellSource}
+            />
+            <ExportDialog
+                isOpen={showExport}
+                onClose={() => setShowExport(false)}
+                scope="current"
+                count={1}
+                transcriptCount={transcriptRows.length > 0 ? 1 : 0}
+                analysisCount={exportAnalysis ? 1 : 0}
+                loadMeetings={async () => [{
+                    createdAt: activeJob?.created_at ?? new Date().toISOString(),
+                    lines: transcriptRows,
+                    analysis: exportAnalysis,
+                    fallbackTitle: typeof activeJob?.filename === "string" ? activeJob.filename.replace(/\.[^.]+$/, "") : undefined,
+                }]}
             />
         </div >
     );

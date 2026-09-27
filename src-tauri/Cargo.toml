@@ -14,7 +14,7 @@ name = "sagt"
 # strängen. Att hålla fältet utanför synken gjorde alltså inte problemet ofarligt — det
 # gjorde det osynligt. Rätt svar på en fil som måste vara i synk är att lägga den under
 # grinden, vilket den nu är.
-version = "0.10.6"
+version = "0.10.7"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -44,6 +44,10 @@ hound = "3.5"
 tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Save dialog + writing the chosen file (transcript export). Pinned to the minors that
+# match tauri 2.10 and the JS packages; the next patch releases require tauri 2.11.
+tauri-plugin-dialog = "=2.7.0"
+tauri-plugin-fs = "=2.5.0"
 tokio = { version = "1", features = ["sync"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_rusqlite = "0.35"
