@@ -19,7 +19,7 @@ const QUESTIONNAIRE_START: FeedbackQuestion[] = [
     },
     {
         id: "last_bother",
-        thumb: "Fungerade Sagt som du väntade dig senast?",
+        thumb: "Fungerade Sagt som du väntade dig?",
         text: "Vad störde dig?",
     },
     {

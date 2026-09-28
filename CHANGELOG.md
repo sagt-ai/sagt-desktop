@@ -7,6 +7,14 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.10.9 — 2026-09-28
+
+### Changed
+
+- **Clearer wording in the feedback questions.** One of the questions now asks
+  whether Sagt worked the way you expected, without referring to a particular
+  occasion.
+
 ## 0.10.8 — 2026-09-27
 
 ### Added
