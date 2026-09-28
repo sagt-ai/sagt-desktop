@@ -7,6 +7,7 @@ import { usePostHogEvents } from "@/hooks/use-posthog-events";
 import { selectUpsellView, shouldAutoClose, shouldCelebrate, type UpsellSource } from "@/lib/upsell-state";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { onUpsellDismissed } from "@/lib/feedback-runtime";
 
 interface UpsellModalProps {
     isOpen: boolean;
@@ -57,7 +58,9 @@ export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
 
     // Uttrycklig avfärdning — nollställer betalförsöket så nästa öppning visar säljsidan.
     const dismiss = () => {
-        events.upsellModalDismissed(source, selectUpsellView({ isPro, paymentAttempted, isWaiting }));
+        const view = selectUpsellView({ isPro, paymentAttempted, isWaiting });
+        events.upsellModalDismissed(source, view);
+        onUpsellDismissed(view);
         setPaymentAttempted(false);
         stopPolling();
         onClose();

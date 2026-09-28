@@ -25,6 +25,7 @@ import { autoIdentify, buildTurnsFromSegments, mergeSuggestions, parseSpeakerDat
 import { stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
 import { captureEvent } from "@/hooks/use-posthog-events";
 import { waitForCloudStreamIdle } from "@/hooks/use-cloud-stream";
+import { markErrorSeen, onAnalysisCompleted } from "@/lib/feedback-runtime";
 
 interface StoppedRecording {
     id: number | null;
@@ -85,9 +86,11 @@ async function runAutoAnalysis(recordingId: number | null, segs: UISegment[], to
             });
         }
         captureEvent("analysis_completed", { source: "auto_stop" });
+        onAnalysisCompleted();
     } catch (e: any) {
         console.error("Auto-analys vid stopp misslyckades:", e);
         captureEvent("analysis_failed", { error: e?.message || "unknown", source: "auto_stop" });
+        markErrorSeen();
     }
 }
 

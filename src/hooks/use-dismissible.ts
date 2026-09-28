@@ -13,23 +13,23 @@ import { useState } from "react";
  *     (MOTD-bannern: ett *nytt* meddelande = ny token = kortet visas igen trots
  *     att en tidigare version avfärdats.)
  *
- * `dismissed` läses en gång vid mount — inte reaktivt — precis som kopiorna
- * hooken ersätter. Avfärdan sker via `dismiss()`, som även uppdaterar state så
- * att UI:t döljs direkt utan omläsning.
+ * Det lagrade värdet läses en gång vid mount, men jämförs mot `token` vid varje
+ * rendering. Det spelar roll när token kommer först efter mount: vid kallstart
+ * släpps appen in efter 4 s och motd kommer med bakgrundshämtningen. Jämfördes
+ * värdet bara vid mount (mot "1", eftersom motd då var null) visades ett redan
+ * avfärdat meddelande igen så fort det kom.
  */
 export function useDismissible(key: string, token?: string | null) {
     // null/undefined token faller tillbaka på "1", så boolean-läget och ett
     // ännu-inte-laddat värde (t.ex. motd === null) beter sig identiskt med
     // originalen: lagrat === "1" är falskt när bara värde-tokens skrivits.
     const resolved = token ?? "1";
-    const [dismissed, setDismissed] = useState(
-        () => localStorage.getItem(key) === resolved
-    );
+    const [stored, setStored] = useState(() => localStorage.getItem(key));
 
     const dismiss = () => {
         localStorage.setItem(key, resolved);
-        setDismissed(true);
+        setStored(resolved);
     };
 
-    return { dismissed, dismiss };
+    return { dismissed: stored === resolved, dismiss };
 }

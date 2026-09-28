@@ -5,6 +5,7 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
 import { toast } from "sonner";
+import { onTranscriptSaved } from "@/lib/feedback-runtime";
 // import { open } from "@tauri-apps/plugin-shell"; // Removed for In-App Analysis
 import { useSettingsStore } from "@/store/settings-store";
 // import { useRecordingStore } from "@/store/recording-store";
@@ -159,6 +160,8 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                         const wordCount = segs.reduce((n, s) => n + s.text.split(" ").length, 0);
                         events.transcriptionCompleted(wordCount);
                     }
+                    // Inbjudan till frågorna kommer bara efter ett transkript med text.
+                    onTranscriptSaved(d ? d.segments_saved > 0 : segs.length > 0);
                     // Utfallet för varje lokal inspelning, med eller utan text, så att de
                     // tomma kan jämföras med de lyckade (nivåer, VAD, whisper).
                     if (d && !d.cloud_streaming) {

@@ -4,7 +4,8 @@ import { Slider } from "@/components/ui/slider";
 import { useSettingsStore, TranscriptionLanguage, LocalAudioRetention } from "@/store/settings-store";
 import { getStorageUsage, runStorageCleanup, openRecordingsFolder, formatBytes, type StorageUsage } from "@/lib/storage";
 import { useAudioAmplitude } from "@/hooks/use-audio-amplitude";
-import { Cpu, Cloud, Sparkles, HardDrive, Lock, Mic, Languages, ChevronDown, ChevronUp, FolderOpen } from "lucide-react";
+import { Cpu, Cloud, Sparkles, HardDrive, Lock, Mic, Languages, ChevronDown, ChevronUp, FolderOpen, MessageSquare } from "lucide-react";
+import { openFromSettings } from "@/lib/feedback-runtime";
 import { Button } from "@/components/ui/button";
 import { InfoHint } from "@/components/ui/info-hint";
 import { invoke } from "@tauri-apps/api/core";
@@ -722,6 +723,19 @@ export function SettingsPage() {
                             </div>
                         </div>
                     </div>
+                </section>
+
+                <section className="space-y-3">
+                    <div className="flex items-center gap-2">
+                        <MessageSquare className="text-primary w-5 h-5" />
+                        <h2 className="text-lg font-display font-semibold text-ink">Tyck till om Sagt</h2>
+                    </div>
+                    <p className="text-sm text-ink-muted">
+                        Berätta vad som fungerar och vad du saknar. Några korta frågor, och du kan sluta när du vill.
+                    </p>
+                    <Button onClick={openFromSettings}>
+                        Svara på frågorna
+                    </Button>
                 </section>
 
                 <div className="flex items-center justify-between pt-4">

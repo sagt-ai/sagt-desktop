@@ -24,6 +24,10 @@ if (KEY) {
         // transkript inräknade. Kört i en harness 2026-09-22. Webben fick
         // samma rad 2026-09-23.
         disable_session_recording: true,
+        // Frågorna till användaren ställs av appens eget kort (components/feedback),
+        // som fungerar utan nät och ser ut som appen. Utan raden kan en enkät som
+        // skapas i PostHog dyka upp här ovanpå den.
+        disable_surveys: true,
         loaded: (ph) => {
             ph.register({ platform: 'desktop', app_version: CURRENT_VERSION })
             ph.capture('app_opened')

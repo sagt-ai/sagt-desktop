@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
 import { toast } from "sonner";
+import { markErrorSeen } from "@/lib/feedback-runtime";
 
 interface TranscriptionEvent {
     text: string;
@@ -46,6 +47,7 @@ export function useTranscription() {
             toast.error(event.payload, {
                 duration: 6000,
             });
+            markErrorSeen();
             setIsProcessing(false);
         });
 

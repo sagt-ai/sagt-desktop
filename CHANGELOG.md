@@ -7,6 +7,25 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.10.8 — 2026-09-27
+
+### Added
+
+- **Tell us what you think.** After you have transcribed a few meetings, a small
+  card may ask if you would like to answer a few short questions about Sagt.
+  Each question starts with thumbs up or down, and you can write as much or as
+  little as you like. Answers are sent as you go, so you can stop at any time.
+  Choose "Inte nu" (not now) and the card rests for two weeks, or "Nej tack"
+  (no thanks) and it never asks again. It never appears on first launch, during a recording, or after an
+  error. You can also open the questions yourself under Settings.
+- **One question when you uninstall on Windows.** After a normal uninstall, your
+  browser opens a page that asks what made you uninstall. Answering is optional.
+
+### Fixed
+
+- **A dismissed notice could come back.** If the app took a while to connect
+  when it started, a notice you had already closed was shown again.
+
 ## 0.10.7 — 2026-09-27
 
 ### Added

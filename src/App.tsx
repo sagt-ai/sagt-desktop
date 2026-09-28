@@ -22,6 +22,8 @@ import { useAuthStore } from "@/store/auth-store";
 import { MotdBanner } from "@/components/lifecycle/motd-banner";
 import { TrialBanner } from "@/components/lifecycle/trial-banner";
 import { AudioWarningBanner } from "@/components/lifecycle/audio-warning-banner";
+import { FeedbackCard } from "@/components/feedback/feedback-card";
+import { markErrorSeen, onAppStarted } from "@/lib/feedback-runtime";
 
 function App() {
   useConnectivity();
@@ -36,6 +38,9 @@ function App() {
 
   // Återställ molnläge för Pro-användare vars inställning nollställdes av v0.9.18-migrering.
   // Kör varje gång isSignedIn ändras (auth laddas asynkront efter mount).
+  // Inbjudan till frågorna även för den som redan spelat in tre möten.
+  useEffect(() => { onAppStarted(); }, []);
+
   useEffect(() => {
     const { isPro } = useAuthStore.getState();
     const { recordingMode, modeExplicitlySet, defaultProMode, setRecordingMode } = useSettingsStore.getState();
@@ -106,6 +111,7 @@ function App() {
     const unlistenPromise = listen<string>("audio-error", (event) => {
       console.error("Audio engine error:", event.payload);
       toast.error("Ljudfel: " + event.payload, { duration: 8000 });
+      markErrorSeen();
     });
     return () => { unlistenPromise.then((f) => f()); };
   }, []);
@@ -134,6 +140,7 @@ function App() {
     const unlistenWarning = listen<string>("audio-warning", (event) => {
       console.warn("Audio engine warning:", event.payload);
       toast.warning(event.payload, { duration: 10000 });
+      markErrorSeen();
       useSyncStore.getState().setAudioWarning(event.payload);
     });
     const unlistenCleared = listen("audio-warning-cleared", () => {
@@ -160,6 +167,7 @@ function App() {
                 {currentView === 'dashboard' ? <SplitView /> :
                   currentView === 'settings' ? <SettingsPage /> :
                     <RecordingsPage onViewChange={setCurrentView} />}
+                <FeedbackCard />
               </div>
               <ControlBar onViewChange={setCurrentView} />
             </main>

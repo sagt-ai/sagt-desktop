@@ -25,6 +25,7 @@ import {
 } from "@/lib/transcript-turns";
 import { AnalysisData } from "@/store/sync-store";
 import { useAuthStore, WAS_PRO_KEY } from "@/store/auth-store";
+import { markErrorSeen, onAnalysisCompleted } from "@/lib/feedback-runtime";
 import { useConfigStore } from "@/store/config-store";
 import { toast } from "sonner";
 import { ModePill } from "./mode-pill";
@@ -695,6 +696,7 @@ export function SplitView() {
 
                 setAnalysisData(mappedAnalysis as AnalysisData);
                 events.analysisCompleted();
+                onAnalysisCompleted();
                 // Stop polling so it doesn't overwrite this re-analysis result
                 setUploadedJobId(null);
 
@@ -719,6 +721,7 @@ export function SplitView() {
             } catch (e: any) {
                 console.error("Re-analyze failed:", e);
                 events.analysisFailed(e?.message || 'unknown');
+                markErrorSeen();
                 if (e.message?.includes("Payment Required")) {
                     openUpsell('analysis_402');
                 } else {
