@@ -2,6 +2,7 @@ import posthog from 'posthog-js'
 import { toast } from 'sonner'
 import type { UpsellSource, UpsellView } from '@/lib/upsell-state'
 import { markErrorSeen } from '@/lib/feedback-runtime'
+import { withoutErrorCode } from '@/lib/error-slug'
 import type { ExportBundle, ExportContent, ExportFormat, ExportScope } from '@/lib/export/types'
 
 const enabled = !!import.meta.env.VITE_POSTHOG_KEY
@@ -21,7 +22,7 @@ export function showError(
     props?: Record<string, unknown>,
     toastOptions?: Parameters<typeof toast.error>[1],
 ) {
-    toast.error(message, toastOptions)
+    toast.error(withoutErrorCode(message), toastOptions)
     // Ingen fråga om Sagt resten av sessionen efter ett fel.
     markErrorSeen()
     captureEvent('error_shown', { surface: 'desktop', code, ...props })

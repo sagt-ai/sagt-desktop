@@ -19,7 +19,9 @@ export interface Job {
         action_items?: string[];
         template_used?: string;
     };
-    result?: any;
+    // Fält som läses explicit: `analysis_failed` sätts av servern när transkriptet blev klart
+    // men AI-analysen inte (Berget nere eller modellen borta). `analysis` är då null.
+    result?: { analysis_failed?: boolean; [key: string]: any };
     error_message?: string;
 }
 
@@ -231,6 +233,17 @@ export async function getJob(jobId: string, token: string): Promise<Job> {
  * → dashboard speglar senaste versionen. Använd endast för persisterade jobb (cloud_job_id).
  * Osynkade/lokala jobb använder reanalyzeTranscript (stateless).
  */
+/**
+ * Molnjobbet finns inte (404): TTL har raderat det efter 90 dagar, eller användaren har raderat
+ * det i webben. Backend svarar likadant för ett jobb som tillhör någon annan.
+ */
+export class CloudJobNotFoundError extends Error {
+    constructor(detail: string) {
+        super(`Re-analys (moln) misslyckades: ${detail}`);
+        this.name = "CloudJobNotFoundError";
+    }
+}
+
 export async function reanalyzeJob(jobId: string, templateId: string = "general", token: string): Promise<Job> {
     const { backendUrl } = useSettingsStore.getState();
     let baseUrl = backendUrl.replace(/\/$/, "");
@@ -254,6 +267,7 @@ export async function reanalyzeJob(jobId: string, templateId: string = "general"
         try { const p = JSON.parse(errorText); if (p.detail) parsedError = p.detail; } catch (e) { }
         if (response.status === 401) throw new Error(`Unauthorized: ${parsedError}`);
         if (response.status === 402) throw new Error(`Payment Required: Denna funktion kräver Pro.`);
+        if (response.status === 404) throw new CloudJobNotFoundError(parsedError);
         throw new Error(`Re-analys (moln) misslyckades: ${parsedError}`);
     }
 

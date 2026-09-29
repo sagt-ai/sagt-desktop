@@ -17,3 +17,12 @@ export function errorSlug(error: unknown): string {
     if (/raderad/i.test(msg)) return "audio_deleted";
     return "unknown";
 }
+
+/**
+ * Serverns felkod, till exempel "(llm_upstream)", står sist i svarets text så att den syns i
+ * loggen och i analysen av felen. Användaren har ingen nytta av den, så den tas bort ur det
+ * som visas. Bara en avslutande kod i formen (gemener_med_understreck) tas bort.
+ */
+export function withoutErrorCode(message: string): string {
+    return message.replace(/\s*\([a-z]+(?:_[a-z]+)+\)\s*$/, "");
+}

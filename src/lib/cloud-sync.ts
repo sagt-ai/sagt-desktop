@@ -1,7 +1,37 @@
 import { invoke } from "@tauri-apps/api/core";
+import { toast } from "sonner";
 import { useSyncStore, AnalysisData } from "@/store/sync-store";
 import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
+import { captureEvent } from "@/hooks/use-posthog-events";
 import type { Job } from "./api";
+
+/** Visas när molnjobbet blev klart men analysen inte. Transkriptet är sparat. */
+export const ANALYSIS_FAILED_MESSAGE =
+    "AI-analysen misslyckades. Transkriptet är sparat, försök igen med Starta analys.";
+
+/**
+ * Analysen ur ett klart molnjobb, eller null om jobbet inte har någon att visa.
+ *
+ * null betyder: skriv INTE över den analys som redan visas eller ligger i den lokala
+ * databasen, och räkna det inte som en lyckad analys. Tidigare blev `job.analysis || {}` en
+ * tom analys som sparades över den befintliga, till exempel vid en omtranskribering.
+ * Servern sätter `analysis = null` och `result.analysis_failed = true` när Berget inte
+ * levererade. Samma gäller ett jobb som bara
+ * transkriberades, där `analysis` är en skip-markör utan sammanfattning.
+ */
+export function analysisFromJob(job: Job): AnalysisData | null {
+    if (!job.analysis || job.result?.analysis_failed) return null;
+    // Transkribering utan analys ger {"status": "skipped", "message": …} utan sammanfattning.
+    // Det är ingen analys och får inte skriva över den som finns.
+    if (typeof job.analysis.summary !== "string" || !job.analysis.summary.trim()) return null;
+    const analysis = job.analysis;
+    return {
+        summary: analysis.summary || "",
+        decisions: analysis.key_decisions || [],
+        actions: analysis.action_items || [],
+        template_used: analysis.template_used,
+    };
+}
 
 /**
  * Fas 1c: extrahera strukturerade DU/MÖTET-turer ur ett molnresultat (stereo-omtranskribering)
@@ -96,14 +126,13 @@ export async function invalidateStaleSpeakerMap(
 export async function applyInlineCloudResult(job: Job, recordingDbId: number | null): Promise<number> {
     const sync = useSyncStore.getState();
 
-    const analysis = job.analysis || {};
-    const completedAnalysis: AnalysisData = {
-        summary: analysis.summary || "",
-        decisions: analysis.key_decisions || [],
-        actions: analysis.action_items || [],
-        template_used: analysis.template_used,
-    };
-    sync.setAnalysisData(completedAnalysis);
+    const completedAnalysis = analysisFromJob(job);
+    if (completedAnalysis) {
+        sync.setAnalysisData(completedAnalysis);
+    } else if (job.result?.analysis_failed) {
+        captureEvent("analysis_failed", { error: "analysis_failed_server", source: "cloud_job" });
+        toast.error(ANALYSIS_FAILED_MESSAGE);
+    }
     sync.setProcessingStatus("COMPLETED");
 
     const cloudText: string | undefined = job.result?.text;
@@ -146,11 +175,13 @@ export async function applyInlineCloudResult(job: Job, recordingDbId: number | n
     // Persist i LOKAL sqlite så resultatet överlever flikbyten — inget skickas/sparas i molnet.
     if (recordingDbId != null) {
         try {
-            await invoke("save_analysis_to_db", {
-                id: recordingDbId,
-                analysis: JSON.stringify(completedAnalysis),
-                template: completedAnalysis.template_used || "general",
-            });
+            if (completedAnalysis) {
+                await invoke("save_analysis_to_db", {
+                    id: recordingDbId,
+                    analysis: JSON.stringify(completedAnalysis),
+                    template: completedAnalysis.template_used || "general",
+                });
+            }
             // Skriv ALLTID cloud_segments (tom sträng = rensa) så DB och in-memory aldrig
             // divergerar — annars skulle en stereo→mono-omtranskribering lämna kvar gamla
             // turer i DB medan activeJob nollställs → stale turer vid återöppning.
@@ -176,7 +207,7 @@ export async function applyInlineCloudResult(job: Job, recordingDbId: number | n
     if (activeJob) {
         sync.setActiveJob({
             ...activeJob,
-            analysis_json: JSON.stringify(completedAnalysis),
+            analysis_json: completedAnalysis ? JSON.stringify(completedAnalysis) : activeJob.analysis_json,
             cloud_transcript: cloudText || null,
             cloud_segments: cloudSegmentsJson,
             speaker_map: speakerMapRaw,

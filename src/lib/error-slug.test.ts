@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { errorSlug } from "./error-slug";
+import { errorSlug, withoutErrorCode } from "./error-slug";
 
 describe("errorSlug", () => {
     it("mappar 401-prefix → unauthorized", () => {
@@ -44,5 +44,20 @@ describe("errorSlug", () => {
         expect(errorSlug(new Error("Något helt oväntat inträffade"))).toBe("unknown");
         expect(errorSlug(undefined)).toBe("unknown");
         expect(errorSlug("en naken sträng")).toBe("unknown");
+    });
+});
+
+describe("withoutErrorCode", () => {
+    it("tar bort serverns felkod sist i texten", () => {
+        expect(withoutErrorCode("Talaridentifiering misslyckades: Talaridentifieringen är tillfälligt otillgänglig. (llm_upstream)"))
+            .toBe("Talaridentifiering misslyckades: Talaridentifieringen är tillfälligt otillgänglig.");
+        expect(withoutErrorCode("AI-analysen är tillfälligt otillgänglig. Försök igen om en stund. (llm_invalid_response)"))
+            .toBe("AI-analysen är tillfälligt otillgänglig. Försök igen om en stund.");
+    });
+
+    it("lämnar vanliga parenteser och text utan kod orörda", () => {
+        expect(withoutErrorCode("Uppladdning misslyckades (försök igen)")).toBe("Uppladdning misslyckades (försök igen)");
+        expect(withoutErrorCode("Filen är för stor (max 500 MB)")).toBe("Filen är för stor (max 500 MB)");
+        expect(withoutErrorCode("Okänt fel")).toBe("Okänt fel");
     });
 });

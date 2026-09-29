@@ -19,6 +19,7 @@ vi.mock("@/hooks/use-posthog-events", () => ({ captureEvent: vi.fn() }));
 vi.mock("@/hooks/use-cloud-stream", () => ({ waitForCloudStreamIdle: vi.fn(async () => {}) }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { captureEvent } from "@/hooks/use-posthog-events";
 import { diarizeMeeting, identifySpeakers, reanalyzeTranscript } from "@/lib/api";
 import { finalizeStreamingSession } from "./auto-finalize";
 import { useConfigStore } from "@/store/config-store";
@@ -110,6 +111,21 @@ describe("auto-diariseringen vid stopp", () => {
         await stop();
         expect(reanalyzeTranscript).toHaveBeenCalledTimes(1);
         expect(diarizeMeeting).not.toHaveBeenCalled();
+    });
+
+    it("ett fel i namngivningen efter en diarisering sparar ändå strippningen (R4)", async () => {
+        // /identify-speakers svarar 503 när Berget är nere. Förr
+        // svarade den 200 med tom mappning och strippningen sparades; ett kast får inte ändra det.
+        useConfigStore.getState().setDiarizeEnabled(true);
+        useSyncStore.setState({ activeJob: { id: RECORDING.id, speaker_map: speakerMap({ DU: "Jag", "MÖTET 2": "Gammal" }) } });
+        vi.mocked(diarizeMeeting).mockResolvedValueOnce([
+            { start: 2, end: 4, speaker: "MÖTET 1", channel: "right" },
+        ]);
+        vi.mocked(identifySpeakers).mockRejectedValueOnce(new Error("Talaridentifiering misslyckades: 503"));
+        await stop();
+        expect(savedSpeakerData()?.map).toEqual({ DU: "Jag" });
+        const events = vi.mocked(captureEvent).mock.calls.map(([name]) => name);
+        expect(events).not.toContain("diarization_failed");
     });
 });
 

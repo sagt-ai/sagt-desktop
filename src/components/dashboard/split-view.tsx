@@ -10,8 +10,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
-import { getJob, reanalyzeTranscript, reanalyzeJob, uploadJob, identifySpeakers, SpeakerTurn, Job, errorSlug } from "@/lib/api";
-import { applyInlineCloudResult, cloudSegmentsJsonFromJob, segmentsHaveDiarizationLabels, invalidateStaleSpeakerMap, stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
+import { getJob, uploadJob, identifySpeakers, SpeakerTurn, Job, errorSlug } from "@/lib/api";
+import { bestSavedText, forgetCloudJob, reanalyzeRecording } from "@/lib/reanalyze";
+import { applyInlineCloudResult, analysisFromJob, ANALYSIS_FAILED_MESSAGE, cloudSegmentsJsonFromJob, segmentsHaveDiarizationLabels, invalidateStaleSpeakerMap, stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
 import { speakerKey, mergeSuggestions, parseSpeakerData, serializeSpeakerData } from "@/lib/speaker-naming";
 import {
     buildCopyText as buildCopyTextFromLines,
@@ -677,15 +678,19 @@ export function SplitView() {
             events.analysisRequested();
             setIsReanalyzing(true);
             try {
-                const fullText = segments.map(s => s.text).join(" ");
+                const fullText = bestSavedText(activeJob, segments);
 
                 // Synkat moln-jobb → kör om i molnet (job.analysis uppdateras → dashboard matchar
-                // desktop). Osynkat/lokalt → stateless analys på den visade texten.
-                // OBS: activeJob kan vara null direkt efter stopp (history-updated ej landad) —
-                // segmenten finns redan, så analysera texten statelesst i det fallet.
-                const raw = (activeJob?.cloud_job_id && useSettingsStore.getState().cloudSync)
-                    ? ((await reanalyzeJob(activeJob.cloud_job_id, "general", token)).analysis || {})
-                    : await reanalyzeTranscript(fullText, "general", token);
+                // desktop). Osynkat/lokalt, eller molnjobbet borta (404) → stateless analys på den
+                // visade texten. OBS: activeJob kan vara null direkt efter stopp (history-updated
+                // ej landad) — segmenten finns redan, så analysera texten statelesst i det fallet.
+                const { raw, cloudJobGone } = await reanalyzeRecording({
+                    cloudJobId: activeJob?.cloud_job_id,
+                    cloudSync: useSettingsStore.getState().cloudSync,
+                    fullText,
+                    templateId: "general",
+                    token,
+                });
 
                 const mappedAnalysis = {
                     summary: raw.summary || "",
@@ -709,12 +714,20 @@ export function SplitView() {
                         template: "general"
                     });
 
-                    const updatedJob = {
+                    let updatedJob = {
                         ...activeJob,
                         analysis_json: JSON.stringify(mappedAnalysis),
                         ai_template_used: "general"
                     };
+                    // Molnjobbet är borta: glöm det lokalt (se forgetCloudJob).
+                    if (cloudJobGone) {
+                        const forgotten = await forgetCloudJob(activeJob.id);
+                        if (forgotten) updatedJob = { ...updatedJob, ...forgotten };
+                    }
                     setActiveJob(updatedJob);
+                }
+                if (cloudJobGone) {
+                    toast.info("Molnkopian finns inte längre, så analysen gjordes på texten på den här datorn.");
                 }
                 setTemplateId("general"); // Ensure global store is updated
                 console.log("Analys uppdaterad!");
@@ -891,20 +904,20 @@ export function SplitView() {
                 setProcessingStatus(job.status);
 
                 if (job.status === 'COMPLETED') {
-                    const analysis = job.analysis || {};
-
-                    const completedAnalysis: AnalysisData = {
-                        summary: analysis.summary || "",
-                        decisions: analysis.key_decisions || [],
-                        actions: analysis.action_items || [],
-                        template_used: analysis.template_used
-                    };
+                    // null när jobbet saknar analys, till exempel när den misslyckades i
+                    // servern: då står den visade och den sparade analysen kvar orörda.
+                    const completedAnalysis = analysisFromJob(job);
 
                     // Guard again
                     if (!useSyncStore.getState().uploadedJobId) return;
 
-                    setAnalysisData(completedAnalysis);
-                    events.analysisCompleted();
+                    if (completedAnalysis) {
+                        setAnalysisData(completedAnalysis);
+                        events.analysisCompleted();
+                    } else if (job.result?.analysis_failed) {
+                        events.analysisFailed("analysis_failed_server", "cloud_job");
+                        toast.error(ANALYSIS_FAILED_MESSAGE);
+                    }
 
                     // Replace local whisper segments with the superior Berget cloud transcription
                     const cloudText = job.result?.text;
@@ -940,11 +953,13 @@ export function SplitView() {
                     const currentActiveJob = useSyncStore.getState().activeJob;
                     if (currentActiveJob?.id) {
                         try {
-                            await invoke("save_analysis_to_db", {
-                                id: currentActiveJob.id,
-                                analysis: JSON.stringify(completedAnalysis),
-                                template: completedAnalysis.template_used || "general"
-                            });
+                            if (completedAnalysis) {
+                                await invoke("save_analysis_to_db", {
+                                    id: currentActiveJob.id,
+                                    analysis: JSON.stringify(completedAnalysis),
+                                    template: completedAnalysis.template_used || "general"
+                                });
+                            }
                             // Persistera molnresultatet i sqlite — överlever omstart och
                             // gör att modellväxlaren fungerar när inspelningen återöppnas.
                             if (cloudText && cloudText.trim()) {
@@ -977,7 +992,7 @@ export function SplitView() {
                             // Persist cloud_transcript + cloud_segments so segments survive tab switches
                             const updatedJob = {
                                 ...currentActiveJob,
-                                analysis_json: JSON.stringify(completedAnalysis),
+                                analysis_json: completedAnalysis ? JSON.stringify(completedAnalysis) : currentActiveJob.analysis_json,
                                 cloud_transcript: cloudText || null,
                                 cloud_segments: cloudSegmentsJson,
                                 speaker_map: speakerMapRaw,

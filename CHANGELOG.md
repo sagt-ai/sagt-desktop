@@ -7,6 +7,28 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.10.10 — 2026-09-28
+
+### Fixed
+
+- **A failed AI analysis no longer replaces your summary.** If the analysis could
+  not be completed, the app could save an empty summary over the one you already
+  had. Your existing summary now stays, and the app tells you the analysis
+  failed so you can try again.
+- **Re-analysing an older synced recording works again.** When the cloud copy of
+  a recording was no longer available, "Analysera igen" (Analyse again) showed an error. The app
+  now analyses the transcript on your computer instead, and the recording is
+  marked as local so you can sync it again.
+- **Transcribing without analysis keeps your summary.** Sending a recording for
+  cloud transcription only no longer clears an existing summary.
+
+### Changed
+
+- **Re-analysis uses the best transcript you have.** If a recording has a cloud
+  transcript, it is used for re-analysis instead of the local one.
+- **Clearer error messages.** Internal error codes are no longer shown in error
+  messages.
+
 ## 0.10.9 — 2026-09-28
 
 ### Changed

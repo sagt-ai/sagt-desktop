@@ -112,7 +112,16 @@ async function autoNameSpeakers(
     { renumbered }: { renumbered: boolean },
 ): Promise<void> {
     const hints = parseSpeakerData(latestSpeakerMapRaw(recording.id, baseSpeakerMapRaw)).participants;
-    const suggested = await autoIdentify(segs, hints, token);
+    // Ett fel i namngivningen (503 när Berget är nere) behandlas som "inga förslag" och inte
+    // som ett kast: R4-strippningen nedan måste ändå sparas efter en diarisering, annars
+    // hänger gamla namn kvar på omnumrerade röster. Kastet hamnade dessutom i runAutoDiarize
+    // och räknades som diarization_failed fast diariseringen lyckats.
+    let suggested: Awaited<ReturnType<typeof autoIdentify>> = null;
+    try {
+        suggested = await autoIdentify(segs, hints, token);
+    } catch (e: any) {
+        console.warn("Auto-namngivning vid stopp misslyckades:", e?.message || e);
+    }
 
     // Merga mot FÄRSK state, som live-loopen: användaren kan ha döpt om en talare eller lagt
     // till en deltagare medan dräneringen, diariseringen och anropet pågick, och det ska vinna.
