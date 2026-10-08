@@ -45,15 +45,17 @@ interface SettingsState {
 
     // New unified mode
     recordingMode: 'cloud_analysis' | 'cloud' | 'local';
-    defaultProMode: 'cloud_analysis' | 'cloud' | 'local';
     modeExplicitlySet: boolean; // true = user has consciously picked a mode via dropdown
+    // Satt av uppdateringen till v10 för den som hade molnmodellen som standard. Appen
+    // frågar då en gång vid start (Pro) i stället för att byta läge i tysthet.
+    cloudChoicePending: boolean;
+    resolveCloudChoice: (mode: 'cloud' | 'local') => void;
 
     // Legacy flags kept for compatibility, now derived from recordingMode
     autoTranscribeCloud: boolean;
     autoAnalyzeCloud: boolean;
 
     setRecordingMode: (mode: 'cloud_analysis' | 'cloud' | 'local') => void;
-    setDefaultProMode: (mode: 'cloud_analysis' | 'cloud' | 'local') => void;
 
     setTranscriptionLanguage: (language: TranscriptionLanguage) => void;
     setVadThreshold: (threshold: number) => void;
@@ -101,8 +103,8 @@ export const useSettingsStore = create<SettingsState>()(
             // New unified mode — default 'local' så gratisanvändare inte möts av
             // molnläge-toast vid första inspelning
             recordingMode: 'local',
-            defaultProMode: 'cloud',
             modeExplicitlySet: false,
+            cloudChoicePending: false,
 
             // Legacy
             autoTranscribeCloud: false,
@@ -115,7 +117,14 @@ export const useSettingsStore = create<SettingsState>()(
                 modeExplicitlySet: true,
             }),
 
-            setDefaultProMode: (mode) => set({ defaultProMode: mode }),
+
+            resolveCloudChoice: (mode) => set({
+                recordingMode: mode,
+                autoTranscribeCloud: mode === 'cloud',
+                autoAnalyzeCloud: false,
+                modeExplicitlySet: true,
+                cloudChoicePending: false,
+            }),
 
             setTranscriptionLanguage: (transcriptionLanguage) => set({ transcriptionLanguage }),
             setVadThreshold: (vadThreshold) => set({ vadThreshold }),
@@ -163,8 +172,8 @@ export const useSettingsStore = create<SettingsState>()(
                 autoAnalyze: true,
                 autoDiarize: true,
                 recordingMode: 'local',
-                defaultProMode: 'cloud',
                 modeExplicitlySet: false,
+                cloudChoicePending: false,
                 autoTranscribeCloud: false,
                 autoAnalyzeCloud: false
             })
@@ -172,29 +181,45 @@ export const useSettingsStore = create<SettingsState>()(
         {
             name: 'swedish-whisper-settings',
             storage: createJSONStorage(() => localStorage),
-            version: 9,
-            migrate: (state: any) => ({
-                ...state,
-                backendUrl: import.meta.env.PROD ? PROD_API_URL : 'http://localhost:8000',
-                // Lägg till nytt fält — rör inte recordingMode (Pro-användare återställs
-                // till defaultProMode av App.tsx:useEffect när de är inloggade)
-                modeExplicitlySet: false,
-                // "keep" (Spara alltid) borttagen — hedrades ej av infra + krockade med
-                // GDPR-löftet. Migrera befintliga 'keep'-värden till '24h'.
-                retentionPolicy: state.retentionPolicy === 'keep' ? '24h' : (state.retentionPolicy ?? '24h'),
-                // Opt-in molnsynk — default av (privacy-first).
-                cloudSync: state.cloudSync ?? false,
-                // v6: PRO live-molnströmning — strukturerad (Du/Mötet) default; pausbryt 1.5s.
-                cloudDiarizationMode: state.cloudDiarizationMode ?? 'structured',
-                pauseBreakMs: state.pauseBreakMs ?? 1500,
-                // v7: lokal gallringspolicy — default behåll allt (offline-first, ljudet är enda kopian)
-                localAudioRetention: state.localAudioRetention ?? 'keep_all',
-                // v8: §13.4 mic-kanal-hint — default true (en talare vid mikrofonen)
-                micIsSingleSpeaker: state.micIsSingleSpeaker ?? true,
-                // v9: automatik efter möte — analys + talarseparering (opt-out, default på)
-                autoAnalyze: state.autoAnalyze ?? true,
-                autoDiarize: state.autoDiarize ?? true,
-            }),
+            version: 10,
+            migrate: (state: any, version: number) => migrateSettings(state, version),
         }
     )
 );
+
+/**
+ * Uppgradering av sparade inställningar. Exporterad för testerna.
+ *
+ * v10: lokal modell är standard för alla. Före v10 flyttade appen en Pro-användare till
+ * molnmodellen vid varje start om hen inte själv valt läge, och den flytten markerade
+ * samtidigt valet som gjort. Ett molnläge i sparade inställningar kan därför vara både ett
+ * eget val och appens gamla standard, och det går inte att skilja dem åt i efterhand. Ingen
+ * flyttas i tysthet: läget står kvar, och `cloudChoicePending` gör att appen frågar en gång
+ * vid nästa start (bara Pro ser frågan, se CloudChoiceDialog).
+ */
+export function migrateSettings(state: any, version: number) {
+    const wasCloud = state?.recordingMode === 'cloud' || state?.recordingMode === 'cloud_analysis';
+    return {
+        ...state,
+        backendUrl: import.meta.env.PROD ? PROD_API_URL : 'http://localhost:8000',
+        // Behåll ett gjort val. Fram till v9 nollställdes fältet vid varje uppgradering.
+        modeExplicitlySet: state?.modeExplicitlySet ?? false,
+        // "keep" (Spara alltid) borttagen — hedrades ej av infra + krockade med
+        // GDPR-löftet. Migrera befintliga 'keep'-värden till '24h'.
+        retentionPolicy: state.retentionPolicy === 'keep' ? '24h' : (state.retentionPolicy ?? '24h'),
+        // Opt-in molnsynk — default av (privacy-first).
+        cloudSync: state.cloudSync ?? false,
+        // v6: PRO live-molnströmning — strukturerad (Du/Mötet) default; pausbryt 1.5s.
+        cloudDiarizationMode: state.cloudDiarizationMode ?? 'structured',
+        pauseBreakMs: state.pauseBreakMs ?? 1500,
+        // v7: lokal gallringspolicy — default behåll allt (offline-first, ljudet är enda kopian)
+        localAudioRetention: state.localAudioRetention ?? 'keep_all',
+        // v8: §13.4 mic-kanal-hint — default true (en talare vid mikrofonen)
+        micIsSingleSpeaker: state.micIsSingleSpeaker ?? true,
+        // v9: automatik efter möte — analys + talarseparering (opt-out, default på)
+        autoAnalyze: state.autoAnalyze ?? true,
+        autoDiarize: state.autoDiarize ?? true,
+        // v10: frågan om molnmodellen, en gång, för den som hade den som standard.
+        cloudChoicePending: version < 10 ? wasCloud : (state.cloudChoicePending ?? false),
+    };
+}

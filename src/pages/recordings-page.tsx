@@ -6,12 +6,15 @@ import { openRecordingsFolder } from "@/lib/storage";
 import { useSyncStore } from "@/store/sync-store";
 import { useAuthStore } from "@/store/auth-store";
 import { uploadJob, errorSlug } from "@/lib/api";
-import { showError, usePostHogEvents } from "@/hooks/use-posthog-events";
+import { captureEvent, showError, usePostHogEvents } from "@/hooks/use-posthog-events";
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useSettingsStore } from "@/store/settings-store";
 import { UpsellModal } from "@/components/dashboard/upsell-modal";
 import { ExportDialog } from "@/components/dashboard/export-dialog";
-import { canExport, hasAnalysisSource, hasTranscriptSource, isExportable } from "@/lib/export/select";
+import { hasAnalysisSource, hasTranscriptSource, isExportable } from "@/lib/export/select";
+import { exportClick } from "@/lib/export/quota";
+import { entitlementFor, quotaForUpsell } from "@/store/entitlements-store";
+import type { QuotaLineInput, UpsellSource } from "@/lib/upsell-state";
 import { collectMeetings } from "@/lib/export/tauri-io";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -61,13 +64,13 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
     const isPro = useAuthStore((s) => s.isPro());
     const [syncingId, setSyncingId] = useState<number | null>(null);
 
-    // Export (Pro): urval per rad, "välj alla", "Exportera valda".
+    // Export (Pro obegränsat, gratiskonto med månadskvot): urval per rad, "välj alla", "Exportera valda".
     const events = usePostHogEvents();
-    const exportAllowed = useAuthStore((s) => canExport(s.stripeStatus));
     const pauseBreakMs = useSettingsStore((s) => s.pauseBreakMs);
     const [selected, setSelected] = useState<Set<number>>(new Set());
     const [showExport, setShowExport] = useState(false);
     const [showUpsell, setShowUpsell] = useState(false);
+    const [upsell, setUpsell] = useState<{ source: UpsellSource; quota: QuotaLineInput | null }>({ source: 'export', quota: null });
     const exportableIds = useMemo(() => recordings.filter(isExportable).map(r => r.id), [recordings]);
     const selectedRecs = useMemo(() => recordings.filter(r => selected.has(r.id)), [recordings, selected]);
     const allSelected = exportableIds.length > 0 && exportableIds.every(id => selected.has(id));
@@ -78,8 +81,10 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
     });
     const handleExportSelected = () => {
         if (selected.size === 0) return;
-        if (!exportAllowed) {
+        const gate = exportClick(entitlementFor('export'), quotaForUpsell('export'), captureEvent);
+        if (gate) {
             events.upsellShown('export');
+            setUpsell(gate);
             setShowUpsell(true);
             return;
         }
@@ -400,7 +405,7 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
                 </div>
             </div>
 
-            <UpsellModal isOpen={showUpsell} onClose={() => setShowUpsell(false)} source="export" />
+            <UpsellModal isOpen={showUpsell} onClose={() => setShowUpsell(false)} source={upsell.source} quota={upsell.quota} />
             <ExportDialog
                 isOpen={showExport}
                 onClose={() => setShowExport(false)}

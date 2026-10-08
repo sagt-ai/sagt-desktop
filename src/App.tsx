@@ -18,12 +18,13 @@ import { useCloudStream } from "@/hooks/use-cloud-stream";
 import { useLiveSpeakerNaming } from "@/hooks/use-live-speaker-naming";
 import { useLiveDiarize } from "@/hooks/use-live-diarize";
 import { runStorageCleanup, getStorageUsage, formatBytes, GB, type CleanupResult } from "@/lib/storage";
-import { useAuthStore } from "@/store/auth-store";
 import { MotdBanner } from "@/components/lifecycle/motd-banner";
 import { TrialBanner } from "@/components/lifecycle/trial-banner";
 import { AudioWarningBanner } from "@/components/lifecycle/audio-warning-banner";
 import { FeedbackCard } from "@/components/feedback/feedback-card";
 import { markErrorSeen, onAppStarted } from "@/lib/feedback-runtime";
+import { startEntitlementsSync } from "@/store/entitlements-store";
+import { CloudChoiceDialog } from "@/components/dashboard/cloud-choice-dialog";
 
 function App() {
   useConnectivity();
@@ -34,23 +35,16 @@ function App() {
   useSessionRefresh();
 
   const [currentView, setCurrentView] = useState<'dashboard' | 'settings' | 'recordings'>('dashboard');
-  const isSignedIn = useAuthStore((s) => s.isSignedIn);
 
-  // Återställ molnläge för Pro-användare vars inställning nollställdes av v0.9.18-migrering.
-  // Kör varje gång isSignedIn ändras (auth laddas asynkront efter mount).
   // Inbjudan till frågorna även för den som redan spelat in tre möten.
   useEffect(() => { onAppStarted(); }, []);
 
-  useEffect(() => {
-    const { isPro } = useAuthStore.getState();
-    const { recordingMode, modeExplicitlySet, defaultProMode, setRecordingMode } = useSettingsStore.getState();
-    if (isPro() && !modeExplicitlySet && recordingMode === 'local') {
-      setRecordingMode(defaultProMode);
-      if (navigator.onLine) {
-        useSyncStore.getState().setEffectiveMode(defaultProMode);
-      }
-    }
-  }, [isSignedIn]);
+  // Gratiskvoternas räknare följer sessionen: hämtas vid inloggning och vid varje
+  // förnyelse, töms vid utloggning.
+  useEffect(() => startEntitlementsSync(), []);
+
+  // Lokal modell är standard för alla, även Pro. Molnmodellen är ett val (lägesväljaren,
+  // Inställningar, eller engångsfrågan i CloudChoiceDialog efter uppdateringen).
 
   // Bootstrap av ljudmotorn. Både mikrofonvalet OCH VAD-inställningarna måste pushas
   // hit — Rust har egna defaults (tröskel 0.008, tystnad 800 ms) som annars gäller tills
@@ -157,21 +151,27 @@ function App() {
       <TitleBar />
       <div className="flex-1 min-h-0 w-full relative">
         <AppGuard>
-          <div className="flex h-full w-full overflow-hidden">
-            <Sidebar currentView={currentView} onViewChange={setCurrentView} />
-            <main className="flex-1 flex flex-col h-full overflow-hidden relative">
-              <MotdBanner />
-              <TrialBanner />
-              <AudioWarningBanner />
-              <div className="flex-1 overflow-hidden relative">
-                {currentView === 'dashboard' ? <SplitView /> :
-                  currentView === 'settings' ? <SettingsPage /> :
-                    <RecordingsPage onViewChange={setCurrentView} />}
-                <FeedbackCard />
-              </div>
-              <ControlBar onViewChange={setCurrentView} />
-            </main>
+          {/* Bannerna ligger över hela bredden, ovanför menyn och panelerna. Låg de bara
+              över huvudytan tryckte de ned panelernas rubrikrad men inte menyns, och
+              linjen under rubrikerna blev inte hel. */}
+          <div className="flex flex-col h-full w-full overflow-hidden">
+            <MotdBanner />
+            <TrialBanner />
+            <AudioWarningBanner />
+            <div className="flex flex-1 min-h-0 w-full overflow-hidden">
+              <Sidebar currentView={currentView} onViewChange={setCurrentView} />
+              <main className="flex-1 flex flex-col h-full overflow-hidden relative">
+                <div className="flex-1 overflow-hidden relative">
+                  {currentView === 'dashboard' ? <SplitView /> :
+                    currentView === 'settings' ? <SettingsPage /> :
+                      <RecordingsPage onViewChange={setCurrentView} />}
+                  <FeedbackCard />
+                </div>
+                <ControlBar onViewChange={setCurrentView} />
+              </main>
+            </div>
           </div>
+          <CloudChoiceDialog />
         </AppGuard>
       </div>
       <Toaster richColors position="bottom-right" />

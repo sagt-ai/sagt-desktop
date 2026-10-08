@@ -3,6 +3,8 @@ import posthog from 'posthog-js'
 import { useAuthStore } from '@/store/auth-store'
 import { captureEvent } from '@/hooks/use-posthog-events'
 import { CURRENT_VERSION } from '@/lib/version'
+import { recordingMarker } from '@/lib/recording-marker'
+import { consumeSignInIntent } from '@/lib/sign-in-intent'
 
 const KEY = import.meta.env.VITE_POSTHOG_KEY as string | undefined
 const HOST = (import.meta.env.VITE_POSTHOG_HOST as string | undefined) ?? 'https://eu.i.posthog.com'
@@ -31,6 +33,8 @@ if (KEY) {
         loaded: (ph) => {
             ph.register({ platform: 'desktop', app_version: CURRENT_VERSION })
             ph.capture('app_opened')
+            // En inspelning från förra körningen som aldrig sparades eller avbröts.
+            recordingMarker.reportLeftover()
         },
     })
 }
@@ -52,7 +56,11 @@ export function PostHogProvider({ children }: { children: React.ReactNode }) {
         return useAuthStore.subscribe((state, prev) => {
             if (state.isSignedIn && !prev.isSignedIn && state.userId) {
                 posthog.identify(state.userId, { plan: state.isPro() ? 'pro' : 'free' })
-                captureEvent('sign_in_completed')
+                // intent: 'free' (gratiskonto) eller 'upgrade' (köpet fortsätter), och
+                // fönstrets källa, så att tratten går att följa per rätt. Saknas avsikten
+                // startades inloggningen inte från uppgraderingsfönstret.
+                const started = consumeSignInIntent()
+                captureEvent('sign_in_completed', started ? { intent: started.intent, source: started.source } : {})
             } else if (!state.isSignedIn && prev.isSignedIn) {
                 captureEvent('sign_out')
                 posthog.reset()

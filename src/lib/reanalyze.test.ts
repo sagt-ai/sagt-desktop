@@ -7,6 +7,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => undefined) })
 
 import { invoke } from "@tauri-apps/api/core";
 import { bestSavedText, forgetCloudJob, reanalyzeRecording } from "./reanalyze";
+import { AnalyzeHttpError, IdempotencyKeys } from "./entitlements";
 import { useSettingsStore } from "@/store/settings-store";
 
 const ANALYSIS = { summary: "Lokal analys", key_decisions: ["B"], action_items: [], template_used: "general" };
@@ -82,6 +83,46 @@ describe("reanalyzeRecording", () => {
 
         expect(out.cloudJobGone).toBe(false);
         expect(paths()).toEqual(["/api/v1/analyze"]);
+    });
+});
+
+describe("protokoll med idempotensnyckel (gratiskonto)", () => {
+    const sentKeys = () => fetchMock.mock.calls.map((call) =>
+        new Headers(((call as unknown[])[1] as RequestInit | undefined)?.headers).get("X-Idempotency-Key"));
+
+    it("skickar X-Idempotency-Key på /analyze när nycklarna finns", async () => {
+        let n = 0;
+        await run({ cloudSync: false, keys: new IdempotencyKeys(() => `nyckel-${++n}-abcdef`) });
+        expect(sentKeys()).toEqual(["nyckel-1-abcdef"]);
+    });
+
+    it("skickar ingen nyckel utan nycklar (Pro, auto-analysen)", async () => {
+        await run({ cloudSync: false });
+        expect(sentKeys()).toEqual([null]);
+    });
+
+    it("402 med kvotfält når anroparen som AnalyzeHttpError med kvoten", async () => {
+        routes["/analyze"] = { status: 402, body: {
+            detail: "Du har använt 3 av 3 AI-protokoll den här månaden.",
+            code: "quota_exhausted", kind: "protocol", limit: 3, used: 3, resets_at: "2026-11-01",
+        } };
+        const err = await run({ cloudSync: false, keys: new IdempotencyKeys() }).catch(e => e);
+        expect(err).toBeInstanceOf(AnalyzeHttpError);
+        expect(err.quota).toMatchObject({ kind: "protocol", used: 3, limit: 3 });
+        // Felvägarna som läser texten (uppgraderingsfönstret vid 402) fungerar som förut.
+        expect(err.message).toMatch(/Payment Required/);
+    });
+
+    it("serverfel → samma nyckel vid användarens nästa försök med samma text", async () => {
+        let n = 0;
+        const keys = new IdempotencyKeys(() => `nyckel-${++n}-abcdef`);
+        routes["/analyze"] = { status: 503, body: { detail: "AI-analysen är tillfälligt otillgänglig. (llm_upstream)" } };
+        await expect(run({ cloudSync: false, keys })).rejects.toThrow();
+        routes["/analyze"] = { status: 200, body: ANALYSIS };
+        await run({ cloudSync: false, keys });
+        await run({ cloudSync: false, keys });
+        // Två första är samma begäran; den tredje är en ny avsiktlig begäran.
+        expect(sentKeys()).toEqual(["nyckel-1-abcdef", "nyckel-1-abcdef", "nyckel-2-abcdef"]);
     });
 });
 

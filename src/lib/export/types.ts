@@ -1,6 +1,6 @@
 import type { TranscriptLine } from "@/lib/transcript-turns";
 
-export type ExportFormat = "txt" | "md" | "docx";
+export type ExportFormat = "txt" | "md" | "docx" | "pdf";
 export type ExportContent = "transcript" | "analysis" | "both";
 /** single = ett möte; zip = en fil per möte i ett arkiv; combined = alla möten i en fil. */
 export type ExportBundle = "single" | "zip" | "combined";
@@ -28,7 +28,7 @@ export interface ExportOptions {
     bundle: ExportBundle;
 }
 
-/** Formatoberoende innehåll; renderarna översätter blocken till txt, md eller docx. */
+/** Formatoberoende innehåll; renderarna översätter blocken till txt, md, docx eller pdf. */
 export type ExportBlock =
     | { kind: "title"; text: string }
     | { kind: "heading"; level: 1 | 2; text: string }

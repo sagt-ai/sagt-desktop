@@ -59,8 +59,3 @@ export function hasAnalysisSource(rec: ExportableRecording): boolean {
 export function isExportable(rec: ExportableRecording): boolean {
     return hasTranscriptSource(rec) || hasAnalysisSource(rec);
 }
-
-/** Export ingår i Pro. Allt annat än en aktiv prenumeration ger nej. */
-export function canExport(stripeStatus: string | null | undefined): boolean {
-    return stripeStatus === "active";
-}

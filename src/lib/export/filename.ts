@@ -89,6 +89,7 @@ export function dedupeNames(names: string[]): string[] {
 
 export const FILE_FILTERS: Record<ExportFormat | "zip", { name: string; extensions: string[] }> = {
     docx: { name: "Word-dokument", extensions: ["docx"] },
+    pdf: { name: "PDF-dokument", extensions: ["pdf"] },
     md: { name: "Markdown", extensions: ["md"] },
     txt: { name: "Textfil", extensions: ["txt"] },
     zip: { name: "Zip-arkiv", extensions: ["zip"] },

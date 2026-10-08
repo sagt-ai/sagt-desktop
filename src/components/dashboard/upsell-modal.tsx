@@ -4,26 +4,44 @@ import { usePaymentRefresh } from "@/hooks/use-payment-refresh";
 import { useBrowserAuth } from "@/hooks/use-browser-auth";
 import { useCheckout } from "@/hooks/use-checkout";
 import { usePostHogEvents } from "@/hooks/use-posthog-events";
-import { selectUpsellView, shouldAutoClose, shouldCelebrate, type UpsellSource } from "@/lib/upsell-state";
+import { freeChoice, PRO_FOOTNOTE, PRO_ROWS, quotaLine, upsellHeading, selectUpsellView, shouldAutoClose, shouldCelebrate, shouldCloseAfterSignIn, type QuotaLineInput, type UpsellSource } from "@/lib/upsell-state";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { onUpsellDismissed } from "@/lib/feedback-runtime";
+
+// Båda valen i fönstret har samma stil: gratiskontot och Pro ska vara lika tydliga.
+const PRIMARY_BUTTON = "w-full py-2.5 px-4 rounded-lg bg-brand border border-brand text-sm font-semibold text-paper hover:bg-brand-deep hover:border-brand-deep shadow-sm transition-colors disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2";
 
 interface UpsellModalProps {
     isOpen: boolean;
     onClose: () => void;
     /** Varifrån modalen öppnades — följer med på tratt-eventen nedan. */
     source: UpsellSource;
+    /** Gratiskontots räknare för kvotraden ("3 av 3 AI-protokoll"), när källan är en kvot. */
+    quota?: QuotaLineInput | null;
 }
 
-export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
+export function UpsellModal({ isOpen, onClose, source, quota = null }: UpsellModalProps) {
     const events = usePostHogEvents();
     const userId = useAuthStore((s) => s.userId);
+    // Gällande session. userId kan stå kvar efter att sessionen gått ut; vägen till ett
+    // gratiskonto (inloggning) ska då ändå visas.
+    const isSignedIn = useAuthStore((s) => s.isSignedIn);
     const isPro = useAuthStore((s) => s.isPro());
     const { isWaiting, startPolling, stopPolling, manualRefresh } = usePaymentRefresh();
-    const { startAuth, isAuthenticating } = useBrowserAuth();
+    // Inloggningen är gemensam för appen. Fönstret har en egen ägarnyckel och visar och
+    // släpper bara sitt eget intresse, aldrig panelens "Logga in" eller ett annat fönsters.
+    // En gemensam nyckel för alla instanser av fönstret (bara ett syns åt gången), så att ett
+    // fönster som visas igen efter ett vybyte känner igen och kan släppa sin inloggning.
+    const authOwner = "upsell";
+    const { startAuth, stopAuth, setIntent, isWaiting: isMyAuthPending } = useBrowserAuth(authOwner);
     const { openCheckout: openCheckoutInBrowser, isOpening } = useCheckout();
     const [pendingUpgrade, setPendingUpgrade] = useState(false);
+    // Senaste värdet för städningen när fönstret försvinner (effekten ser annars det första).
+    const pendingUpgradeRef = useRef(false);
+    pendingUpgradeRef.current = pendingUpgrade;
+    const sourceRef = useRef(source);
+    sourceRef.current = source;
     const [isChecking, setIsChecking] = useState(false);
 
     // Överlever pollingens 5-minuterstimeout, till skillnad från isWaiting.
@@ -61,9 +79,41 @@ export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
         const view = selectUpsellView({ isPro, paymentAttempted, isWaiting });
         events.upsellModalDismissed(source, view);
         onUpsellDismissed(view);
+        close();
+    };
+
+    // Stäng och glöm ett påbörjat köp: ett "Uppgradera nu" som övergetts ska inte fortsätta
+    // till betalningen vid en senare inloggning (till exempel från "Logga in" i panelen).
+    const close = () => {
         setPaymentAttempted(false);
+        forgetUpgrade(true);
         stopPolling();
         onClose();
+    };
+
+    // Ett påbörjat "Uppgradera nu" glöms: köpet kan inte fortsätta från ett stängt fönster.
+    // Stänger användaren själv efter ett övergivet köp släpper fönstret sitt intresse i
+    // inloggningen. Stängs eller försvinner fönstret utifrån får inloggningen fortsätta,
+    // eftersom användaren kan vara mitt i den, men räknas som en gratisinloggning. En
+    // gratisinloggning från fönstret avbryts inte av att fönstret stängs: användaren kan
+    // vara mitt i den i webbläsaren.
+    const forgetUpgrade = (release: boolean) => {
+        if (pendingUpgradeRef.current || upgradeChosenRef.current) {
+            if (release) stopAuth();
+            else setIntent({ intent: 'free', source: sourceRef.current });
+        }
+        resetUpgrade();
+    };
+    // Det enda stället som nollställer ett påbörjat köp.
+    const resetUpgrade = () => {
+        setPendingUpgrade(false);
+        upgradeChosenRef.current = false;
+    };
+
+    // Gratisvalet: ett val, inte en avfärdning, så ingen fråga om varför köpet uteblev.
+    const chooseFree = () => {
+        events.upsellFreeChosen(source);
+        close();
     };
 
     const handleManualCheck = async () => {
@@ -117,17 +167,55 @@ export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
 
     // Inloggning klar efter upgrade-intent → fortsätt automatiskt till Stripe
     useEffect(() => {
-        if (pendingUpgrade && userId) {
+        if (pendingUpgrade && isSignedIn) {
             setPendingUpgrade(false);
             if (!isPro) openCheckout();
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [pendingUpgrade, userId, isPro]);
+    }, [pendingUpgrade, isSignedIn, userId, isPro]);
 
-    // Städa polling när modalen stängs
+    // Städa polling när modalen stängs. Stängs den utifrån (automatiskt efter inloggning
+    // eller av föräldern) glöms också ett påbörjat köp, så att en senare inloggning inte
+    // öppnar betalningen från ett stängt fönster. Inloggningen själv får fortsätta.
     useEffect(() => {
-        if (!isOpen) stopPolling();
+        if (!isOpen) {
+            stopPolling();
+            forgetUpgrade(false);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isOpen, stopPolling]);
+
+    // Fönstret försvinner (vybyte): samma som en stängning utifrån.
+    useEffect(() => () => forgetUpgrade(false),
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        []);
+
+    // Inloggad vid öppningen? Läses en gång per öppning, så att en inloggning i fönstret
+    // går att känna igen.
+    const signedInAtOpenRef = useRef(false);
+    // "Uppgradera nu" vald i den här öppningen. En ref och inte pendingUpgrade: den
+    // nollställs i samma ögonblick som inloggningen landar, innan betalningen hunnit öppnas,
+    // och då hade stängningen nedan slagit till mitt i köpet.
+    const upgradeChosenRef = useRef(false);
+    useEffect(() => {
+        if (isOpen) {
+            signedInAtOpenRef.current = isSignedIn;
+            upgradeChosenRef.current = false;
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isOpen]);
+
+    // Inloggning utan köp från ett fönster om gratiskontot (kvotrad eller "konto först"):
+    // inget mer att visa, stäng. Den som valde "Uppgradera" har pendingUpgrade och går
+    // vidare till betalningen i effekten ovan.
+    useEffect(() => {
+        if (!shouldCloseAfterSignIn({
+            source, isOpen, signedInAtOpen: signedInAtOpenRef.current,
+            isSignedIn, pendingUpgrade: pendingUpgrade || upgradeChosenRef.current,
+        })) return;
+        toast.success("Du är inloggad.");
+        onCloseRef.current();
+    }, [source, isOpen, isSignedIn, pendingUpgrade]);
 
     // Tratten börjar här: en gång per öppning, med källan den öppnades från. Beror medvetet
     // bara på isOpen — source och userId läses vid öppningen, en senare inloggning i samma
@@ -141,30 +229,41 @@ export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
     if (!isOpen) return null;
 
     const handleUpgrade = async () => {
-        events.upgradeClicked(source, !!userId);
+        // Ett nytt klick medan fönstrets inloggning väntar öppnar bara fliken igen; det är
+        // inte ett nytt beslut att köpa och räknas inte en gång till.
+        if (!(pendingUpgrade && isMyAuthPending)) events.upgradeClicked(source, !!userId);
         // Ej inloggad → logga in först (konto krävs för Stripe-kundreferens),
         // fortsätt sedan automatiskt till checkout via pendingUpgrade-effekten.
-        if (!userId) {
+        upgradeChosenRef.current = true;
+        // Sessionen, inte userId: userId står kvar efter en utgången session.
+        if (!isSignedIn) {
             setPendingUpgrade(true);
-            startAuth();
+            startAuth({ intent: 'upgrade', source });
             return;
         }
         openCheckout();
     };
 
-    // "Har du redan Pro? Logga in" — ren inloggning utan köp-intent
+    // "Skapa gratiskonto / logga in" — inloggning utan köp. Samma inloggning i webbläsaren
+    // skapar kontot om det inte finns, och loggar in ett befintligt (även Pro).
     const handleLoginOnly = () => {
-        if (!userId) startAuth();
+        if (isSignedIn) return;
+        // Ett tidigare, övergivet "Uppgradera nu" ska inte göra den här inloggningen till ett köp.
+        resetUpgrade();
+        // Fönstrets eget gratisval avstår från köpet: fönstrets avsikt blir free.
+        startAuth({ intent: 'free', source });
     };
 
     // Rubrik och kropp läser SAMMA vy — det är enda sättet att göra det strukturellt
     // omöjligt för dem att säga emot varandra. Tidigare hade rubriken ett eget villkor.
     const view = selectUpsellView({ isPro, paymentAttempted, isWaiting });
     const activated = view === 'activated';
+    const line = quotaLine({ source, isPro, quota });
+    const free = freeChoice({ source, isPro, isSignedIn, quota });
 
     return (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-ink/30 backdrop-blur-sm animate-in fade-in duration-200">
-            <div className="bg-white rounded-2xl w-[480px] max-w-[90vw] shadow-2xl border border-line overflow-hidden relative animate-in zoom-in-95 slide-in-from-bottom-4 duration-300">
+            <div className="bg-white rounded-2xl w-[480px] max-w-[90vw] max-h-[95vh] overflow-y-auto shadow-2xl border border-line relative animate-in zoom-in-95 slide-in-from-bottom-4 duration-300">
                 {/* Header — solid brand, no gradient */}
                 <div className="h-32 bg-brand relative flex items-center justify-center p-6">
                     <button
@@ -182,7 +281,7 @@ export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
                             }
                         </div>
                         <h2 className="text-xl font-display font-bold tracking-tight">
-                            {activated ? "Pro aktiverat!" : "Uppgradera till Sagt Pro"}
+                            {activated ? "Pro aktiverat!" : upsellHeading({ source, isSignedIn })}
                         </h2>
                     </div>
                 </div>
@@ -260,13 +359,38 @@ export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
                             </button>
                         </div>
                     ) : (
-                        /* Default / success state */
+                        /* Säljsidan. För gratiskontots källor två tydligt åtskilda val: gratisvalet
+                           och Pro, med samma knappstil och "eller" emellan, så att gratiskontot inte
+                           kan förväxlas med ett köp. */
                         <>
-                            <p className="text-sm text-ink-soft text-center mb-6">
-                                Marknadens bästa svenska precision + färdiga mötesprotokoll.
+                            {line && (
+                                <p className="text-sm font-medium text-ink bg-amber-50 border border-amber-200/70 rounded-lg px-4 py-3 mb-4 text-center" role="status">
+                                    {line}
+                                </p>
+                            )}
+                            {free && (
+                                <>
+                                    <button
+                                        onClick={free.action === 'sign_in' ? handleLoginOnly : chooseFree}
+                                        className={PRIMARY_BUTTON}
+                                    >
+                                        {free.action === 'sign_in' && isMyAuthPending && !pendingUpgrade
+                                            ? <><Loader2 className="w-4 h-4 animate-spin" /> Väntar på inloggningen. Öppna igen</>
+                                            : free.label}
+                                    </button>
+                                    <p className="text-xs text-ink-muted text-center mt-2">{free.caption}</p>
+                                    <div className="flex items-center gap-3 my-5" role="separator" aria-label="eller">
+                                        <div className="h-px flex-1 bg-line" />
+                                        <span className="text-xs font-medium uppercase tracking-widest text-ink-muted">eller</span>
+                                        <div className="h-px flex-1 bg-line" />
+                                    </div>
+                                </>
+                            )}
+                            <p className="text-sm text-ink-soft text-center mb-4">
+                                Sagt Pro: vår största svenska modell och obegränsade mötesprotokoll.
                             </p>
 
-                            <div className="bg-paper-dim border border-line rounded-xl p-5 mb-6">
+                            <div className="bg-paper-dim border border-line rounded-xl p-5 mb-5">
                                 <div className="flex items-center justify-between font-semibold text-ink mb-4 pb-4 border-b border-line">
                                     <span>Sagt.ai Pro</span>
                                     {/* Samma formulering som prissidan på sagt.ai. Här stod "ex. moms" fram till
@@ -274,75 +398,51 @@ export function UpsellModal({ isOpen, onClose, source }: UpsellModalProps) {
                                     <span className="text-brand">199 kr<span className="text-xs text-ink-muted font-normal"> / mån inkl. moms</span></span>
                                 </div>
                                 <ul className="space-y-3">
-                                    {/* Ledargument — större modell = högre kvalitet (ryms inte lokalt → moln) */}
-                                    <li className="flex items-start gap-3 text-sm text-ink-soft">
-                                        <div className="mt-0.5 w-4 h-4 rounded-full bg-verified/10 text-verified flex items-center justify-center flex-shrink-0">
-                                            <Sparkles className="w-2.5 h-2.5" />
-                                        </div>
-                                        KB-Whisper Large — högre precision än vad som ryms lokalt
-                                    </li>
-                                    <li className="flex items-start gap-3 text-sm text-ink-soft">
-                                        <div className="mt-0.5 w-4 h-4 rounded-full bg-verified/10 text-verified flex items-center justify-center flex-shrink-0">
-                                            <Check className="w-2.5 h-2.5" />
-                                        </div>
-                                        AI-mötesprotokoll — sammanfattning, beslut & åtgärder
-                                    </li>
-                                    <li className="flex items-start gap-3 text-sm text-ink-soft">
-                                        <div className="mt-0.5 w-4 h-4 rounded-full bg-verified/10 text-verified flex items-center justify-center flex-shrink-0">
-                                            <Check className="w-2.5 h-2.5" />
-                                        </div>
-                                        Synk mellan enheter
-                                    </li>
-                                    <li className="flex items-start gap-3 text-sm text-ink-soft">
-                                        <div className="mt-0.5 w-4 h-4 rounded-full bg-verified/10 text-verified flex items-center justify-center flex-shrink-0">
-                                            <Check className="w-2.5 h-2.5" />
-                                        </div>
-                                        Export till Word, Markdown och text
-                                    </li>
-                                    <li className="flex items-start gap-3 text-sm text-ink-soft">
-                                        <div className="mt-0.5 w-4 h-4 rounded-full bg-verified/10 text-verified flex items-center justify-center flex-shrink-0">
-                                            <Check className="w-2.5 h-2.5" />
-                                        </div>
-                                        Avbryt när du vill
-                                    </li>
+                                    {PRO_ROWS.map((row, i) => (
+                                        <li key={row} className="flex items-start gap-3 text-sm text-ink-soft">
+                                            <div className="mt-0.5 w-4 h-4 rounded-full bg-verified/10 text-verified flex items-center justify-center flex-shrink-0">
+                                                {i === 0 ? <Sparkles className="w-2.5 h-2.5" /> : <Check className="w-2.5 h-2.5" />}
+                                            </div>
+                                            {row}
+                                        </li>
+                                    ))}
                                 </ul>
                                 <p className="text-[11px] text-ink-muted text-center mt-4 flex items-center justify-center gap-1.5">
                                     <Shield className="w-3 h-3 flex-shrink-0" />
-                                    Körs på EU-servrar i Sverige. Ljud raderas automatiskt inom 24 h.
+                                    {PRO_FOOTNOTE}
                                 </p>
                             </div>
 
-                            <div className="flex gap-3">
-                                <button
-                                    onClick={dismiss}
-                                    className="flex-1 py-2.5 px-4 rounded-lg bg-white border border-line text-sm font-medium text-ink-soft hover:bg-paper-dim transition-colors"
-                                >
-                                    Avbryt
-                                </button>
-                                <button
-                                    onClick={handleUpgrade}
-                                    disabled={isAuthenticating || isOpening}
-                                    className="flex-[2] py-2.5 px-4 rounded-lg bg-brand border border-brand text-sm font-semibold text-paper hover:bg-brand-deep hover:border-brand-deep shadow-sm transition-colors disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                                >
-                                    {isAuthenticating ? (
-                                        <><Loader2 className="w-4 h-4 animate-spin" /> Loggar in...</>
-                                    ) : isOpening ? (
-                                        <><Loader2 className="w-4 h-4 animate-spin" /> Öppnar betalningen...</>
-                                    ) : (
-                                        "Uppgradera nu"
-                                    )}
-                                </button>
-                            </div>
+                            <button
+                                onClick={handleUpgrade}
+                                disabled={isOpening}
+                                className={PRIMARY_BUTTON}
+                            >
+                                {isMyAuthPending && pendingUpgrade ? (
+                                    <><Loader2 className="w-4 h-4 animate-spin" /> Loggar in. Öppna igen</>
+                                ) : isOpening ? (
+                                    <><Loader2 className="w-4 h-4 animate-spin" /> Öppnar betalningen...</>
+                                ) : (
+                                    "Uppgradera nu"
+                                )}
+                            </button>
 
-                            {!userId && (
+                            {!isSignedIn && !free && (
                                 <button
                                     onClick={handleLoginOnly}
-                                    disabled={isAuthenticating}
                                     className="mt-3 w-full text-center text-xs text-ink-muted hover:text-ink-soft transition-colors disabled:opacity-50"
                                 >
-                                    Har du redan Pro? Logga in
+                                    {isMyAuthPending && !pendingUpgrade
+                                        ? "Väntar på inloggningen. Öppna igen"
+                                        : "Skapa gratiskonto / logga in"}
                                 </button>
                             )}
+                            <button
+                                onClick={dismiss}
+                                className="mt-3 w-full text-center text-xs text-ink-muted hover:text-ink-soft transition-colors"
+                            >
+                                Avbryt
+                            </button>
                         </>
                     )}
                 </div>

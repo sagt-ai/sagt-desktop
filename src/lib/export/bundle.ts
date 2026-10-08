@@ -6,8 +6,9 @@ import { bundleStem, dedupeNames, meetingStem } from "./filename";
 const encoder = new TextEncoder();
 
 async function render(blocks: ExportBlock[], format: ExportFormat): Promise<Uint8Array> {
-    // Word- och zip-biblioteken laddas först när någon exporterar, inte när appen startar.
+    // Word-, PDF- och zip-biblioteken laddas först när någon exporterar, inte när appen startar.
     if (format === "docx") return (await import("./render-docx")).renderDocx(blocks);
+    if (format === "pdf") return (await import("./render-pdf")).renderPdf(blocks);
     return encoder.encode(format === "md" ? renderMd(blocks) : renderTxt(blocks));
 }
 

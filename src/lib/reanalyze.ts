@@ -1,5 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { CloudJobNotFoundError, reanalyzeJob, reanalyzeTranscript } from "@/lib/api";
+import { IdempotencyKeys, requestProtocol } from "@/lib/entitlements";
+
+/**
+ * Idempotensnycklarna för protokoll på den lokala texten. En instans för appen, så att ett
+ * omförsök av samma text återanvänder nyckeln även om vyn byggts om under tiden.
+ */
+export const protocolKeys = new IdempotencyKeys();
 
 /**
  * Den bästa texten som finns sparad på datorn för en omanalys: molntranskriptet om det finns,
@@ -36,8 +43,13 @@ export async function reanalyzeRecording(opts: {
     fullText: string;
     templateId: string;
     token: string;
+    /** Nycklarna för den stateless vägen. Utan dem skickas ingen nyckel (bara Pro klarar sig utan). */
+    keys?: IdempotencyKeys;
 }): Promise<ReanalyzeOutcome> {
-    const { cloudJobId, cloudSync, fullText, templateId, token } = opts;
+    const { cloudJobId, cloudSync, fullText, templateId, token, keys } = opts;
+    const stateless = () => keys
+        ? requestProtocol({ text: fullText, templateId, token, keys, call: reanalyzeTranscript })
+        : reanalyzeTranscript(fullText, templateId, token);
     let outcome: ReanalyzeOutcome;
     if (cloudJobId && cloudSync) {
         try {
@@ -45,10 +57,10 @@ export async function reanalyzeRecording(opts: {
             outcome = { raw: job.analysis, cloudJobGone: false };
         } catch (e) {
             if (!(e instanceof CloudJobNotFoundError)) throw e;
-            outcome = { raw: await reanalyzeTranscript(fullText, templateId, token), cloudJobGone: true };
+            outcome = { raw: await stateless(), cloudJobGone: true };
         }
     } else {
-        outcome = { raw: await reanalyzeTranscript(fullText, templateId, token), cloudJobGone: false };
+        outcome = { raw: await stateless(), cloudJobGone: false };
     }
     // Ett svar utan sammanfattning är ingen analys, även om servern svarade 200: det ska
     // behandlas som ett misslyckande så att den sparade analysen står kvar orörd.

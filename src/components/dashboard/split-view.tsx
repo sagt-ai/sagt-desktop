@@ -1,17 +1,19 @@
 // Removed ScrollArea import
 import { Card } from "@/components/ui/card";
-import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Play, Cloud, Check, LogOut, Lock, Users, X, Download } from "lucide-react";
+import { FileText, Sparkles, History, Loader2, Copy, RefreshCw, Cloud, Check, Users, X, Download } from "lucide-react";
 import { useTranscription } from "@/hooks/use-transcription";
 import { cancelCloudStream } from "@/hooks/use-cloud-stream";
 import { useSyncStore } from "@/store/sync-store";
 import { useSettingsStore } from "@/store/settings-store";
 import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { getJob, uploadJob, identifySpeakers, SpeakerTurn, Job, errorSlug } from "@/lib/api";
-import { bestSavedText, forgetCloudJob, reanalyzeRecording } from "@/lib/reanalyze";
+import { bestSavedText, forgetCloudJob, reanalyzeRecording, protocolKeys } from "@/lib/reanalyze";
+import { AnalyzeHttpError } from "@/lib/entitlements";
+import { entitlementFor, quotaForUpsell, useEntitlement, useEntitlementsStore, useQuotaCounter } from "@/store/entitlements-store";
 import { applyInlineCloudResult, analysisFromJob, ANALYSIS_FAILED_MESSAGE, cloudSegmentsJsonFromJob, segmentsHaveDiarizationLabels, invalidateStaleSpeakerMap, stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
 import { speakerKey, mergeSuggestions, parseSpeakerData, serializeSpeakerData } from "@/lib/speaker-naming";
 import {
@@ -31,11 +33,19 @@ import { useConfigStore } from "@/store/config-store";
 import { toast } from "sonner";
 import { ModePill } from "./mode-pill";
 import { UpsellModal } from "./upsell-modal";
+import { AccountButton } from "./account-button";
 import { ExportDialog } from "./export-dialog";
-import { canExport, parseAnalysis } from "@/lib/export/select";
-import type { UpsellSource } from "@/lib/upsell-state";
+import { parseAnalysis } from "@/lib/export/select";
+import { exportClick } from "@/lib/export/quota";
+import type { QuotaLineInput, UpsellSource } from "@/lib/upsell-state";
+import { protocolClick } from "@/lib/protocol-click";
 import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-events";
 import { useSlowLocalHint } from "@/hooks/use-slow-local-hint";
+import { recordingMarker } from "@/lib/recording-marker";
+import { accountButtonPanel, clampSplit } from "@/lib/panel-layout";
+import { useLayoutStore } from "@/store/layout-store";
+import { cn } from "@/lib/utils";
+import { CollapsedPanelStrip, PANEL_HEADER_HEIGHT, PanelControls, PanelResizer } from "./panel-chrome";
 
 /**
  * Enda statusindikatorn under pågående inspelning. Visas centrerad medan panelen är tom
@@ -67,40 +77,58 @@ export function SplitView() {
     const email = useAuthStore((s) => s.email);
     const clearSession = useAuthStore((s) => s.clearSession);
     const events = usePostHogEvents();
+
+    // Panelernas layout: bredden mellan dem och vilken som är hopfälld. Den sparade
+    // andelen begränsas mot den faktiska bredden vid varje rendering, så att en bredd
+    // sparad i ett större fönster inte gör någon panel oläslig i ett mindre.
+    const split = useLayoutStore((s) => s.split);
+    const collapsed = useLayoutStore((s) => s.collapsed);
+    const panelsRef = useRef<HTMLDivElement>(null);
+    const [panelsWidth, setPanelsWidth] = useState(0);
+    const [resizing, setResizing] = useState(false);
+    useEffect(() => {
+        const el = panelsRef.current;
+        if (!el) return;
+        setPanelsWidth(el.getBoundingClientRect().width);
+        const observer = new ResizeObserver((entries) => setPanelsWidth(entries[0].contentRect.width));
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, []);
+    const effectiveSplit = clampSplit(split, panelsWidth);
+    const accountIn = accountButtonPanel(collapsed);
+
+    // En dold panel tappar sitt rullningsläge. Läget sparas medan panelen syns och
+    // återställs när den öppnas igen; var den nere vid slutet hamnar den där igen, så att
+    // en pågående inspelning fortsätter att synas.
+    const transcriptScrollRef = useRef<HTMLDivElement>(null);
+    const transcriptScroll = useRef({ top: 0, atEnd: true });
+    useLayoutEffect(() => {
+        const el = transcriptScrollRef.current;
+        if (!el || collapsed === 'transcript') return;
+        el.scrollTop = transcriptScroll.current.atEnd ? el.scrollHeight : transcriptScroll.current.top;
+    }, [collapsed]);
+
     const [showUpsellModal, setShowUpsellModal] = useState(false);
     // Varifrån modalen senast öppnades. Sätts i samma händelse som showUpsellModal, så
     // modalen ser rätt källa redan vid öppningen (React batchar de två uppdateringarna).
     const [upsellSource, setUpsellSource] = useState<UpsellSource>('locked_panel');
-    const openUpsell = (source: UpsellSource) => {
+    // Kvotraden i fönstret ("3 av 3 AI-protokoll"), när fönstret öppnas för en kvot.
+    const [upsellQuota, setUpsellQuota] = useState<QuotaLineInput | null>(null);
+    const openUpsell = (source: UpsellSource, quota: QuotaLineInput | null = null) => {
         setUpsellSource(source);
+        setUpsellQuota(quota);
         setShowUpsellModal(true);
     };
-    const [showUserMenu, setShowUserMenu] = useState(false);
-    const userMenuRef = useRef<HTMLDivElement>(null);
-
-    // Close user menu on click outside
+    // Protokollet: Pro obegränsat, gratiskonto med månadskvot, utloggad via konto först.
+    const protocolGate = useEntitlement('protocol');
+    const protocolCounter = useQuotaCounter('protocol');
+    // Gratiskontot har använt månadens protokoll: panelen visar räknaren på noll.
     useEffect(() => {
-        if (!showUserMenu) return;
-        const handleClick = (e: MouseEvent) => {
-            if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
-                setShowUserMenu(false);
-            }
-        };
-        document.addEventListener("mousedown", handleClick);
-        return () => document.removeEventListener("mousedown", handleClick);
-    }, [showUserMenu]);
-
-    // Derive initials from email
-    const initials = email
-        ? email.split("@")[0].slice(0, 2).toUpperCase()
-        : "?";
-
-    useEffect(() => {
-        if (isSignedIn && !isPro) {
+        if (protocolGate === 'quota_exhausted') {
             events.upsellShown('ai_insights_panel');
         }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [isSignedIn, isPro]);
+    }, [protocolGate]);
 
     const { segments: rawSegments, isProcessing } = useTranscription();
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -259,17 +287,17 @@ export function SplitView() {
     // inte ett prefix per råsegment/mening. Merged-läget kopierar styckena.
     const buildCopyText = (): string => buildCopyTextFromLines(transcriptRows);
 
-    // Filexport (Pro). Protokollet exporteras bara när det har innehåll.
+    // Filexport: Pro obegränsat, gratiskonto med månadskvot. Protokollet exporteras bara när det har innehåll.
     const [showExport, setShowExport] = useState(false);
-    const exportAllowed = useAuthStore((s) => canExport(s.stripeStatus));
     const exportAnalysis = useMemo(
         () => (analysisData ? parseAnalysis(JSON.stringify(analysisData)) : null),
         [analysisData],
     );
     const handleExportClick = () => {
-        if (!exportAllowed) {
+        const upsell = exportClick(entitlementFor('export'), quotaForUpsell('export'), captureEvent);
+        if (upsell) {
             events.upsellShown('export');
-            openUpsell('export');
+            openUpsell(upsell.source, upsell.quota);
             return;
         }
         setShowExport(true);
@@ -304,6 +332,7 @@ export function SplitView() {
     };
 
     const handleCancel = async () => {
+        recordingMarker.cancelled();
         setIsReanalyzing(false);
         setUploadStatus('idle');
         setUploadedJobId(null);
@@ -653,14 +682,60 @@ export function SplitView() {
         return runIdentify(apiTurns, participants, speakerMap, autoKeys, { silent: false });
     };
 
+    // Felen från protokollanropet. Kvoten slut → fönstret med kvotraden, och serverns siffror
+    // in i räknaren direkt. Övriga 402 ("Pro krävs") → fönstret som tidigare.
+    const handleAnalysisError = (e: any) => {
+        if (e instanceof AnalyzeHttpError && e.quota) {
+            const kind = e.quota.kind;
+            useEntitlementsStore.getState().applyQuotaExhausted(e.quota);
+            // Fönstret ersätter toasten, så bara eventet (samma slug som errorSlug ger).
+            captureEvent('error_shown', { surface: 'desktop', code: 'quota_exhausted', kind, action: 'analysis' });
+            if (kind === 'template') openUpsell('quota_template');
+            else openUpsell('quota_protocol', { used: e.quota.used, limit: e.quota.limit, resets_at: e.quota.resets_at });
+            return;
+        }
+        if (e?.message?.includes("Payment Required")) {
+            openUpsell('analysis_402');
+            return;
+        }
+        if (e instanceof AnalyzeHttpError) {
+            if (e.status === 413) {
+                showError('file_too_large', useAuthStore.getState().isPro()
+                    ? "Texten är för lång för ett protokoll."
+                    : "Texten är för lång för ett gratisprotokoll. Med Pro finns ingen sådan gräns.", { action: 'analysis' });
+                return;
+            }
+            if (e.status === 400) {
+                showError(errorSlug(e), /ingen text/i.test(e.detail)
+                    ? "Det finns ingen text att skapa ett protokoll av."
+                    : "Kunde inte skapa protokollet: " + e.detail, { action: 'analysis' });
+                return;
+            }
+            if (e.status === 409) {
+                showError(errorSlug(e), e.conflict === 'request_in_progress'
+                    ? "Protokollet skapas redan. Försök igen om en stund."
+                    : "Kunde inte skapa protokollet. Försök igen.", { action: 'analysis' });
+                return;
+            }
+        }
+        toast.error("Kunde inte uppdatera analys.");
+    };
+
     const handleAction = async () => {
-        if (!navigator.onLine) {
-            toast.error("Denna funktion kräver internetanslutning.");
+        // Grinden först: utloggad får vägen till ett gratiskonto, ett tomt gratiskonto
+        // fönstret med kvotraden. Ingen text lämnar datorn i de fallen.
+        // Medan texten fortfarande slutförs (lokal transkribering, eller analysen efter en
+        // molninspelning) skulle ett protokoll byggas på ofullständig text.
+        if (useTranscriptionStore.getState().isProcessing) return;
+
+        const upsell = protocolClick(entitlementFor('protocol'), quotaForUpsell('protocol'), captureEvent);
+        if (upsell) {
+            openUpsell(upsell.source, upsell.quota);
             return;
         }
 
-        if (!isSignedIn || !isPro) {
-            openUpsell('analysis');
+        if (!navigator.onLine) {
+            toast.error("Denna funktion kräver internetanslutning.");
             return;
         }
 
@@ -670,8 +745,13 @@ export function SplitView() {
             return;
         }
 
+        const pro = useAuthStore.getState().isPro();
         const isUploaded = activeJob && (activeJob.cloud_job_id || activeJob.sync_status === 'uploaded' || activeJob.sync_status === 'synced');
         const hasTranscription = segments.length > 0;
+
+        // Gratiskontot får protokoll på texten som finns på datorn, aldrig synk eller
+        // uppladdning av ljudet (det ingår i Pro).
+        if (!pro && !hasTranscription) return;
 
         if (isUploaded || analysisData || hasTranscription) {
             if (!activeJob && segments.length === 0) return;
@@ -684,12 +764,14 @@ export function SplitView() {
                 // desktop). Osynkat/lokalt, eller molnjobbet borta (404) → stateless analys på den
                 // visade texten. OBS: activeJob kan vara null direkt efter stopp (history-updated
                 // ej landad) — segmenten finns redan, så analysera texten statelesst i det fallet.
+                // Utan Pro alltid den visade texten: omkörning av ett molnjobb kräver Pro.
                 const { raw, cloudJobGone } = await reanalyzeRecording({
-                    cloudJobId: activeJob?.cloud_job_id,
+                    cloudJobId: pro ? activeJob?.cloud_job_id : null,
                     cloudSync: useSettingsStore.getState().cloudSync,
                     fullText,
                     templateId: "general",
                     token,
+                    keys: protocolKeys,
                 });
 
                 const mappedAnalysis = {
@@ -735,13 +817,11 @@ export function SplitView() {
                 console.error("Re-analyze failed:", e);
                 events.analysisFailed(e?.message || 'unknown');
                 markErrorSeen();
-                if (e.message?.includes("Payment Required")) {
-                    openUpsell('analysis_402');
-                } else {
-                    toast.error("Kunde inte uppdatera analys.");
-                }
+                handleAnalysisError(e);
             } finally {
                 setIsReanalyzing(false);
+                // Räknaren efter varje förbrukning (och efter ett avvisat försök).
+                if (!pro) void useEntitlementsStore.getState().refresh();
             }
         } else {
             // Initial Sync
@@ -1038,15 +1118,27 @@ export function SplitView() {
     };
 
     return (
-        <div className="grid grid-cols-5 h-full overflow-hidden bg-paper-dim/50">
-            {/* Left: Live Transcription (60% -> 3/5 cols) */}
-            <div className="col-span-3 flex flex-col h-full overflow-hidden min-w-0 bg-white border-r border-line/60 shadow-[4px_0_24px_-12px_rgba(0,0,0,0.1)] z-10 relative">
-                <div className="px-8 py-6 flex-none flex justify-between items-center bg-white border-b border-line z-50">
-                    <h2 className="text-xl font-semibold tracking-tight flex items-center gap-2.5 text-ink">
-                        <div className="p-1.5 bg-brand/5 rounded-lg text-brand">
+        <div ref={panelsRef} className={cn("flex h-full overflow-hidden bg-paper-dim/50", resizing && "select-none cursor-col-resize")}>
+            {/* Vänster: transkriptionen. Hålls monterad även hopfälld, så att rullningsläget
+                och pågående inspelning inte påverkas av att panelen döljs. */}
+            {collapsed === 'transcript' && (
+                <CollapsedPanelStrip panel="transcript" icon={<FileText className="w-4 h-4" />} />
+            )}
+            <div
+                id="transcript-panel"
+                className={cn(
+                    "flex flex-col h-full overflow-hidden min-w-0 bg-white border-r border-line/60 shadow-[4px_0_24px_-12px_rgba(0,0,0,0.1)] z-10 relative",
+                    collapsed === 'transcript' && "hidden",
+                    collapsed === 'protocol' ? "flex-1 border-r-0" : "flex-none",
+                )}
+                style={collapsed === null ? { width: `${effectiveSplit * 100}%` } : undefined}
+            >
+                <div data-panel-header="transcript" className={cn(PANEL_HEADER_HEIGHT, "px-8 flex-none flex justify-between items-center gap-3 bg-white border-b border-line z-50")}>
+                    <h2 className="text-xl font-semibold tracking-tight flex items-center gap-2.5 text-ink min-w-0">
+                        <div className="p-1.5 bg-brand/5 rounded-lg text-brand flex-none">
                             <FileText className="w-4 h-4" />
                         </div>
-                        Transkription
+                        <span className="truncate">Transkription</span>
                         {segments.length > 0 && (
                             <Button
                                 variant="ghost"
@@ -1129,12 +1221,22 @@ export function SplitView() {
                             );
                         })()}
                     </h2>
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-3 flex-none">
                         <ModePill onUpsellClick={() => openUpsell('mode_pill')} />
+                        <PanelControls panel="transcript" />
+                        {/* Kontot flyttar hit när protokollet är hopfällt. */}
+                        {accountIn === 'transcript' && <AccountButton />}
                     </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-line [&::-webkit-scrollbar-thumb]:rounded-full">
+                <div
+                    ref={transcriptScrollRef}
+                    onScroll={(e) => {
+                        const el = e.currentTarget;
+                        transcriptScroll.current = { top: el.scrollTop, atEnd: el.scrollHeight - el.scrollTop - el.clientHeight < 150 };
+                    }}
+                    className="flex-1 overflow-y-auto min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-line [&::-webkit-scrollbar-thumb]:rounded-full"
+                >
                     <div className="p-8 pt-4 max-w-3xl mx-auto space-y-8">
                         {/* History Banner — only shown when user explicitly opened a recording from history */}
                         {activeJob && activeJobFromHistory && (
@@ -1436,46 +1538,34 @@ export function SplitView() {
                 </div>
             </div>
 
-            {/* Right: AI Insights (40% -> 2/5 cols) */}
-            <div className="col-span-2 flex flex-col h-full overflow-hidden bg-paper/60 relative">
-                <div className="px-8 py-6 flex-none bg-paper/60 border-b border-line z-50 flex justify-between items-center">
-                    <h2 className="text-lg font-medium tracking-tight flex items-center gap-2 text-ink-soft">
-                        <Sparkles className="w-4 h-4 text-ochre" />
-                        <span className="text-[11px] font-semibold uppercase tracking-widest text-ochre">Protokoll</span>
+            {collapsed === null && (
+                <PanelResizer
+                    containerRef={panelsRef}
+                    containerWidth={panelsWidth}
+                    split={effectiveSplit}
+                    controls="transcript-panel"
+                    onDraggingChange={setResizing}
+                />
+            )}
+
+            {/* Höger: protokollet. */}
+            <div className={cn("flex-1 flex flex-col h-full overflow-hidden min-w-0 bg-paper/60 relative", collapsed === 'protocol' && "hidden")}>
+                <div data-panel-header="protocol" className={cn(PANEL_HEADER_HEIGHT, "px-6 flex-none bg-paper/60 border-b border-line z-50 flex justify-between items-center gap-3")}>
+                    <h2 className="text-lg font-medium tracking-tight flex items-center gap-2 text-ink-soft min-w-0">
+                        <Sparkles className="w-4 h-4 text-ochre flex-none" />
+                        <span className="text-[11px] font-semibold uppercase tracking-widest text-ochre truncate">Protokoll</span>
                     </h2>
 
-                    {/* User button */}
-                    {isSignedIn && (
-                        <div className="relative" ref={userMenuRef}>
-                            <button
-                                onClick={() => setShowUserMenu((v) => !v)}
-                                className="w-8 h-8 rounded-full bg-brand text-paper text-xs font-semibold flex items-center justify-center hover:bg-brand-deep transition-colors focus:outline-none focus:ring-2 focus:ring-brand/40 focus:ring-offset-2"
-                                title={email || "Konto"}
-                            >
-                                {initials}
-                            </button>
-                            {showUserMenu && (
-                                <div className="absolute right-0 top-full mt-2 w-56 bg-white rounded-xl shadow-lg border border-line py-2 z-50 animate-in fade-in slide-in-from-top-1 duration-150">
-                                    <div className="px-4 py-2 border-b border-line">
-                                        <p className="text-sm font-medium text-ink truncate">{email}</p>
-                                        <p className="text-xs text-ink-muted mt-0.5">{isPro ? "Sagt Pro" : "Free"}</p>
-                                    </div>
-                                    <button
-                                        onClick={() => { setShowUserMenu(false); clearSession(); }}
-                                        className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 transition-colors flex items-center gap-2"
-                                    >
-                                        <LogOut className="w-3.5 h-3.5" />
-                                        Logga ut
-                                    </button>
-                                </div>
-                            )}
-                        </div>
-                    )}
+                    <div className="flex items-center gap-2 flex-none">
+                        <PanelControls panel="protocol" />
+                        {/* Kontot: menyn för inloggad, "Logga in" för utloggad. */}
+                        {accountIn === 'protocol' && <AccountButton />}
+                    </div>
                 </div>
 
                 <div className="flex-1 flex flex-col gap-4 p-8 pt-4 overflow-y-auto min-h-0 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-line [&::-webkit-scrollbar-thumb]:rounded-full">
-                        {/* Summary Section */}
-                        {(analysisData || uploadedJobId || (isSignedIn && isPro)) && (
+                        {/* Summary Section. Visas för alla: utloggad och gratiskonto får knappen
+                            för att skapa ett protokoll, grinden avgör vad som händer vid klick. */}
                             <Card className="border border-brand/10 shadow-sm bg-white/80 p-6 space-y-4 relative overflow-hidden flex-none">
                             <div className="flex items-center justify-between">
                                 <div className="flex items-center gap-2">
@@ -1492,19 +1582,29 @@ export function SplitView() {
                                         </Button>
                                     )}
                                 </div>
-                                {/* Analyze / re-analyze button: shown whenever there is a transcription and user is Pro */}
-                                {!isReanalyzing && isPro && isSignedIn && segments.length > 0 && !isRecording && (
+                                {/* Skapa / analysera igen: bara när det finns text. Grinden i handleAction
+                                    avgör om det blir ett protokoll, en inloggning eller kvotraden. */}
+                                {!isReanalyzing && analysisData && segments.length > 0 && !isRecording && !isProcessing && (
                                     <Button
                                       variant="ghost"
                                       size="icon"
                                       className="h-6 w-6 text-ink-muted hover:text-brand hover:bg-brand/5 rounded-full"
-                                      title={analysisData ? "Analysera igen" : "Starta analys"}
+                                      title={protocolCounter ? "Analysera igen (räknas som ett nytt protokoll)" : "Analysera igen"}
                                       onClick={handleAction}
                                     >
-                                      {analysisData ? <RefreshCw className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                                      <RefreshCw className="h-3.5 w-3.5" />
                                     </Button>
                                 )}
                             </div>
+                            {/* Gratiskontots räknare: "2 av 3 kvar". Pro och utloggad har ingen. */}
+                            {protocolCounter && (
+                                <p
+                                    className={`-mt-2 text-[11px] ${protocolCounter.remaining > 0 ? 'text-ink-muted' : 'text-amber-700'}`}
+                                    title="AI-protokoll som ingår i ditt gratiskonto den här månaden. Pro ger obegränsat."
+                                >
+                                    {protocolCounter.remaining} av {protocolCounter.limit} AI-protokoll kvar den här månaden
+                                </p>
+                            )}
 
                             {isReanalyzing ? (
                                 <div className="flex flex-col items-center justify-center h-[50vh] space-y-4 p-8 text-center animate-in fade-in zoom-in-95 duration-500">
@@ -1630,90 +1730,36 @@ export function SplitView() {
                                             ? (cloudStreamingActive && autoAnalyze
                                                 ? "AI-analysen startar när du stoppar inspelningen."
                                                 : "AI-analysen kan startas när inspelningen är klar.")
-                                            : "Starta inspelningen för att se transkribering i realtid."}
+                                            : segments.length > 0
+                                                ? (protocolGate === 'sign_in'
+                                                    ? "Skapa ett AI-protokoll med sammanfattning, beslut och åtgärder. Det kräver ett gratiskonto."
+                                                    : "Skapa ett AI-protokoll med sammanfattning, beslut och åtgärder.")
+                                                : "Starta inspelningen för att se transkribering i realtid."}
                                     </p>
+                                    {!isRecording && !isProcessing && segments.length > 0 && (
+                                        <div className="flex justify-center pt-1">
+                                            <Button size="sm" onClick={handleAction} className="gap-1.5">
+                                                <Sparkles className="w-3.5 h-3.5" />
+                                                Skapa protokoll
+                                            </Button>
+                                        </div>
+                                    )}
                                 </>
                             )}
                         </Card>
-                        )}
 
-                        {/* Skeleton — syns genom blur-overlay för ej Pro-användare */}
-                        {(!isSignedIn || !isPro) && (
-                            <div className="space-y-5 pointer-events-none select-none" aria-hidden="true">
-
-                                {/* Sammanfattning */}
-                                <div className="space-y-2">
-                                    <p className="text-[10px] font-semibold text-ink-muted uppercase tracking-widest">Sammanfattning</p>
-                                    <div className="space-y-1.5">
-                                        <div className="h-2 bg-paper-dim rounded-full w-full" />
-                                        <div className="h-2 bg-paper-dim rounded-full w-5/6" />
-                                        <div className="h-2 bg-paper-dim rounded-full w-4/6" />
-                                    </div>
-                                </div>
-
-                                {/* Beslut */}
-                                <div className="space-y-2">
-                                    <p className="text-[10px] font-semibold text-ink-muted uppercase tracking-widest">Beslut</p>
-                                    <div className="space-y-2">
-                                        <div className="flex items-start gap-2">
-                                            <div className="w-1.5 h-1.5 rounded-full bg-paper-dim mt-1.5 flex-shrink-0" />
-                                            <div className="h-2 bg-paper-dim rounded-full w-4/5" />
-                                        </div>
-                                        <div className="flex items-start gap-2">
-                                            <div className="w-1.5 h-1.5 rounded-full bg-paper-dim mt-1.5 flex-shrink-0" />
-                                            <div className="h-2 bg-paper-dim rounded-full w-3/5" />
-                                        </div>
-                                    </div>
-                                </div>
-
-                                {/* Åtgärder */}
-                                <div className="space-y-2">
-                                    <p className="text-[10px] font-semibold text-ink-muted uppercase tracking-widest">Åtgärder</p>
-                                    <div className="space-y-2">
-                                        <div className="flex items-start gap-2">
-                                            <div className="w-3 h-3 rounded border border-line mt-0.5 flex-shrink-0" />
-                                            <div className="h-2 bg-paper-dim rounded-full w-full" />
-                                        </div>
-                                        <div className="flex items-start gap-2">
-                                            <div className="w-3 h-3 rounded border border-line mt-0.5 flex-shrink-0" />
-                                            <div className="h-2 bg-paper-dim rounded-full w-5/6" />
-                                        </div>
-                                        <div className="flex items-start gap-2">
-                                            <div className="w-3 h-3 rounded border border-line mt-0.5 flex-shrink-0" />
-                                            <div className="h-2 bg-paper-dim rounded-full w-3/4" />
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        )}
                 </div>
 
-                {/* Lock overlay — täcker hela höger kolonn inklusive "Protokoll"-rubrik, exakt som hero-mockupen */}
-                {(!isSignedIn || !isPro) && (
-                    <div className="absolute inset-0 z-[51] bg-white/55 backdrop-blur-[2px] grid place-items-center pointer-events-none">
-                        <div className="pointer-events-auto">
-                            {/* Här fanns tidigare en "Väntar på betalning..."-gren styrd av en egen
-                                usePaymentRefresh-instans. Den kunde aldrig renderas: hookens isWaiting är
-                                per-instans useState och den här instansen anropade aldrig startPolling —
-                                modalen har sin egen. Och även med delat tillstånd hade grenen varit
-                                oåtkomlig, eftersom overlayen (z-51) bara syns när modalen (z-100) är
-                                stängd, och varje väg som stänger modalen anropar stopPolling(). */}
-                            <button
-                                onClick={() => openUpsell('locked_panel')}
-                                className="inline-flex items-center gap-2 rounded-full bg-ink text-paper text-xs font-semibold px-4 py-2 hover:bg-ink/90 transition-colors shadow-md"
-                            >
-                                <Lock className="w-3.5 h-3.5" />
-                                Lås upp med Pro
-                            </button>
-                        </div>
-                    </div>
-                )}
             </div >
+            {collapsed === 'protocol' && (
+                <CollapsedPanelStrip panel="protocol" icon={<Sparkles className="w-4 h-4 text-ochre" />} />
+            )}
 
             <UpsellModal
                 isOpen={showUpsellModal}
                 onClose={() => setShowUpsellModal(false)}
                 source={upsellSource}
+                quota={upsellQuota}
             />
             <ExportDialog
                 isOpen={showExport}

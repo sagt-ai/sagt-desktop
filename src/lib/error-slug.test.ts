@@ -1,7 +1,18 @@
 import { describe, it, expect } from "vitest";
 import { errorSlug, withoutErrorCode } from "./error-slug";
+import { analyzeErrorFrom } from "./entitlements";
 
 describe("errorSlug", () => {
+    it("402 med code quota_exhausted → quota_exhausted, inte not_pro", () => {
+        const e = analyzeErrorFrom(402, null, JSON.stringify({
+            detail: "Du har använt 3 av 3 AI-protokoll den här månaden.",
+            code: "quota_exhausted", kind: "protocol", limit: 3, used: 3, resets_at: "2026-11-01",
+        }));
+        expect(errorSlug(e)).toBe("quota_exhausted");
+        // Samma text utan felobjektet faller inte in i kvotslugen av misstag.
+        expect(errorSlug(new Error(e.message))).toBe("not_pro");
+    });
+
     it("mappar 401-prefix → unauthorized", () => {
         expect(errorSlug(new Error("Unauthorized: token invalid"))).toBe("unauthorized");
         expect(errorSlug(new Error("Din session är inte längre giltig."))).toBe("unauthorized");

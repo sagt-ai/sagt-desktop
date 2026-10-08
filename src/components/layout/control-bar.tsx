@@ -19,6 +19,7 @@ import { useTranscriptionStore } from "@/store/transcription-store";
 import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-events";
 import { resetCloudStream } from "@/hooks/use-cloud-stream";
 import { transcriptOutcomeProps, type SessionDiagnostics } from "@/lib/session-diagnostics";
+import { recordingMarker, HEARTBEAT_MS } from "@/lib/recording-marker";
 
 interface Recording {
     id: number | null;
@@ -86,6 +87,14 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
         return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
     };
 
+    // Hjärtslag i markören för den pågående inspelningen, så att längden på en
+    // inspelning som aldrig sparas går att räkna ut vid nästa start.
+    useEffect(() => {
+        if (!isRecording) return;
+        const interval = setInterval(() => recordingMarker.heartbeat(), HEARTBEAT_MS);
+        return () => clearInterval(interval);
+    }, [isRecording]);
+
     // Track duration in ref for the listener to access latest value
     const durationRef = useRef(0);
     useEffect(() => {
@@ -107,6 +116,7 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
 
             if (recording.id && recording.file_path) {
                 events.recordingStopped(durationRef.current);
+                recordingMarker.saved(recording.file_path);
                 setSession(recording.file_path, recording.id.toString());
                 setUploadStatus('idle');
                 setActiveJob(recording);
@@ -264,6 +274,7 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                 // Backend handles saving now.
                 // We just stop and wait for event.
                 await invoke("stop_recording");
+                recordingMarker.stopped();
                 setIsRecording(false);
                 useTranscriptionStore.getState().setIsProcessing(true); // Show Finalizing state
                 setStartTime(null);
@@ -290,7 +301,8 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                 useSyncStore.getState().setCloudStreamingActive(streaming);
 
                 await invoke("start_recording");
-                events.recordingStarted();
+                events.recordingStarted(streaming ? 'cloud' : 'local', isPro ? 'pro' : 'free');
+                recordingMarker.started();
 
                 /**
                  * clearSegments() is intentionally called AFTER start_recording.

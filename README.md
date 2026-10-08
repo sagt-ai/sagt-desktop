@@ -2,7 +2,7 @@
 
 **Free, private meeting transcription for Swedish. Runs on your own machine.**
 
-[Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) (173 MB) · [Download for Mac →](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (179 MB)
+[Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) (173 MB) · [Download for Mac →](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (180 MB)
 
 [sagt.ai](https://sagt.ai) · Windows 10/11 · macOS 14.2+ (Apple Silicon) · MIT licensed
 
@@ -26,11 +26,12 @@ It listens to **your computer's audio** rather than integrating with a meeting p
 - **Records and transcribes in real time** — text appears as you speak, ~1–3 s latency
 - **No bot in your meeting** — captures microphone + system audio directly. Nobody in the participant list knows you're taking notes
 - **100% local on the free tier** — KB-Whisper Small runs on your own CPU. Zero audio leaves your machine
-- **No account required** — no email, no password, no sign-up. Download, install, record
+- **No account to record** — no email, no password, no sign-up to record and transcribe. A free account adds AI meeting minutes and export
 - **Installs without administrator rights** — works on a locked-down work laptop
 - **Works offline** — no internet connection needed on the free tier
 - **You and the meeting on separate channels** — your microphone and the computer's audio are transcribed apart, so the transcript shows what you said and what was said in the meeting
-- **AI meeting protocol on Pro** — summaries, decisions and action items via Gemma 4 31B on Berget.ai's Swedish servers. Never outside Europe
+- **AI meeting minutes** — summaries, decisions and action items via Gemma 4 31B on Berget.ai's Swedish servers: 3 per month with a free account, unlimited on Pro. Never outside Europe
+- **Export to Word, Markdown, text and PDF** — 10 exports per month with a free account, unlimited on Pro
 
 ## Free vs Pro
 
@@ -40,11 +41,12 @@ It listens to **your computer's audio** rather than integrating with a meeting p
 | KB-Whisper Small (offline, on-device) | ✅ | ✅ |
 | Captures Teams / Zoom / Skype / Meet audio | ✅ | ✅ |
 | Works with no internet connection | ✅ | ✅ |
-| Account required | ❌ None | Yes |
-| AI meeting summary | — | ✅ |
-| Key decisions & action items | — | ✅ |
+| Account required | Not to record; a free account for AI minutes and export | Yes |
+| AI meeting summary | 3 per month (free account) | ✅ Unlimited |
+| Key decisions & action items | 3 per month (free account) | ✅ Unlimited |
+| Export (Word, Markdown, text, PDF) | 10 per month (free account) | ✅ Unlimited |
 | You and the meeting on separate channels | ✅ | ✅ |
-| KB-Whisper Large (higher accuracy, cloud) | — | ✅ |
+| KB-Whisper Large (higher accuracy, cloud) | — | ✅ When you choose it |
 | Cloud transcription quota | n/a | 1,500 min/month |
 | Data ever leaves the EU | ❌ Never | ❌ Never |
 
@@ -112,7 +114,6 @@ We hold **neither ISO 27001 nor SOC 2**, and do not claim to. What we offer inst
 Stated plainly, so you can decide before downloading:
 
 - **Apple Silicon Macs only.** The Mac build is arm64 — there is no Intel Mac build and no universal binary. macOS 14.2 or later is required, because the API used to capture meeting audio does not exist before it. No Linux build exists.
-- **Export is part of Pro, and there is no PDF.** Free users copy transcripts and summaries to the clipboard. Pro exports one or many meetings as Word (.docx), Markdown or plain text, saved where you choose, offline.
 - **Speakers are told apart by channel only.** Everyone on the same channel appears as one speaker: the other people on a call as "Mötet" (the meeting), and people in the room with you as "Du" (you). Acoustic speaker separation ("Speaker 1, 2, 3") was switched off on 2026-09-18.
 - **Swedish-first.** The bundled on-device model handles Swedish only. Norwegian and English are available through the cloud tier (Pro).
 - **Public beta.** Expect rough edges.
@@ -123,13 +124,13 @@ Stated plainly, so you can decide before downloading:
 Yes, and with anything else that makes sound. Sagt captures your computer's audio output rather than integrating with a specific platform, so the meeting tool is irrelevant — including a conversation happening in the room.
 
 **Do I need an account?**
-Not for the free tier. No email address, no password, no sign-up. An account is only needed for Pro features (AI protocol, cloud sync).
+Not to record and transcribe: no email address, no password, no sign-up. A free account (no payment card) gives you 3 AI meeting minutes and 10 exports per month. Pro removes the limits and adds the cloud model and sync.
 
 **Does my audio leave my computer?**
-Not on the free tier — transcription runs on your own CPU. On Pro, only the recordings you choose to process are uploaded, to servers in Sweden, and the audio files are deleted within 24 hours.
+Not on the free tier — transcription runs on your own CPU. With a free account, AI meeting minutes are made from the transcript text; the audio stays on your computer. On Pro, only the recordings you choose to process are uploaded, to servers in Sweden, and the audio files are deleted within 24 hours.
 
 **Is it really free, or is it a trial?**
-Free is free, with no time limit and no usage cap. Local transcription is unlimited.
+Free is free, with no time limit. Local transcription is unlimited. A free account adds 3 AI meeting minutes and 10 exports per month.
 
 **Does it work without internet?**
 Yes. Recording and local transcription work fully offline.
@@ -144,7 +145,7 @@ No. It installs per-user, which means it works on a managed work laptop.
 Yes, since v0.10.0 — the same app, released from the same version tag as Windows. It needs macOS 14.2 or later on an Apple Silicon Mac (M1 or newer); Intel Macs are not supported.
 
 **Can I export to Word or PDF?**
-Word, Markdown and plain text, yes, with Pro (since v0.10.7): one meeting from the transcript view, or several at once from Recordings, as a zip or one combined file. PDF is not available. Free users copy the text to the clipboard.
+Yes. Word, Markdown, plain text and PDF: one meeting from the transcript view, or several at once from Recordings, as a zip or one combined file. A free account can export 10 times per month, also offline; Pro has no limit. Without an account you can copy the text to the clipboard.
 
 ## Installation
 

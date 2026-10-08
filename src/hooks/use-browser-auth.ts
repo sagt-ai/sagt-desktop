@@ -1,72 +1,38 @@
-import { useState, useRef, useCallback } from "react"
+import { useCallback } from "react"
 import { invoke } from "@tauri-apps/api/core"
 import { useAuthStore } from "@/store/auth-store"
+import { setBrowserAuthIntent, startBrowserAuth, stopBrowserAuthFor, useBrowserAuthStore, type AuthIntent } from "@/lib/browser-auth"
+import { clearSignInIntent, setSignInIntent } from "@/lib/sign-in-intent"
 
 const API_URL = import.meta.env.VITE_API_URL || "https://api.sagt.ai/api/v1"
 const FRONTEND_URL = import.meta.env.VITE_FRONTEND_URL || "https://sagt.ai"
-const POLL_INTERVAL_MS = 2500
-const POLL_TIMEOUT_MS = 300_000 // 5 minutes
 
-export function useBrowserAuth() {
-    const [isAuthenticating, setIsAuthenticating] = useState(false)
-    const setSession = useAuthStore((s) => s.setSession)
-    const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-    const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+function apiBase(): string {
+    const base = API_URL.replace(/\/$/, "")
+    return base.endsWith("/api/v1") ? base : `${base}/api/v1`
+}
 
-    const stopPolling = useCallback(() => {
-        if (pollRef.current) {
-            clearInterval(pollRef.current)
-            pollRef.current = null
-        }
-        if (timeoutRef.current) {
-            clearTimeout(timeoutRef.current)
-            timeoutRef.current = null
-        }
-        setIsAuthenticating(false)
-    }, [])
-
-    const startAuth = useCallback(async () => {
-        const nonce = crypto.randomUUID()
-        setIsAuthenticating(true)
-
-        // Open browser to frontend desktop-auth page
-        try {
-            await invoke("plugin:shell|open", {
-                path: `${FRONTEND_URL}/desktop-auth?nonce=${nonce}`,
-            })
-        } catch (err) {
-            console.error("Failed to open browser:", err)
-            setIsAuthenticating(false)
-            return
-        }
-
-        // Ensure base URL ends with /api/v1
-        let baseUrl = API_URL.replace(/\/$/, "")
-        if (!baseUrl.endsWith("/api/v1")) {
-            baseUrl = `${baseUrl}/api/v1`
-        }
-
-        // Poll for token
-        pollRef.current = setInterval(async () => {
-            try {
-                const res = await fetch(`${baseUrl}/auth/desktop-poll?nonce=${nonce}`)
-                if (res.ok) {
-                    const data = await res.json()
-                    setSession(data.token, data.user, data.expires_at)
-                    stopPolling()
-                } else if (res.status === 410) {
-                    // Nonce expired
-                    stopPolling()
-                }
-                // 404 = not ready yet, keep polling
-            } catch {
-                // Network error, keep retrying
-            }
-        }, POLL_INTERVAL_MS)
-
-        // Timeout after 5 minutes
-        timeoutRef.current = setTimeout(stopPolling, POLL_TIMEOUT_MS)
-    }, [setSession, stopPolling])
-
-    return { startAuth, stopPolling, isAuthenticating }
+/**
+ * Inloggningen i webbläsaren för en komponent. Själva inloggningen är gemensam för appen
+ * (lib/browser-auth.ts) och avbryts inte när komponenten försvinner, så att ett vybyte
+ * medan webbläsaren är öppen inte tappar sessionen. Därför ingen städning här.
+ *
+ * `owner` är komponentens ägarnyckel: `stopAuth` släpper bara dess intresse, och
+ * `isWaiting` säger om just den väntar.
+ */
+export function useBrowserAuth(owner: string) {
+    const isAuthenticating = useBrowserAuthStore((s) => s.isAuthenticating)
+    const isWaiting = useBrowserAuthStore((s) => s.owners.includes(owner))
+    const startAuth = useCallback((intent: AuthIntent) => startBrowserAuth({
+        openUrl: (path) => invoke("plugin:shell|open", { path }),
+        fetchFn: (url) => fetch(url),
+        onSession: (data) => useAuthStore.getState().setSession(data.token, data.user, data.expires_at),
+        // Avsikten sätts först här, när inloggningen lyckats, ur alla som väntade på den.
+        onIntent: (i) => i ? setSignInIntent(i.intent, i.source) : clearSignInIntent(),
+        apiBase: apiBase(),
+        frontendUrl: FRONTEND_URL,
+    }, owner, intent), [owner])
+    const stopAuth = useCallback(() => stopBrowserAuthFor(owner), [owner])
+    const setIntent = useCallback((i: AuthIntent) => setBrowserAuthIntent(owner, i), [owner])
+    return { startAuth, stopAuth, setIntent, isAuthenticating, isWaiting }
 }

@@ -7,6 +7,37 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.11.0 — 2026-10-08
+
+### Added
+
+- **A free account with AI meeting minutes.** Sign in with a free account to
+  create up to 3 AI meeting minutes per month from your local transcript. The
+  panel shows how many you have left. Recording and transcription still work
+  without an account.
+- **Export for free accounts.** A free account can export up to 10 times per
+  month, also without an internet connection. The export dialog shows how many
+  exports you have left. Exporting several meetings at once counts as one.
+- **PDF export.** Transcripts and minutes can now be saved as PDF, in addition to
+  Word, Markdown and text.
+- **Resizable and collapsible panels.** Drag the edge between the transcript and
+  the minutes, or the edge of the menu, to change the width. Double-click an edge
+  to reset it. Each panel and the menu can be collapsed. Your layout is
+  remembered.
+- **Sign-in button.** When you are signed out, the round button at the top right
+  opens a menu with "Logga in" (Sign in).
+
+### Changed
+
+- **Pro: choose where transcription runs.** The local model is now the default
+  for everyone. Pro users can switch to the larger cloud model whenever they want
+  higher accuracy. If you used the cloud model before, the app asks you once
+  which one you want.
+- **Clearer upgrade window.** The free account and Pro are shown as two separate
+  choices.
+- **Information banners span the whole window,** so the line under the panel
+  headings stays straight.
+
 ## 0.10.10 — 2026-09-28
 
 ### Fixed

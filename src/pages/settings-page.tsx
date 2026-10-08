@@ -12,6 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAuthStore } from "@/store/auth-store";
 import { useConfigStore } from "@/store/config-store";
 import { useCheckout } from "@/hooks/use-checkout";
+import { usePostHogEvents } from "@/hooks/use-posthog-events";
 import { toast } from "sonner";
 
 
@@ -72,6 +73,7 @@ export function SettingsPage() {
     // Backendens kill switch för talarseparering: styr vilka av valen nedan som visas.
     const diarizeEnabled = useConfigStore((s) => s.diarizeEnabled);
     const { openCheckout, isOpening: isOpeningCheckout } = useCheckout();
+    const events = usePostHogEvents();
 
     const [availableDevices, setAvailableDevices] = useState<{ name: string, is_default: boolean }[]>([]);
     const [showAdvancedVad, setShowAdvancedVad] = useState(false);
@@ -575,7 +577,10 @@ export function SettingsPage() {
 
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
                                 <button
-                                    onClick={() => setRecordingMode('cloud')}
+                                    onClick={() => {
+                                        if (recordingMode === 'local') events.cloudModelEnabled('settings');
+                                        setRecordingMode('cloud');
+                                    }}
                                     disabled={!isPro}
                                     className={`relative p-4 rounded-xl border text-left flex flex-col items-center justify-center transition-all ${(recordingMode === 'cloud' || recordingMode === 'cloud_analysis')
                                         ? 'border-blue-600 bg-blue-50/50 shadow-sm ring-1 ring-blue-600'

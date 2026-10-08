@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore } from "@/store/settings-store";
 import { ChunkHttpError } from "./cloud-chunks";
+import { analyzeErrorFrom, parseEntitlements, parseQuotaExhausted, type EntitlementsResponse, type OfflineAllowance, type QuotaExhaustedInfo } from "./entitlements";
 
 // Re-export så alla `import { errorSlug } from "@/lib/api"` fungerar; själva funktionen
 // bor i en ren fil utan Tauri-beroenden (error-slug.ts) → enhetstestbar i node.
@@ -274,60 +275,110 @@ export async function reanalyzeJob(jobId: string, templateId: string = "general"
     return await response.json();
 }
 
-export async function reanalyzeTranscript(text: string, templateId: string = "general", token: string): Promise<any> {
-    const { backendUrl } = useSettingsStore.getState();
+/**
+ * Stateless protokoll på en text. Ett gratiskonto skickar `X-Idempotency-Key` (en per
+ * avsiktlig begäran, samma vid omförsök): servern räknar då protokollet i kvoten en gång,
+ * även om svaret går förlorat och begäran görs om. Pro räknas aldrig, så nyckeln skadar
+ * inte där. Kastar `AnalyzeHttpError` vid icke-2xx (status, kvotfält och 409-kod).
+ */
+export async function reanalyzeTranscript(
+    text: string,
+    templateId: string = "general",
+    token: string,
+    opts: { idempotencyKey?: string } = {},
+): Promise<any> {
+    const url = `${apiBase()}/analyze`;
 
-    let baseUrl = backendUrl.replace(/\/$/, "");
-    if (!baseUrl.endsWith("/api/v1")) {
-        baseUrl = `${baseUrl}/api/v1`;
-    }
-    const url = `${baseUrl}/analyze`;
-
-    const headers: HeadersInit = {
+    const headers: Record<string, string> = {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${token}`
     };
+    if (opts.idempotencyKey) headers["X-Idempotency-Key"] = opts.idempotencyKey;
 
+    let response: Response;
     try {
-        const response = await fetch(url, {
+        response = await fetch(url, {
             method: "POST",
             headers,
             body: JSON.stringify({ text, template_id: templateId }),
         });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            let parsedError = errorText;
-            try {
-                const parsed = JSON.parse(errorText);
-                if (parsed.detail) parsedError = parsed.detail;
-            } catch (e) { }
-
-            if (response.status === 401) {
-                throw new Error(`Unauthorized: ${parsedError}`);
-            }
-            if (response.status === 402) {
-                throw new Error(`Payment Required: Denna funktion kräver Pro. Vänligen uppgradera via webbportalen.`);
-            }
-            throw new Error(`Re-analys misslyckades: ${parsedError}`);
-        }
-
-        return await response.json();
     } catch (error: any) {
         console.error("🔥 API Reanalyze Error:", error);
-        if (error.response) {
-            console.error("Response data:", error.response.data);
-        }
-
-        if (error instanceof Error && error.message.startsWith("Unauthorized")) {
-            throw error;
-        }
-        if (error instanceof Error && error.message.includes("Payment Required")) {
-            throw error;
-        }
-
         throw error;
     }
+
+    if (!response.ok) {
+        const err = analyzeErrorFrom(response.status, response.headers.get("X-Error-Code"), await response.text());
+        console.error("🔥 API Reanalyze Error:", err.message);
+        throw err;
+    }
+
+    return await response.json();
+}
+
+/**
+ * Planen och gratiskvoternas räknare för det inloggade kontot. Kräver inloggning men
+ * inte Pro. Kastar vid icke-2xx; anroparen behåller då sin senaste bild.
+ */
+export async function getEntitlements(token: string): Promise<EntitlementsResponse> {
+    const response = await fetch(`${apiBase()}/entitlements`, {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${token}` },
+    });
+    if (!response.ok) throw new Error(`Kunde inte hämta kvoterna (${response.status}).`);
+    return parseEntitlements(await response.json());
+}
+
+const ENTITLEMENT_TIMEOUT_MS = 10_000;
+
+/** Svaret från en förbrukning eller avstämning som inte är ett nätfel. */
+export type EntitlementCallOutcome =
+    | { kind: "ok"; body: EntitlementsResponse }
+    | { kind: "exhausted"; quota: QuotaExhaustedInfo | null }
+    | { kind: "error"; status: number; detail: string };
+
+async function entitlementOutcome(response: Response): Promise<EntitlementCallOutcome> {
+    const text = await response.text();
+    let body: unknown = null;
+    try { body = JSON.parse(text); } catch { /* inte JSON */ }
+    if (response.ok) return { kind: "ok", body: parseEntitlements(body) };
+    if (response.status === 402) return { kind: "exhausted", quota: parseQuotaExhausted(body) };
+    const d = (body as { detail?: unknown } | null)?.detail;
+    return { kind: "error", status: response.status, detail: typeof d === "string" ? d : text };
+}
+
+/**
+ * Dra en enhet för en handling som görs i appen (export). Samma nyckel igen drar inget
+ * nytt. Kastar bara när servern inte gick att nå; alla svar blir ett utfall.
+ */
+export async function consumeEntitlement(kind: string, key: string, token: string): Promise<EntitlementCallOutcome> {
+    const response = await fetch(`${apiBase()}/entitlements/consume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+        body: JSON.stringify({ kind, key }),
+        // Ett nät som hänger (portal, tappad uppkoppling) ska ge offline-vägen, inte en
+        // export som väntar för evigt.
+        signal: AbortSignal.timeout(ENTITLEMENT_TIMEOUT_MS),
+    });
+    return entitlementOutcome(response);
+}
+
+/** Bokför exporter som gjorts utan nätverk mot förskottet de drogs från. Kastar vid nätfel. */
+export async function reconcileEntitlements(allowance: OfflineAllowance, keys: string[], token: string): Promise<EntitlementCallOutcome> {
+    const response = await fetch(`${apiBase()}/entitlements/reconcile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+        body: JSON.stringify({ allowance, keys }),
+        signal: AbortSignal.timeout(ENTITLEMENT_TIMEOUT_MS),
+    });
+    return entitlementOutcome(response);
+}
+
+function apiBase(): string {
+    const { backendUrl } = useSettingsStore.getState();
+    let baseUrl = backendUrl.replace(/\/$/, "");
+    if (!baseUrl.endsWith("/api/v1")) baseUrl = `${baseUrl}/api/v1`;
+    return baseUrl;
 }
 
 // ─── Talaridentifiering (Fas 1 — tilltalsnamn ovanpå Du/Mötet) ───────────────

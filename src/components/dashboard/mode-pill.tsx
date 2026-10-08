@@ -3,6 +3,7 @@ import { useSyncStore } from "@/store/sync-store";
 import { useAuthStore } from "@/store/auth-store";
 import { ChevronDown, Cloud, HardDrive, Lock, ShieldAlert, Loader2 } from "lucide-react";
 import { useTranscriptionStore } from "@/store/transcription-store";
+import { usePostHogEvents } from "@/hooks/use-posthog-events";
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -20,6 +21,7 @@ export function ModePill({ onUpsellClick }: ModePillProps) {
     const { recordingMode, setRecordingMode } = useSettingsStore();
     const { effectiveMode, isOnline, isRecording, uploadStatus, processingStatus } = useSyncStore();
     const isProcessingLocal = useTranscriptionStore(state => state.isProcessing);
+    const events = usePostHogEvents();
     
     const isProcessing = isProcessingLocal || uploadStatus === 'uploading' || processingStatus === 'PROCESSING' || processingStatus === 'PENDING';
     const derivedMode = (!isSignedIn || !isPro) ? 'local' : effectiveMode;
@@ -72,6 +74,7 @@ export function ModePill({ onUpsellClick }: ModePillProps) {
             onUpsellClick();
             return;
         }
+        if (mode === 'cloud' && recordingMode === 'local') events.cloudModelEnabled('mode_pill');
         setRecordingMode(mode);
         useSyncStore.getState().setEffectiveMode(isOnline ? mode : 'local');
     };

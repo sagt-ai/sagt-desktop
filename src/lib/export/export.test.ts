@@ -9,7 +9,7 @@ import { mdEscape, renderMd, renderTxt } from "./render-text";
 import { renderDocx } from "./render-docx";
 import { buildExport, effectiveBundle } from "./bundle";
 import { bundleStem, datePrefix, dedupeNames, firstSentence, meetingStem, sanitizeFilename, shortenAtWord } from "./filename";
-import { canExport, isExportable, parseAnalysis, selectExportSegments } from "./select";
+import { isExportable, parseAnalysis, selectExportSegments } from "./select";
 import { buildCopyText } from "@/lib/transcript-turns";
 import { EXPECTED_MD_A, EXPECTED_TXT_A, MEETING_A } from "./fixtures";
 import type { ExportMeeting } from "./types";
@@ -320,21 +320,5 @@ describe("inspelningar", () => {
         expect(isExportable({ has_segments: false, cloud_transcript: "x" })).toBe(true);
         expect(isExportable({ has_segments: false, analysis_json: '{"summary":"S"}' })).toBe(true);
         expect(isExportable({ has_segments: false, analysis_json: "{trasig", cloud_transcript: " " })).toBe(false);
-    });
-});
-
-describe("Pro-gränsen", () => {
-    it("aktiv prenumeration får exportera", () => {
-        expect(canExport("active")).toBe(true);
-    });
-
-    it("gratis och utloggad får inte", () => {
-        expect(canExport(null)).toBe(false);
-        expect(canExport(undefined)).toBe(false);
-        expect(canExport("")).toBe(false);
-    });
-
-    it.each(["canceled", "past_due", "trialing", "incomplete", "unpaid", "Active"])("%s får inte", status => {
-        expect(canExport(status)).toBe(false);
     });
 });

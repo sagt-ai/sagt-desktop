@@ -30,8 +30,15 @@ export function showError(
 
 export function usePostHogEvents() {
     return {
-        recordingStarted: () =>
-            captureEvent('recording_started'),
+        // mode: där ljudet transkriberas i den här inspelningen ('local' | 'cloud'),
+        // plan: 'pro' | 'free'. Visar hur många Pro som väljer molnmodellen.
+        recordingStarted: (mode: 'local' | 'cloud', plan: 'pro' | 'free') =>
+            captureEvent('recording_started', { mode, plan }),
+
+        // Molnmodellen valdes som standard. source: var valet gjordes
+        // ('mode_pill' | 'settings' | 'first_start').
+        cloudModelEnabled: (source: 'mode_pill' | 'settings' | 'first_start') =>
+            captureEvent('cloud_model_enabled', { source }),
 
         recordingStopped: (durationSeconds: number) =>
             captureEvent('recording_stopped', { duration_seconds: durationSeconds }),
@@ -61,12 +68,15 @@ export function usePostHogEvents() {
 
         // En sparad exportfil. Bara val och antal, aldrig filnamn eller text ur mötet.
         // count = antal möten; bundle = single | zip | combined; content = vad som ingick.
+        // scope: current = transkriptvyn, selected = Inspelningar. plan: free | pro, så att
+        // användningen går att dela på plan. Fälten byggs av exportedEventProps (lib/export/run).
         transcriptExported: (p: {
             format: ExportFormat
             scope: ExportScope
             count: number
             bundle: ExportBundle
             content: ExportContent
+            plan: 'free' | 'pro'
         }) =>
             captureEvent('transcript_exported', p),
 
@@ -74,6 +84,9 @@ export function usePostHogEvents() {
         // sign_in_completed) → Stripe öppnad i webbläsaren → payment_succeeded (server).
         // `source` säger varifrån modalen öppnades, se UpsellSource. `signed_in` skiljer
         // den som måste logga in först, eftersom det är ett eget steg där folk kan falla bort.
+        // Kvotkällorna (quota_protocol, quota_template) bär rätten i namnet, så att tratten
+        // quota_exhausted → upsell_modal_opened → sign_in_completed → payment_succeeded går
+        // att dela upp per rätt.
         upsellModalOpened: (source: UpsellSource, signedIn: boolean) =>
             captureEvent('upsell_modal_opened', { source, signed_in: signedIn }),
 
@@ -85,6 +98,10 @@ export function usePostHogEvents() {
 
         // view: vilket läge modalen stod i när den stängdes (UpsellView) — säljsidan,
         // eller väntan på Stripe-bekräftelse efter att betalningen öppnats.
+        // Gratisvalet i fönstret ("Fortsätt med gratiskontot"): ett val, inte en avfärdning.
+        upsellFreeChosen: (source: UpsellSource) =>
+            captureEvent('upsell_free_chosen', { source }),
+
         upsellModalDismissed: (source: UpsellSource, view: UpsellView) =>
             captureEvent('upsell_modal_dismissed', { source, view }),
 

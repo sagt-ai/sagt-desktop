@@ -1,13 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Download, Loader2, X } from "lucide-react";
 import { toast } from "sonner";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Label } from "@/components/ui/label";
-import { showError, usePostHogEvents } from "@/hooks/use-posthog-events";
-import { buildExport, effectiveBundle } from "@/lib/export/bundle";
-import { coverageHint, filterForContent } from "@/lib/export/blocks";
+import { captureEvent, showError, usePostHogEvents } from "@/hooks/use-posthog-events";
+import { buildExport } from "@/lib/export/bundle";
+import { coverageHint } from "@/lib/export/blocks";
+import { captureExportExhausted, exportCounterText } from "@/lib/export/quota";
+import { ExportKey, exportedEventProps, runExport } from "@/lib/export/run";
 import { saveExportFile } from "@/lib/export/tauri-io";
 import type { ExportBundle, ExportContent, ExportFormat, ExportMeeting, ExportScope } from "@/lib/export/types";
+import type { QuotaLineInput, UpsellSource } from "@/lib/upsell-state";
+import { requestExportPermit, useEntitlementsStore, useExportCounter } from "@/store/entitlements-store";
+import { UpsellModal } from "./upsell-modal";
 
 interface ExportDialogProps {
     isOpen: boolean;
@@ -61,29 +66,73 @@ export function ExportDialog({ isOpen, onClose, scope, count, transcriptCount, a
     const [content, setContent] = useState<ExportContent>(() => defaultContent(transcriptCount, analysisCount));
     const [bundle, setBundle] = useState<ExportBundle>("zip");
     const [busy, setBusy] = useState(false);
+    // Gratiskontots räknare: "9 av 10 exporter kvar". Pro och utloggad har ingen.
+    const counter = useExportCounter(isOpen);
+    // Nyckeln för exporten: densamma tills en fil sparats (se ExportKey).
+    const keyRef = useRef(new ExportKey());
+    // Uppgraderingsfönstret när exporten nekas (utloggad, kvoten slut). Fönstret bor här så
+    // att det kan öppnas mitt i en export, efter att exportdialogen stängts.
+    const [upsell, setUpsell] = useState<{ source: UpsellSource; quota: QuotaLineInput | null } | null>(null);
 
     // Nytt urval → rimligt innehållsval igen (t.ex. inget protokoll i det nya urvalet).
     useEffect(() => {
         if (isOpen) setContent(defaultContent(transcriptCount, analysisCount));
     }, [isOpen, transcriptCount, analysisCount]);
 
-    if (!isOpen) return null;
+    const upsellModal = (
+        <UpsellModal isOpen={upsell !== null} onClose={() => setUpsell(null)} source={upsell?.source ?? 'quota_export'} quota={upsell?.quota ?? null} />
+    );
+
+    if (!isOpen) return upsellModal;
 
     const hint = coverageHint(content, count, transcriptCount, analysisCount);
+
+    const openUpsell = (source: UpsellSource, quota: QuotaLineInput | null) => {
+        events.upsellShown('export');
+        onClose();
+        setUpsell({ source, quota });
+    };
 
     const run = async () => {
         setBusy(true);
         try {
-            const meetings = filterForContent(await loadMeetings(), content);
-            if (meetings.length === 0) {
+            const result = await runExport({
+                loadMeetings, format, content, bundle,
+                key: keyRef.current,
+                permit: requestExportPermit,
+                build: buildExport,
+                save: saveExportFile,
+            });
+            if (result.status === "empty") {
                 toast.error("Det finns inget att exportera.");
                 return;
             }
-            const used = effectiveBundle(meetings.length, bundle);
-            const file = await buildExport(meetings, { format, content, bundle: used });
-            if (!(await saveExportFile(file, format, used))) return; // avbröt i dialogen
-            events.transcriptExported({ format, scope, count: meetings.length, bundle: used, content });
-            toast.success(meetings.length > 1 ? `${meetings.length} möten exporterade.` : "Exporterat.");
+            if (result.status === "cancelled") return; // avbröt i "Spara som"
+            if (result.status === "denied") {
+                const p = result.permit;
+                if (p.reason === "sign_in") {
+                    openUpsell('export', null);
+                } else if (p.reason === "quota_exhausted") {
+                    if (p.origin === "server") {
+                        if (p.quota) useEntitlementsStore.getState().applyQuotaExhausted({ kind: "export", used: p.quota.used, limit: p.quota.limit, resets_at: p.quota.resets_at ?? null });
+                        // Servern skickar själv quota_exhausted; fönstret ersätter felnotisen.
+                        captureEvent('error_shown', { surface: 'desktop', code: 'quota_exhausted', kind: 'export', action: 'export' });
+                    } else {
+                        captureExportExhausted(captureEvent, p.quota, "offline");
+                    }
+                    openUpsell('quota_export', p.quota);
+                } else if (p.reason === "offline_no_allowance") {
+                    showError('offline', "Ingen internetanslutning. Anslut och försök igen för att exportera.", { format, scope });
+                } else if (p.status === 401) {
+                    showError('unauthorized', "Sessionen har gått ut. Logga in igen för att exportera.", { format, scope });
+                } else {
+                    showError('export_failed', "Exporten kunde inte godkännas just nu. Försök igen om en stund.", { format, scope, status: p.status });
+                }
+                return;
+            }
+            events.transcriptExported(exportedEventProps(result, { format, scope, content }));
+            if (result.via !== "pro") captureEvent('entitlement_consumed', { kind: 'export', via: result.via, format });
+            toast.success(result.count > 1 ? `${result.count} möten exporterade.` : "Exporterat.");
             onClose();
         } catch (e) {
             console.error("[export]", e);
@@ -94,6 +143,8 @@ export function ExportDialog({ isOpen, onClose, scope, count, transcriptCount, a
     };
 
     return (
+        <>
+        {upsellModal}
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-ink/30 backdrop-blur-sm animate-in fade-in duration-200">
             <div
                 role="dialog"
@@ -112,12 +163,21 @@ export function ExportDialog({ isOpen, onClose, scope, count, transcriptCount, a
                 </div>
 
                 <div className="px-6 py-5 space-y-5">
+                    {counter && (
+                        <p
+                            className={`-mt-1 text-[11px] ${counter.remaining > 0 ? 'text-ink-muted' : 'text-amber-700'}`}
+                            title="Exporter som ingår i ditt gratiskonto den här månaden. Pro ger obegränsat."
+                        >
+                            {exportCounterText(counter)}
+                        </p>
+                    )}
                     <Choice
                         title="Format"
                         value={format}
                         onChange={setFormat}
                         options={[
                             { value: "docx", label: "Word (.docx)" },
+                            { value: "pdf", label: "PDF (.pdf)" },
                             { value: "md", label: "Markdown (.md)" },
                             { value: "txt", label: "Text (.txt)" },
                         ]}
@@ -164,5 +224,6 @@ export function ExportDialog({ isOpen, onClose, scope, count, transcriptCount, a
                 </div>
             </div>
         </div>
+        </>
     );
 }

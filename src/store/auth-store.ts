@@ -26,6 +26,11 @@ interface AuthState {
     isPro: () => boolean
 }
 
+/** Pro = aktiv prenumeration. Läses av isPro() och av planbytesbevakningen för räknarna. */
+export function isProStatus(stripeStatus: string | null | undefined): boolean {
+    return stripeStatus === "active"
+}
+
 // Upsell-suppression, INTE entitlement: loadPersisted wipear hela sessionen
 // (inkl. stripeStatus) när JWT:n gått ut, så en betalande kund offline ser ut
 // som Free. Markören överlever expiry och läses bara av upsell-ytor för att
@@ -113,5 +118,5 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         return s.token
     },
 
-    isPro: () => get().stripeStatus === "active",
+    isPro: () => isProStatus(get().stripeStatus),
 }))
