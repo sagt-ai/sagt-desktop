@@ -7,6 +7,7 @@ mod audio_meter;
 #[cfg(target_os = "macos")]
 mod mac_sysaudio;
 mod database;
+mod mcp;
 
 use database::{CleanupResult, DatabaseManager, Recording, Segment, StorageUsage};
 use tauri::Emitter;
@@ -318,6 +319,10 @@ fn cleanup_audio_storage(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // `sagt --mcp`: lokal MCP-server på stdin/stdout, före allt annat (se src/mcp/mod.rs).
+    if mcp::is_mcp_invocation(std::env::args()) {
+        std::process::exit(mcp::run_stdio());
+    }
     tauri::Builder::default()
         .setup(|app| {
             // 🔴 FÖRST av allt. Allt som skrivs före den här raden går till /dev/null
@@ -425,7 +430,10 @@ pub fn run() {
             get_recordings_dir,
             cleanup_audio_storage,
             audio::extract_meeting_channel,
-            audio::delete_diarize_temp
+            audio::delete_diarize_temp,
+            mcp::commands::mcp_write_session,
+            mcp::commands::mcp_clear_session,
+            mcp::commands::mcp_server_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -20,6 +20,12 @@ interface SettingsState {
     apiKey: string;
     inputDevice: string | null;
     transcriptionLanguage: TranscriptionLanguage;
+    // MCP: låt en AI-assistent på datorn läsa mötena. Av som standard; slås på av användaren
+    // under Inställningar efter samtyckestexten. Värdet är kontot som godkände, inte en flagga:
+    // inställningarna delas av alla som loggar in på datorn, och samtycket gäller bara det
+    // konto som gav det (mcpEnabledForUser i lib/mcp.ts).
+    mcpEnabledFor: string | null;
+    setMcpEnabledFor: (userId: string | null) => void;
     cloudSync: boolean;   // opt-in: persistera molnresultat i kontot (dashboard). Default false (privacy-first).
 
     // PRO live-molnströmning: hur kanalerna hanteras.
@@ -94,6 +100,8 @@ export const useSettingsStore = create<SettingsState>()(
             inputDevice: null,
             transcriptionLanguage: 'sv' as TranscriptionLanguage,
             cloudSync: false,
+            mcpEnabledFor: null,
+            setMcpEnabledFor: (mcpEnabledFor) => set({ mcpEnabledFor }),
             cloudDiarizationMode: 'structured' as 'structured' | 'merged',
             pauseBreakMs: 1500,
             micIsSingleSpeaker: true,

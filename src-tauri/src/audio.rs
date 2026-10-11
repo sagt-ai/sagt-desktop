@@ -80,6 +80,23 @@ const SILENCE_DURATION_MS: u128 = 800;
 const MIN_RECORDING_DURATION_MS: u128 = 1000;
 // 3.0s minimum keeps short sounds from becoming separate segments
 const MIN_SEGMENT_DURATION_MS: u128 = 3000;
+/// En inspelning kortare än så här, och utan text, sparas inte: ett oavsiktligt start och
+/// stopp ska inte bli en permanent rad på 00:00:00 i Inspelningar. Texten är vakten, inte
+/// längden: korta inspelningar med text sparas alltid.
+const MIN_SAVED_RECORDING_SEC: f64 = 3.0;
+
+/// Ska den stoppade inspelningen kasseras i stället för att sparas? Bara när längden är
+/// UPPMÄTT och kortare än gränsen, och inget transkriberades lokalt. `None` betyder att
+/// filens storlek inte gick att läsa: längden är då okänd, inte noll, och inspelningen
+/// sparas. `text_known` är falskt när "ingen text" inte går att avgöra, och då sparas
+/// inspelningen: i molnläget transkriberas inget här (texten från molnet syns inte för den
+/// här sidan), och har väntan på sista talbufferten gett upp kan ett segment fortfarande
+/// vara på väg.
+fn should_discard_recording(measured_duration_sec: Option<f64>, has_segments: bool, text_known: bool) -> bool {
+    text_known
+        && !has_segments
+        && matches!(measured_duration_sec, Some(d) if d < MIN_SAVED_RECORDING_SEC)
+}
 // 8s max chunk (was 15s) — shorter chunks → faster transcription → live text sooner
 const MAX_SEGMENT_DURATION_MS: u128 = 8000;
 // Molnchunks får vara längre: KB-Whisper är tränad på 30 s-fönster, så mer kontext per chunk
@@ -176,6 +193,9 @@ struct SessionState {
     start_time: Option<u128>, // SystemTime as millis
     pending_transcriptions: usize,
     duration_sec: f64,
+    /// Sant när `duration_sec` är uppmätt ur den färdiga filen vid stoppet. Utan mätning
+    /// står `duration_sec` på 0.0, och det får inte läsas som en inspelning på noll sekunder.
+    duration_measured: bool,
     /// Vad som hände med sessionens ljud på vägen till transkriptet. Följer med
     /// `history-updated` så att en inspelning utan text går att klassa: tyst ljud,
     /// tal som VAD aldrig utlöste på, whisper som svarade tomt eller whisper som föll.
@@ -290,6 +310,15 @@ struct SavedRecording<'a> {
     diagnostics: SessionDiagnostics,
 }
 
+/// `recording-discarded`-payloaden: en inspelning som var för kort och utan text, och som
+/// därför inte sparades. Appen behöver sökvägen för att känna igen inspelningen och längden
+/// för telemetrin.
+#[derive(Serialize, Clone)]
+struct DiscardedRecording<'a> {
+    file_path: &'a str,
+    duration_sec: f64,
+}
+
 /// Unikt id per processortråd, för `SessionState::open_speech`. Ett kanalnamn räcker
 /// inte: vid en omkoppling lever den gamla och den nya tråden för samma kanal samtidigt
 /// en kort stund.
@@ -391,6 +420,7 @@ impl AudioMonitor {
                 start_time: None,
                 pending_transcriptions: 0,
                 duration_sec: 0.0,
+                duration_measured: false,
                 diagnostics: SessionDiagnostics::default(),
                 open_speech: std::collections::BTreeSet::new(),
                 saved_generation: None,
@@ -1430,6 +1460,7 @@ impl AudioMonitor {
         session.start_time = Some(SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         session.pending_transcriptions = 0;
         session.duration_sec = 0.0;
+        session.duration_measured = false;
         // `open_speech` nollställs INTE: den speglar processortrådarnas buffertar, som
         // lever över sessionsgränsen, och varje tråd håller sin egen post i synk.
         session.diagnostics = SessionDiagnostics::default();
@@ -4007,10 +4038,14 @@ fn start_session_recorder(
             if let Ok(meta) = std::fs::metadata(&filename) {
                 // Header (44) + frames * 4 (stereo: 2 kanaler × 2 byte/sampel).
                 // OBS: /4.0 (inte /2.0) — annars halveras varaktigheten för stereo-WAV.
+                // En fil på högst 44 byte har inga ramar: längden är uppmätt till noll.
                 let bytes = meta.len();
-                if bytes > 44 {
-                    state.duration_sec = (bytes - 44) as f64 / 4.0 / SAMPLE_RATE as f64;
-                }
+                state.duration_sec = if bytes > 44 {
+                    (bytes - 44) as f64 / 4.0 / SAMPLE_RATE as f64
+                } else {
+                    0.0
+                };
+                state.duration_measured = true;
             }
         }
         
@@ -4040,6 +4075,27 @@ fn try_save_session(app: &AppHandle, session_state: &Arc<Mutex<SessionState>>) {
             let duration = state.duration_sec;
             let segments = state.segments.clone();
             let recording_path = wav_path.clone();
+
+            let measured = state.duration_measured.then_some(duration);
+            let text_known = !state.diagnostics.cloud_streaming && !state.diagnostics.flush_timed_out;
+            if should_discard_recording(measured, !segments.is_empty(), text_known) {
+                // Samma bokföring som en sparning, så att en sen transkribering inte
+                // försöker spara sessionen igen.
+                state.wav_path = None;
+                state.saved_generation = Some(state.wav_generation);
+                drop(state);
+                // Filen tas bort här: gallringen av ljud utgår från raderna i databasen och
+                // skulle aldrig hitta en fil utan rad.
+                if let Err(e) = std::fs::remove_file(&recording_path) {
+                    eprintln!("AUDIO: kunde inte ta bort den kasserade inspelningen: {}", e);
+                }
+                println!("DEBUG: Recording discarded ({:.2} s, no text) — not saved.", duration);
+                let _ = app.emit(
+                    "recording-discarded",
+                    DiscardedRecording { file_path: &recording_path, duration_sec: duration },
+                );
+                return;
+            }
             let mut diagnostics = state.diagnostics.clone();
             diagnostics.segments_saved = segments.len() as u32;
             diagnostics.word_count = segments
@@ -4253,11 +4309,44 @@ pub async fn delete_diarize_temp(app: AppHandle, path: String) -> Result<(), Str
 mod tests {
     use super::{
         avkoda_entiteter, generation_is_current, heartbeat_interval, loop_stalled,
-        sys_capture_was_stable,
+        should_discard_recording, sys_capture_was_stable,
         sys_rebuild_allowed, sys_retry_backoff, LOOP_STALL_AFTER, LOOP_STALL_CEILING,
         SYS_STABLE_AFTER,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn kort_inspelning_utan_text_kasseras() {
+        assert!(should_discard_recording(Some(0.0), false, true));
+        assert!(should_discard_recording(Some(2.9), false, true));
+    }
+
+    #[test]
+    fn inspelning_med_text_sparas_oavsett_langd() {
+        assert!(!should_discard_recording(Some(0.5), true, true));
+        assert!(!should_discard_recording(Some(2.9), true, true));
+    }
+
+    #[test]
+    fn inspelning_vid_och_over_gransen_sparas() {
+        assert!(!should_discard_recording(Some(3.0), false, true));
+        assert!(!should_discard_recording(Some(3600.0), false, true));
+    }
+
+    #[test]
+    fn okand_langd_ar_inte_noll() {
+        // Gick filens storlek inte att läsa står duration_sec på 0.0. Det får inte
+        // kassera en inspelning som kan vara ett helt möte.
+        assert!(!should_discard_recording(None, false, true));
+    }
+
+    #[test]
+    fn okand_text_kasseras_aldrig() {
+        // Molnläget, eller en väntan på sista talbufferten som gav upp: en kort
+        // inspelning kan ha text som inte syns här, och den får inte försvinna.
+        assert!(!should_discard_recording(Some(0.5), false, false));
+        assert!(!should_discard_recording(Some(2.9), false, false));
+    }
 
     #[test]
     fn sparandet_vantar_pa_en_oppen_talbuffert() {

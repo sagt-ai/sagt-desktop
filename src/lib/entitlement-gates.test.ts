@@ -30,6 +30,11 @@ const ALLOWED: Record<string, number> = {
     "lib/entitlements.ts": 2,
     // Exportkvoten: Pro anropar aldrig servern och exporterar offline utan förskott.
     "lib/export/quota.ts": 2,
+    // MCP: planen står i sessionsfilen och i eventet, och räknaren och uppgraderingsknappen
+    // döljs för Pro. Ingen av dem stänger ute ett gratiskonto; kvoten räknas av servern.
+    "lib/mcp.ts": 2,
+    "store/mcp-sync.ts": 2,
+    "components/settings/mcp-section.tsx": 6,
     "lib/upsell-state.ts": 10,
     // Sessionen och prenumerationens status.
     "store/auth-store.ts": 7,

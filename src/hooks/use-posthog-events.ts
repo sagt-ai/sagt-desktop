@@ -1,6 +1,7 @@
 import posthog from 'posthog-js'
 import { toast } from 'sonner'
 import type { UpsellSource, UpsellView } from '@/lib/upsell-state'
+import type { BillingInterval } from '@/lib/system-config'
 import { markErrorSeen } from '@/lib/feedback-runtime'
 import { withoutErrorCode } from '@/lib/error-slug'
 import type { ExportBundle, ExportContent, ExportFormat, ExportScope } from '@/lib/export/types'
@@ -34,6 +35,10 @@ export function usePostHogEvents() {
         // plan: 'pro' | 'free'. Visar hur många Pro som väljer molnmodellen.
         recordingStarted: (mode: 'local' | 'cloud', plan: 'pro' | 'free') =>
             captureEvent('recording_started', { mode, plan }),
+
+        // MCP slogs på eller av under Inställningar.
+        mcpToggled: (enabled: boolean, plan: 'free' | 'pro') =>
+            captureEvent('mcp_toggled', { enabled, plan }),
 
         // Molnmodellen valdes som standard. source: var valet gjordes
         // ('mode_pill' | 'settings' | 'first_start').
@@ -93,8 +98,9 @@ export function usePostHogEvents() {
         upgradeClicked: (source: UpsellSource, signedIn: boolean) =>
             captureEvent('upgrade_clicked', { source, signed_in: signedIn }),
 
-        checkoutOpened: (source: UpsellSource) =>
-            captureEvent('checkout_opened', { source }),
+        // interval: "month" | "year" — andelen årsköp är hela mätningen av årsvalet.
+        checkoutOpened: (source: UpsellSource, interval: BillingInterval = 'month') =>
+            captureEvent('checkout_opened', { source, interval }),
 
         // view: vilket läge modalen stod i när den stängdes (UpsellView) — säljsidan,
         // eller väntan på Stripe-bekräftelse efter att betalningen öppnats.

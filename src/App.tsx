@@ -24,6 +24,7 @@ import { AudioWarningBanner } from "@/components/lifecycle/audio-warning-banner"
 import { FeedbackCard } from "@/components/feedback/feedback-card";
 import { markErrorSeen, onAppStarted } from "@/lib/feedback-runtime";
 import { startEntitlementsSync } from "@/store/entitlements-store";
+import { startMcpSessionSync } from "@/store/mcp-sync";
 import { CloudChoiceDialog } from "@/components/dashboard/cloud-choice-dialog";
 
 function App() {
@@ -42,6 +43,8 @@ function App() {
   // Gratiskvoternas räknare följer sessionen: hämtas vid inloggning och vid varje
   // förnyelse, töms vid utloggning.
   useEffect(() => startEntitlementsSync(), []);
+  // MCP: sessionsfilen följer inloggningen och inställningen (lib/mcp.ts).
+  useEffect(() => startMcpSessionSync(), []);
 
   // Lokal modell är standard för alla, även Pro. Molnmodellen är ett val (lägesväljaren,
   // Inställningar, eller engångsfrågan i CloudChoiceDialog efter uppdateringen).

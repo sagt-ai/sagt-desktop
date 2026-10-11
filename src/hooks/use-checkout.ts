@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core"
 import { useAuthStore } from "@/store/auth-store"
 import { showError } from "@/hooks/use-posthog-events"
 import { interpretCheckoutResponse } from "@/lib/checkout-response"
+import type { BillingInterval } from "@/lib/system-config"
 
 const _raw = (import.meta.env.VITE_API_URL || "https://api.sagt.ai/api/v1").replace(/\/$/, "")
 const BASE_URL = _raw.endsWith("/api/v1") ? _raw : `${_raw}/api/v1`
@@ -15,6 +16,7 @@ const BASE_URL = _raw.endsWith("/api/v1") ? _raw : `${_raw}/api/v1`
  * sätter kopplingen till kontot innan betalningen i stället för efter.
  *
  * Returnerar true när webbläsaren öppnades — upsell-modalen startar pollingen först då.
+ * `interval` skickas alltid uttryckligen; servern tolkar en tom body som månad.
  */
 export function useCheckout() {
     const [isOpening, setIsOpening] = useState(false)
@@ -22,7 +24,7 @@ export function useCheckout() {
     // inaktiverar knappen, och varje anrop skapar en ny session hos Stripe.
     const inFlight = useRef(false)
 
-    const openCheckout = useCallback(async (): Promise<boolean> => {
+    const openCheckout = useCallback(async (interval: BillingInterval = "month"): Promise<boolean> => {
         if (inFlight.current) return false
 
         const token = useAuthStore.getState().getToken()
@@ -42,7 +44,8 @@ export function useCheckout() {
             try {
                 res = await fetch(`${BASE_URL}/billing/checkout-session`, {
                     method: "POST",
-                    headers: { Authorization: `Bearer ${token}` },
+                    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+                    body: JSON.stringify({ interval }),
                 })
             } catch {
                 showError("offline", "Kunde inte nå servern. Kontrollera din anslutning och försök igen.", { action: "checkout" })

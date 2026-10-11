@@ -14,7 +14,7 @@ name = "sagt"
 # strängen. Att hålla fältet utanför synken gjorde alltså inte problemet ofarligt — det
 # gjorde det osynligt. Rätt svar på en fil som måste vara i synk är att lägga den under
 # grinden, vilket den nu är.
-version = "0.11.0"
+version = "0.12.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -48,7 +48,17 @@ tauri-plugin-process = "2"
 # match tauri 2.10 and the JS packages; the next patch releases require tauri 2.11.
 tauri-plugin-dialog = "=2.7.0"
 tauri-plugin-fs = "=2.5.0"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt", "io-std", "time"] }
+# MCP-läget (`--mcp`, src/mcp/): en lokal stdio-server som en AI-assistent på datorn
+# startar. rmcp är det officiella Rust-SDK:t och sköter versionsförhandlingen
+# (2024-11-05 … 2026-07-28). reqwest och rustls finns redan i trädet via
+# tauri-plugin-updater med samma funktioner; MCP-läget installerar själv rustls
+# kryptoleverantör eftersom uppdateraren inte startar där.
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_rusqlite = "0.35"
 chrono = { version = "0.4", features = ["serde"] }

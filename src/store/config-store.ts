@@ -30,11 +30,19 @@ interface ConfigStore {
     // mint-anropet i use-live-diarize. Samma default och samma skäl som diarizeEnabled:
     // false tills ett svar sagt exakt true.
     liveDiarizeEnabled: boolean
+    // /system/config → pro_yearly_available, tolkat av proYearlyAvailable. Visar valet
+    // Månad/År i uppgraderingsfönstret. false tills ett svar sagt exakt true.
+    proYearlyAvailable: boolean
+    // /system/config → mcp_available, tolkat av mcpAvailable. Visar MCP-avsnittet i
+    // Inställningar. false tills ett svar sagt exakt true.
+    mcpAvailable: boolean
     setMotd: (m: string | null) => void
     setLatestVersion: (v: string) => void
     setDownloadUrl: (url: string) => void
     setDiarizeEnabled: (enabled: boolean) => void
     setLiveDiarizeEnabled: (enabled: boolean) => void
+    setProYearlyAvailable: (available: boolean) => void
+    setMcpAvailable: (available: boolean) => void
 }
 
 export const useConfigStore = create<ConfigStore>((set) => ({
@@ -44,9 +52,13 @@ export const useConfigStore = create<ConfigStore>((set) => ({
     downloadUrl: "https://sagt.ai/downloads",
     diarizeEnabled: false,
     liveDiarizeEnabled: false,
+    proYearlyAvailable: false,
+    mcpAvailable: false,
     setMotd: (m) => set({ motd: m }),
     setLatestVersion: (v) => set({ latestVersion: v, updateAvailable: semverGt(v, CURRENT_VERSION) }),
     setDownloadUrl: (url) => set({ downloadUrl: url }),
     setDiarizeEnabled: (enabled) => set({ diarizeEnabled: enabled }),
     setLiveDiarizeEnabled: (enabled) => set({ liveDiarizeEnabled: enabled }),
+    setProYearlyAvailable: (available) => set({ proYearlyAvailable: available }),
+    setMcpAvailable: (available) => set({ mcpAvailable: available }),
 }))

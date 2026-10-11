@@ -14,6 +14,7 @@ import { useConfigStore } from "@/store/config-store";
 import { useCheckout } from "@/hooks/use-checkout";
 import { usePostHogEvents } from "@/hooks/use-posthog-events";
 import { toast } from "sonner";
+import { McpSection } from "@/components/settings/mcp-section";
 
 
 const VAD_PRESETS = [
@@ -729,6 +730,8 @@ export function SettingsPage() {
                         </div>
                     </div>
                 </section>
+
+                <McpSection />
 
                 <section className="space-y-3">
                     <div className="flex items-center gap-2">

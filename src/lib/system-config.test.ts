@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { diarizeAvailable, liveDiarizeAvailable, type SystemConfig } from "./system-config";
+import { checkoutInterval, diarizeAvailable, liveDiarizeAvailable, mcpAvailable, proYearlyAvailable, type SystemConfig } from "./system-config";
 
 // Samma fall som webbens frontend/lib/system-config.test.ts: talarsepareringen gäller bara
 // när backend uttryckligen svarar true.
@@ -66,3 +66,49 @@ describe("liveDiarizeAvailable", () => {
         expect(diarizeAvailable({ live_diarize_enabled: true })).toBe(false);
     });
 });
+
+// Årsvalet i uppgraderingsfönstret. Ett falskt true visar ett val som kassan svarar 503 på.
+describe("proYearlyAvailable", () => {
+    it("på när backend svarar true", () => {
+        expect(proYearlyAvailable({ pro_yearly_available: true })).toBe(true);
+    });
+
+    it("av när backend svarar false, saknar fältet eller inte svarat", () => {
+        expect(proYearlyAvailable({ pro_yearly_available: false })).toBe(false);
+        expect(proYearlyAvailable({})).toBe(false);
+        expect(proYearlyAvailable(undefined)).toBe(false);
+        expect(proYearlyAvailable(null)).toBe(false);
+    });
+
+    it("av för värden som bara är sanna i JavaScript", () => {
+        for (const value of ["false", "true", 1]) {
+            const config = { pro_yearly_available: value } as unknown as SystemConfig;
+            expect(proYearlyAvailable(config), JSON.stringify(value)).toBe(false);
+        }
+    });
+});
+
+describe("checkoutInterval", () => {
+    it("år bara när året är valt och finns", () => {
+        expect(checkoutInterval("year", true)).toBe("year");
+    });
+
+    it("månad när årspriset inte finns, även om året valts", () => {
+        // Valet gjordes, sedan sa en ny config nej: hellre rubrikpriset än ett 503.
+        expect(checkoutInterval("year", false)).toBe("month");
+    });
+
+    it("månad när månad är vald", () => {
+        expect(checkoutInterval("month", true)).toBe("month");
+        expect(checkoutInterval("month", false)).toBe("month");
+    });
+});
+
+describe("mcpAvailable", () => {
+    it("bara ett uttryckligt true visar MCP-avsnittet", () => {
+        expect(mcpAvailable({ mcp_available: true })).toBe(true)
+        for (const c of [null, undefined, {}, { mcp_available: false }, { mcp_available: "true" as unknown as boolean }, { mcp_available: 1 as unknown as boolean }]) {
+            expect(mcpAvailable(c)).toBe(false)
+        }
+    })
+})

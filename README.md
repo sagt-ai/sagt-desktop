@@ -2,7 +2,7 @@
 
 **Free, private meeting transcription for Swedish. Runs on your own machine.**
 
-[Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) (173 MB) · [Download for Mac →](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (180 MB)
+[Download for Windows →](https://downloads.sagt.ai/Sagt.ai-setup.exe) (174 MB) · [Download for Mac →](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (181 MB)
 
 [sagt.ai](https://sagt.ai) · Windows 10/11 · macOS 14.2+ (Apple Silicon) · MIT licensed
 
@@ -32,6 +32,7 @@ It listens to **your computer's audio** rather than integrating with a meeting p
 - **You and the meeting on separate channels** — your microphone and the computer's audio are transcribed apart, so the transcript shows what you said and what was said in the meeting
 - **AI meeting minutes** — summaries, decisions and action items via Gemma 4 31B on Berget.ai's Swedish servers: 3 per month with a free account, unlimited on Pro. Never outside Europe
 - **Export to Word, Markdown, text and PDF** — 10 exports per month with a free account, unlimited on Pro
+- **MCP (optional, off by default)** — let the AI assistant you choose, such as Claude Desktop or Claude Code, read your meetings. Sagt sends nothing on its own; your assistant fetches the text, and that text then goes to the assistant's provider under their terms. Audio is never reachable through MCP. 10 tool calls per day with a free account, unlimited on Pro
 
 ## Free vs Pro
 
@@ -46,11 +47,12 @@ It listens to **your computer's audio** rather than integrating with a meeting p
 | Key decisions & action items | 3 per month (free account) | ✅ Unlimited |
 | Export (Word, Markdown, text, PDF) | 10 per month (free account) | ✅ Unlimited |
 | You and the meeting on separate channels | ✅ | ✅ |
+| MCP: your AI assistant reads your meetings | 10 tool calls a day (free account) | ✅ Unlimited |
 | KB-Whisper Large (higher accuracy, cloud) | — | ✅ When you choose it |
 | Cloud transcription quota | n/a | 1,500 min/month |
-| Data ever leaves the EU | ❌ Never | ❌ Never |
+| Meeting audio and transcripts leave the EU through Sagt | ❌ Never | ❌ Never |
 
-Local transcription is unlimited on both tiers — the quota applies only to cloud processing.
+Local transcription is unlimited on both tiers — the quota applies only to cloud processing. If you connect an AI assistant via MCP, its provider may be outside the EU.
 
 ## Why a desktop app and not a website
 
@@ -85,7 +87,7 @@ You can also watch the network yourself while a local transcription runs: Task M
 
 ## Privacy — what leaves your machine
 
-**In local mode, your audio and transcripts never leave your machine.** Recordings are transcribed on your own CPU by a bundled KB-Whisper model — nothing is uploaded, and there is no cloud round-trip. That is the promise that matters, and you can verify it yourself in Resource Monitor on Windows, Activity Monitor on a Mac, or any network monitoring tool: no audio ever crosses the wire. The audio pipeline source is [`src-tauri/src/audio.rs`](src-tauri/src/audio.rs).
+**In local mode, your audio never leaves your machine, and your transcripts stay on it unless you turn on MCP and let an assistant of your choice read them.** Recordings are transcribed on your own CPU by a bundled KB-Whisper model — nothing is uploaded, and there is no cloud round-trip. That is the promise that matters, and you can verify it yourself in Resource Monitor on Windows, Activity Monitor on a Mac, or any network monitoring tool: no audio ever crosses the wire. The audio pipeline source is [`src-tauri/src/audio.rs`](src-tauri/src/audio.rs).
 
 The app is **not** network-silent, though, and we would rather say so plainly than have you discover it in Resource Monitor. It also:
 
@@ -153,13 +155,13 @@ Yes. Word, Markdown, plain text and PDF: one meeting from the transcript view, o
 
 ### Windows
 
-1. [Download the signed installer](https://downloads.sagt.ai/Sagt.ai-setup.exe) (173 MB)
+1. [Download the signed installer](https://downloads.sagt.ai/Sagt.ai-setup.exe) (174 MB)
 2. Run `Sagt.ai-setup.exe` — signed with Azure Trusted Signing, so Windows shows a verified publisher: **EDI Labs AB**. No administrator rights needed
 3. Launch Sagt.ai and start recording — no account, no email address
 
 ### macOS
 
-1. [Download the disk image](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (179 MB)
+1. [Download the disk image](https://downloads.sagt.ai/Sagt.ai-arm64.dmg) (181 MB)
 2. Open it and drag Sagt.ai to Applications. The app is signed with an Apple Developer ID and notarised by Apple, so it opens without a security warning — including on a machine that is offline
 3. On first launch macOS asks for microphone access, and for system audio the first time you record a meeting. Both are needed for the other participants to be captured
 

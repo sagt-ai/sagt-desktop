@@ -11,7 +11,7 @@ import type { UpsellSource } from "./upsell-state";
 export type SignInIntent = "free" | "upgrade";
 
 /** Var inloggningen startades: fönstrets källa, eller "Logga in"-knappen i panelen. */
-export type SignInSource = UpsellSource | "sign_in_button";
+export type SignInSource = UpsellSource | "sign_in_button" | "mcp_settings";
 
 /** Avsikten hör till inloggningen som just lyckades; en äldre hör inte dit. */
 export const SIGN_IN_INTENT_TTL_MS = 60_000;

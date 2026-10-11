@@ -276,3 +276,55 @@ describe("markören för en pågående inspelning", () => {
         expect(capture).not.toHaveBeenCalled();
     });
 });
+
+describe("kasserad inspelning (för kort och utan text)", () => {
+    it("recording_discarded_short med längden, och inget recording_unsaved vid nästa start", () => {
+        const m = run("a");
+        const file = begin(m);
+        clock += 1_000;
+        m.stopped();
+        m.discarded(file, 1.234);
+        run("b").reportLeftover();
+
+        expect(capture).toHaveBeenCalledTimes(1);
+        expect(capture).toHaveBeenCalledWith("recording_discarded_short", { duration_seconds: 1.2, cancelled: false });
+        expect(storage.data.has(MARKER_KEY)).toBe(false);
+    });
+
+    it("sen kassering av en äldre inspelning tar inte bort den nyas markör", () => {
+        const m = run("a");
+        const fileA = begin(m);
+        clock += 1_000;
+        m.stopped();
+        clock += 4_000; // B startas innan A hunnit kasseras
+        m.started();
+        clock += 60_000;
+        m.stopped();
+        // Starten av B rapporterade A:s kvarlämnade markör; det är befintligt beteende.
+        capture.mockClear();
+        m.discarded(fileA, 1.0);
+
+        expect(capture).not.toHaveBeenCalled();
+        expect(storage.data.has(MARKER_KEY)).toBe(true);
+    });
+
+    it("okänt filnamn: markören ligger kvar och inget event skickas", () => {
+        const m = run("a");
+        begin(m);
+        m.stopped();
+        m.discarded("C:\\annat\\fil.wav", 1.0);
+
+        expect(capture).not.toHaveBeenCalled();
+        expect(storage.data.has(MARKER_KEY)).toBe(true);
+    });
+
+    it("markör som inte går att ta bort: inget event, så att inspelningen inte räknas två gånger", () => {
+        const m = run("a");
+        const file = begin(m);
+        m.stopped();
+        storage.removeItem = () => { throw new Error("blocked"); };
+        m.discarded(file, 1.0);
+
+        expect(capture).not.toHaveBeenCalled();
+    });
+});

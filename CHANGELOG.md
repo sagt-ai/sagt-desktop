@@ -7,6 +7,25 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.12.0 — 2026-10-11
+
+### Added
+
+- **Let your AI assistant read your meetings (MCP).** Under Settings you can let an
+  AI assistant on this computer, such as Claude Desktop, Claude Code or Codex in the
+  ChatGPT app, search and read your transcripts and meeting minutes. It is off until
+  you turn it on, read-only, and never reaches your audio. When it is on, the text your
+  assistant reads goes to that assistant's provider. Requires an account: 10 tool calls
+  per day with a free account, unlimited on Pro.
+- **A warning when your microphone hears nothing.** If the microphone picks up no
+  sound after the first 30 seconds of a recording, the app tells you, so you can check
+  which microphone is selected.
+
+### Changed
+
+- **Very short recordings without text are no longer saved.** A recording shorter
+  than 3 seconds that produced no text is discarded instead of filling your list.
+
 ## 0.11.0 — 2026-10-08
 
 ### Added

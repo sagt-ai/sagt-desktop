@@ -20,6 +20,8 @@ import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-e
 import { resetCloudStream } from "@/hooks/use-cloud-stream";
 import { transcriptOutcomeProps, type SessionDiagnostics } from "@/lib/session-diagnostics";
 import { recordingMarker, HEARTBEAT_MS } from "@/lib/recording-marker";
+import { MicSilenceDetector, MIC_SILENT_TEXT } from "@/lib/mic-silence";
+import { useAmplitudeStore } from "@/store/amplitude-store";
 
 interface Recording {
     id: number | null;
@@ -86,6 +88,31 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
         const s = seconds % 60;
         return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
     };
+
+    // Mikrofonen under inspelningen: en varning om den inte tar upp något ljud alls, och
+    // nivåerna per kanal till telemetrin vid stopp (lib/mic-silence.ts). Styrs av
+    // isRecording, så att Stopp och Avbryt avslutar mätningen på samma sätt.
+    useEffect(() => {
+        if (!isRecording) return;
+        const detector = new MicSilenceDetector(Date.now());
+        const mode = useSyncStore.getState().cloudStreamingActive ? 'cloud' : 'local';
+        const unsubscribe = useAmplitudeStore.subscribe((s) => {
+            const event = detector.sample(s.mic, s.system, Date.now());
+            if (event === "warn") {
+                captureEvent('mic_silent_warning', { mic_max: detector.mic.max, mode });
+                toast.warning(MIC_SILENT_TEXT, { duration: 10000 });
+                // En varning om mötesljudet som redan visas skrivs inte över.
+                if (!useSyncStore.getState().audioWarning) useSyncStore.getState().setAudioWarning(MIC_SILENT_TEXT);
+            } else if (event === "recovered") {
+                captureEvent('mic_silent_recovered', { mode });
+                if (useSyncStore.getState().audioWarning === MIC_SILENT_TEXT) useSyncStore.getState().setAudioWarning(null);
+            }
+        });
+        return () => {
+            unsubscribe();
+            captureEvent('recording_levels', { ...detector.summary(Date.now()), mode });
+        };
+    }, [isRecording]);
 
     // Hjärtslag i markören för den pågående inspelningen, så att längden på en
     // inspelning som aldrig sparas går att räkna ut vid nästa start.
@@ -257,6 +284,21 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
 
         return () => { unlistenPromise.then(f => f()); };
     }, [setSession, setUploadStatus, setActiveJob, setUploadProgress, setErrorMessage, getToken, isPro]);
+
+    // En inspelning som var kortare än tre sekunder och saknade text sparas inte (till
+    // exempel ett start och stopp av misstag). Ingen rad skapas, så history-updated kommer
+    // aldrig: här avslutas samma tillstånd som den annars hade avslutat.
+    useEffect(() => {
+        const unlistenPromise = listen<{ file_path: string; duration_sec: number }>("recording-discarded", (event) => {
+            recordingMarker.discarded(event.payload.file_path, event.payload.duration_sec);
+            // En ny inspelning som redan startat ska inte få sitt tillstånd nollställt.
+            if (useSyncStore.getState().isRecording) return;
+            useTranscriptionStore.getState().setIsProcessing(false);
+            setUploadStatus('idle');
+            toast.info("Inspelningen var kortare än tre sekunder och sparades inte.");
+        });
+        return () => { unlistenPromise.then(f => f()); };
+    }, [setUploadStatus]);
 
     // Ett lokalt segment som blev klart efter att inspelningen sparats. Texten syntes
     // live men finns inte i den sparade inspelningen. Ska vara noll.

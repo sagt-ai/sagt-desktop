@@ -12,6 +12,11 @@ export interface SystemConfig {
     // svarar POST /live-diarize 503 vid varje inspelningsstart, och 503:an räknas som ett
     // serverfel. Klienten läser fältet för att inte fråga alls.
     live_diarize_enabled?: boolean
+    // Erbjuder servern årsbetalning? Utan det svarar kassan 503 på `interval: "year"`.
+    pro_yearly_available?: boolean
+    // MCP (lokal server för en AI-assistent på datorn). Styr om avsnittet i Inställningar
+    // visas. En MCP-server som redan slagits på fortsätter fungera oavsett fältet.
+    mcp_available?: boolean
 }
 
 /**
@@ -34,4 +39,29 @@ export function diarizeAvailable(config: SystemConfig | null | undefined): boole
  */
 export function liveDiarizeAvailable(config: SystemConfig | null | undefined): boolean {
     return config?.live_diarize_enabled === true
+}
+
+/**
+ * Ska uppgraderingsfönstret erbjuda årsbetalning? Samma strikta regel som ovan: bara ett
+ * uttryckligt `true`. Ett dolt årsval kostar en köpare som fick betala månadsvis. Ett
+ * visat val som servern svarar 503 på är ett köp som inte blir av.
+ */
+export function proYearlyAvailable(config: SystemConfig | null | undefined): boolean {
+    return config?.pro_yearly_available === true
+}
+
+export type BillingInterval = "month" | "year"
+
+/**
+ * Intervallet som skickas till kassan. Ett årsval som valdes medan årspriset fanns, men
+ * som skickas efter att configen sagt nej (en inloggning emellan, en ny hämtning),
+ * blir månad: hellre det pris som står i rubriken än ett 503.
+ */
+export function checkoutInterval(chosen: BillingInterval, yearlyAvailable: boolean): BillingInterval {
+    return chosen === "year" && yearlyAvailable ? "year" : "month"
+}
+
+/** Ska MCP-avsnittet visas? Samma strikta regel: bara ett uttryckligt `true`. */
+export function mcpAvailable(config: SystemConfig | null | undefined): boolean {
+    return config?.mcp_available === true
 }

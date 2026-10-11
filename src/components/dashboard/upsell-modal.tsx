@@ -8,6 +8,8 @@ import { freeChoice, PRO_FOOTNOTE, PRO_ROWS, quotaLine, upsellHeading, selectUps
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { onUpsellDismissed } from "@/lib/feedback-runtime";
+import { useConfigStore } from "@/store/config-store";
+import { checkoutInterval, type BillingInterval } from "@/lib/system-config";
 
 // Båda valen i fönstret har samma stil: gratiskontot och Pro ska vara lika tydliga.
 const PRIMARY_BUTTON = "w-full py-2.5 px-4 rounded-lg bg-brand border border-brand text-sm font-semibold text-paper hover:bg-brand-deep hover:border-brand-deep shadow-sm transition-colors disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2";
@@ -43,6 +45,10 @@ export function UpsellModal({ isOpen, onClose, source, quota = null }: UpsellMod
     const sourceRef = useRef(source);
     sourceRef.current = source;
     const [isChecking, setIsChecking] = useState(false);
+    // Månad eller år. Valet visas bara när servern erbjuder årsbetalning. Rubrikpriset är
+    // 199 kr/mån; året är ett alternativ, inte ett "från 166 kr".
+    const yearlyAvailable = useConfigStore((s) => s.proYearlyAvailable);
+    const [billingInterval, setBillingInterval] = useState<BillingInterval>("month");
 
     // Överlever pollingens 5-minuterstimeout, till skillnad från isWaiting.
     //
@@ -67,8 +73,9 @@ export function UpsellModal({ isOpen, onClose, source, quota = null }: UpsellMod
     // Öppna Stripe-checkout. Backend kräver inloggning och knyter köpet till kontot;
     // fel visas av useCheckout, så här återstår bara att starta väntan när det lyckats.
     const openCheckout = async () => {
-        if (!(await openCheckoutInBrowser())) return;
-        events.checkoutOpened(source);
+        const interval = checkoutInterval(billingInterval, yearlyAvailable);
+        if (!(await openCheckoutInBrowser(interval))) return;
+        events.checkoutOpened(source, interval);
         celebratedRef.current = false; // nytt försök ska kunna firas igen
         setPaymentAttempted(true);
         startPolling();
@@ -390,12 +397,30 @@ export function UpsellModal({ isOpen, onClose, source, quota = null }: UpsellMod
                                 Sagt Pro: vår största svenska modell och obegränsade mötesprotokoll.
                             </p>
 
+                            {yearlyAvailable && (
+                                <div role="radiogroup" aria-label="Betalningsperiod" className="grid grid-cols-2 gap-1 p-1 mb-3 bg-paper-dim border border-line rounded-lg">
+                                    {([["month", "Månadsvis"], ["year", "Årsvis, spara 16 %"]] as const).map(([value, label]) => (
+                                        <button
+                                            key={value}
+                                            role="radio"
+                                            aria-checked={billingInterval === value}
+                                            onClick={() => setBillingInterval(value)}
+                                            className={`py-1.5 rounded-md text-xs font-medium transition-colors ${billingInterval === value ? "bg-paper text-ink shadow-sm" : "text-ink-muted hover:text-ink-soft"}`}
+                                        >
+                                            {label}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+
                             <div className="bg-paper-dim border border-line rounded-xl p-5 mb-5">
                                 <div className="flex items-center justify-between font-semibold text-ink mb-4 pb-4 border-b border-line">
                                     <span>Sagt.ai Pro</span>
                                     {/* Samma formulering som prissidan på sagt.ai. Här stod "ex. moms" fram till
                                         2026-09-14, i strid med sajten. */}
-                                    <span className="text-brand">199 kr<span className="text-xs text-ink-muted font-normal"> / mån inkl. moms</span></span>
+                                    {checkoutInterval(billingInterval, yearlyAvailable) === "year"
+                                        ? <span className="text-brand">1 995 kr<span className="text-xs text-ink-muted font-normal"> / år inkl. moms</span></span>
+                                        : <span className="text-brand">199 kr<span className="text-xs text-ink-muted font-normal"> / mån inkl. moms</span></span>}
                                 </div>
                                 <ul className="space-y-3">
                                     {PRO_ROWS.map((row, i) => (

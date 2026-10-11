@@ -60,8 +60,10 @@ export function parseEntitlements(data: unknown): EntitlementsResponse {
  *  - `export`: filexport (alla format; flera möten i en zip räknas som en). Gratiskonto
  *    med kvot, Pro obegränsat.
  *  - `template`: protokollmallar utöver standardmallen. Bara Pro.
+ *  - `mcp_tool_call`: verktygsanrop från en AI-assistent via MCP, per dygn. Räknas av
+ *    MCP-processen, inte i appen; appen visar bara räknaren.
  */
-export type EntitlementKind = "protocol" | "export" | "template";
+export type EntitlementKind = "protocol" | "export" | "template" | "mcp_tool_call";
 
 /** Utfallet av en grind: släpp igenom, be om inloggning, eller visa kvotraden. */
 export type EntitlementGate = "allowed" | "sign_in" | "quota_exhausted";

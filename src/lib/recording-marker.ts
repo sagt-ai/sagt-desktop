@@ -6,6 +6,9 @@
 // den kvar när appen startar nästa gång stängdes eller kraschade appen innan
 // inspelningen sparades, och då skickas `recording_unsaved` med längden.
 //
+// En inspelning som var för kort och utan text sparas inte. Då skickas
+// `recording_discarded_short` och markören tas bort, så att den inte räknas som osparad.
+//
 // Avbryt skickar `recording_cancelled` direkt och märker markören som avbruten. En
 // avbruten markör tas bort i tysthet vid nästa start. Sparas inspelningen ändå efter
 // Avbryt, vilket kan hända om allt redan var transkriberat, skickas
@@ -170,6 +173,25 @@ export function createRecordingMarker(deps: MarkerDeps) {
             if (m.cancelled) {
                 deps.capture("recording_saved_after_cancel", { duration_seconds: markerDurationSeconds(m) })
             }
+        },
+
+        /**
+         * När en inspelning kasserades för att den var för kort och saknade text. Samma
+         * matchning på filnamnet som `saved`: ett kasserat felklick som rapporteras först
+         * efter att nästa inspelning startat får inte ta bort den nyas markör. Skickar
+         * `recording_discarded_short` med appens uppmätta längd, och bara när markören
+         * gick att ta bort, så att samma inspelning inte också räknas som osparad.
+         */
+        discarded(filePath: string, durationSec: number): void {
+            const m = read()
+            if (!m) return
+            const fileStart = startTimeFromPath(filePath)
+            if (fileStart === null || Math.abs(fileStart - m.started_at) > SAME_RECORDING_MS) return
+            if (!remove()) return
+            deps.capture("recording_discarded_short", {
+                duration_seconds: Math.round(durationSec * 10) / 10,
+                cancelled: m.cancelled === true,
+            })
         },
 
         /**
