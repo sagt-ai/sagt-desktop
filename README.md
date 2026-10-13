@@ -12,7 +12,9 @@ Sagt.ai transcribes meetings in Swedish using **KB-Whisper**, the speech model t
 
 It listens to **your computer's audio** rather than integrating with a meeting platform, so it works with Teams, Zoom, Skype, Google Meet and in-person conversations alike — and no bot ever appears in the participant list.
 
-> **Early access:** This is a public beta. Expect rough edges. If something breaks, [open an issue](../../issues) — we read every one.
+> **På svenska:** Sagt.ai är en gratis app för Windows och Mac (Apple Silicon) som transkriberar svenska möten i Teams, Zoom och Google Meet, och samtal i rummet, direkt på datorn och utan bot i mötet. Den använder KB-Whisper från Kungliga biblioteket, fungerar utan internet och kräver inget konto för att spela in. [Ladda ner på sagt.ai](https://sagt.ai/sv/downloads) · [Guide: transkribera Teams- och Zoom-möten](https://sagt.ai/sv/resurser/transkribera-teams-och-zoom-moten)
+
+> **Found a bug?** [Open an issue](../../issues) — we read every one.
 
 > **⭐ If this is useful to you, a star helps.** It is the main way small open source
 > projects become findable — several directories that list open source software use a
@@ -118,7 +120,6 @@ Stated plainly, so you can decide before downloading:
 - **Apple Silicon Macs only.** The Mac build is arm64 — there is no Intel Mac build and no universal binary. macOS 14.2 or later is required, because the API used to capture meeting audio does not exist before it. No Linux build exists.
 - **Speakers are told apart by channel only.** Everyone on the same channel appears as one speaker: the other people on a call as "Mötet" (the meeting), and people in the room with you as "Du" (you). Acoustic speaker separation ("Speaker 1, 2, 3") was switched off on 2026-09-18.
 - **Swedish-first.** The bundled on-device model handles Swedish only. Norwegian and English are available through the cloud tier (Pro).
-- **Public beta.** Expect rough edges.
 
 ## FAQ
 
