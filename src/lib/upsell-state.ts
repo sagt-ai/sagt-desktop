@@ -88,8 +88,10 @@ export function shouldCelebrate(f: UpsellActivation & { alreadyCelebrated: boole
  * och serverns bild av prenumerationen syns under tiden i `error_shown` / `analysis_failed`.
  */
 export type UpsellSource =
-    /** Långsamhetstipset "Därför tar det tid" → "Se Pro". */
+    /** Kortet medan en långsam lokal transkribering pågår → "Se vad Pro ger". */
     | 'slow_hint'
+    /** Raden ovanför transkriptet efter en långsam lokal transkribering. */
+    | 'slow_done'
     /** Låsöverlägget över Protokoll-panelen → "Lås upp med Pro". */
     | 'locked_panel'
     /** Lägesväljaren i headern: gratisanvändare valde Moln. */

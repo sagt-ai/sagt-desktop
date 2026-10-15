@@ -12,11 +12,12 @@ import { useConfigStore } from "@/store/config-store"
 import { useEntitlementsStore, useQuotaCounter } from "@/store/entitlements-store"
 import { useMcpSyncStore } from "@/store/mcp-sync"
 import { useSettingsStore } from "@/store/settings-store"
+import { copyText } from "@/lib/clipboard"
 
 function CopyBlock({ label, text }: { label: string; text: string }) {
     const copy = async () => {
         try {
-            await navigator.clipboard.writeText(text)
+            await copyText(text)
             toast.success("Kopierat")
         } catch {
             toast.error("Kunde inte kopiera. Markera texten och kopiera den själv.")

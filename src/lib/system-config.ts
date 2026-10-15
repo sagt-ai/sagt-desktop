@@ -4,9 +4,14 @@
 // Håll modulen importfri, som upsell-state.ts, så att Vitest kan köra den i node-miljö.
 
 export interface SystemConfig {
-    // Backendens kill switch för talarseparering (DIARIZE_ENABLED). När den är av svarar
-    // POST /diarize 503, men först när hela MÖTET-kanalen laddats upp, och workern släpper
-    // `diarize` på POST /jobs utan felsvar.
+    // Talarseparering har två vägar med var sin kill switch i backend:
+    // - efter mötet (POST /diarize). Av → 503, men först när hela MÖTET-kanalen laddats upp.
+    // - omtranskribering med talare (POST /jobs med `diarize`). Av → servern släpper
+    //   `diarize` utan felsvar, så valet vore en tyst no-op.
+    diarize_after_meeting_enabled?: boolean
+    job_diarize_enabled?: boolean
+    // Det gamla fältet, som en äldre backend skickar för båda vägarna. Läses bara när de
+    // nya fälten saknas.
     diarize_enabled?: boolean
     // Backendens kill switch för live-diarisering (LIVE_DIARIZE_ENABLED). När den är av
     // svarar POST /live-diarize 503 vid varje inspelningsstart, och 503:an räknas som ett
@@ -19,16 +24,30 @@ export interface SystemConfig {
     mcp_available?: boolean
 }
 
+// Det nya fältet om backend skickar det, annars det gamla gemensamma.
+function pathFlag(config: SystemConfig | null | undefined, field: "diarize_after_meeting_enabled" | "job_diarize_enabled"): unknown {
+    if (!config) return undefined
+    return field in config ? config[field] : config.diarize_enabled
+}
+
 /**
- * Är talarseparering påslagen i backend? Bara när svaret uttryckligen är `true`.
- * Allt annat ger false: en config som inte hämtats (appen startade offline, eller
- * hämtningen har inte hunnit klart), en äldre backend utan fältet, och värden som bara
+ * Är talarsepareringen efter mötet påslagen i backend? Bara när svaret uttryckligen är
+ * `true`. Allt annat ger false: en config som inte hämtats (appen startade offline, eller
+ * hämtningen har inte hunnit klart), en äldre backend utan fälten, och värden som bara
  * är sanna i JavaScript (strängen "false", 1).
  * Att hoppa över ett valfritt Beta-steg i onödan kostar lite. Att ladda upp mötesljudet
  * till en endpoint som ändå svarar 503 är felet.
  */
 export function diarizeAvailable(config: SystemConfig | null | undefined): boolean {
-    return config?.diarize_enabled === true
+    return pathFlag(config, "diarize_after_meeting_enabled") === true
+}
+
+/**
+ * Tar backend emot omtranskribering med talarseparering? Samma strikta regel. Ett val som
+ * servern släpper utan felsvar är felet; ett dolt val kostar lite.
+ */
+export function jobDiarizeAvailable(config: SystemConfig | null | undefined): boolean {
+    return pathFlag(config, "job_diarize_enabled") === true
 }
 
 /**

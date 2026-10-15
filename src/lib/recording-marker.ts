@@ -133,6 +133,9 @@ export function createRecordingMarker(deps: MarkerDeps) {
     }
 
     return {
+        /** Markören som den står just nu, eller null. Läser bara, ändrar ingenting. */
+        current: read,
+
         /** Vid appstart. */
         reportLeftover,
 

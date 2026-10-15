@@ -21,11 +21,15 @@ interface ConfigStore {
     latestVersion: string | null
     updateAvailable: boolean
     downloadUrl: string
-    // /system/config → diarize_enabled, tolkat av diarizeAvailable. Styr auto-diariseringen
+    // /system/config → diarize_after_meeting_enabled (äldre backend: diarize_enabled), tolkat
+    // av diarizeAvailable. Styr auto-diariseringen
     // vid stopp och om talarsepareringens val visas. false tills ett svar sagt exakt true:
     // storen persisteras inte, så varje start börjar avstängd, och en app som startat
     // offline laddar aldrig upp MÖTET-kanalen på chans.
     diarizeEnabled: boolean
+    // /system/config → job_diarize_enabled, tolkat av jobDiarizeAvailable. Styr om
+    // "Transkribera om med talarseparering" och dess inställning visas. Samma default.
+    jobDiarizeEnabled: boolean
     // /system/config → live_diarize_enabled, tolkat av liveDiarizeAvailable. Grindar
     // mint-anropet i use-live-diarize. Samma default och samma skäl som diarizeEnabled:
     // false tills ett svar sagt exakt true.
@@ -40,6 +44,7 @@ interface ConfigStore {
     setLatestVersion: (v: string) => void
     setDownloadUrl: (url: string) => void
     setDiarizeEnabled: (enabled: boolean) => void
+    setJobDiarizeEnabled: (enabled: boolean) => void
     setLiveDiarizeEnabled: (enabled: boolean) => void
     setProYearlyAvailable: (available: boolean) => void
     setMcpAvailable: (available: boolean) => void
@@ -51,6 +56,7 @@ export const useConfigStore = create<ConfigStore>((set) => ({
     updateAvailable: false,
     downloadUrl: "https://sagt.ai/downloads",
     diarizeEnabled: false,
+    jobDiarizeEnabled: false,
     liveDiarizeEnabled: false,
     proYearlyAvailable: false,
     mcpAvailable: false,
@@ -58,6 +64,7 @@ export const useConfigStore = create<ConfigStore>((set) => ({
     setLatestVersion: (v) => set({ latestVersion: v, updateAvailable: semverGt(v, CURRENT_VERSION) }),
     setDownloadUrl: (url) => set({ downloadUrl: url }),
     setDiarizeEnabled: (enabled) => set({ diarizeEnabled: enabled }),
+    setJobDiarizeEnabled: (enabled) => set({ jobDiarizeEnabled: enabled }),
     setLiveDiarizeEnabled: (enabled) => set({ liveDiarizeEnabled: enabled }),
     setProYearlyAvailable: (available) => set({ proYearlyAvailable: available }),
     setMcpAvailable: (available) => set({ mcpAvailable: available }),

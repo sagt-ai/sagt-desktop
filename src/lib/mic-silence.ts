@@ -13,16 +13,21 @@
 // Håll modulen importfri, som upsell-state.ts, så att Vitest kan köra den i node-miljö.
 
 /** Under den här högsta nivån har mikrofonen inte hört något alls. En fungerande mikrofon
- *  fångar andning, stolar och tangenter över den inom en halv minut. */
+ *  fångar oftast andning, stolar och tangenter över den inom en minut. */
 export const MIC_SILENT_LEVEL = 0.001
-/** Hur länge mikrofonen ska ha varit tyst från inspelningens start innan varningen visas. */
-export const MIC_SILENT_AFTER_MS = 30_000
+/** Hur länge mikrofonen ska ha varit tyst från inspelningens start innan varningen visas.
+ *  60 s sedan 2026-10-14: efter 30 s varnades tysta lyssnare med en mikrofon eller ett
+ *  headset som spärrar brus, så att nivån står på noll tills de pratar. Sedan 0.12.0
+ *  släcktes alla tre varningarna senare, alltså fungerade mikrofonen hela tiden. */
+export const MIC_SILENT_AFTER_MS = 60_000
 /** Över den här nivån har mikrofonen hört något, och en visad varning släcks. Högre än
  *  varningsgränsen, så att en nivå som vandrar runt gränsen inte tänder och släcker. */
 export const MIC_RECOVERED_LEVEL = 0.002
 
+// Formulerad som ett villkor, inte som ett fel: en tyst lyssnare kan inte skiljas från en
+// mikrofon som inget hör. Visas bara som notis, inte som kvarliggande rad.
 export const MIC_SILENT_TEXT =
-    "Din mikrofon tar inte upp något ljud. Kontrollera att rätt mikrofon är vald och att den inte är avstängd."
+    "Mikrofonen har inte hört något än. Pratar du utan att din text syns, kontrollera att rätt mikrofon är vald."
 
 /**
  * Fördelningen av nivåer under en inspelning, i logaritmiska fack, så att percentiler går

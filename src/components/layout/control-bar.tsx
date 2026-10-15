@@ -100,12 +100,12 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
             const event = detector.sample(s.mic, s.system, Date.now());
             if (event === "warn") {
                 captureEvent('mic_silent_warning', { mic_max: detector.mic.max, mode });
+                // Bara en notis. Den kvarliggande varningsraden används för mötesljudet;
+                // för mikrofonen var den oftast fel (tyst lyssnare) och låg kvar tills
+                // användaren pratade.
                 toast.warning(MIC_SILENT_TEXT, { duration: 10000 });
-                // En varning om mötesljudet som redan visas skrivs inte över.
-                if (!useSyncStore.getState().audioWarning) useSyncStore.getState().setAudioWarning(MIC_SILENT_TEXT);
             } else if (event === "recovered") {
                 captureEvent('mic_silent_recovered', { mode });
-                if (useSyncStore.getState().audioWarning === MIC_SILENT_TEXT) useSyncStore.getState().setAudioWarning(null);
             }
         });
         return () => {

@@ -50,11 +50,12 @@ const ALLOWED: Record<string, number> = {
     "lib/cloud-choice.ts": 2,
     // Kontomenyn visar planen (Sagt Pro / Gratiskonto).
     "components/dashboard/account-button.tsx": 3,
-    // Transkriptvyn: omtranskribering i molnet, talaridentifiering, långsamhetstipset.
+    // Transkriptvyn: omtranskribering i molnet, talaridentifiering, långsamhetstipset
+    // (kortet under väntan och raden efteråt visas bara utan Pro).
     // Protokollet frågar grinden om det får skapas; Pro-status väljer bara
     // VÄG efter grinden (omkörning av ett synkat molnjobb, uppladdning när text saknas)
     // och texten vid 413. Ingen av dem stänger ute ett gratiskonto.
-    "components/dashboard/split-view.tsx": 8,
+    "components/dashboard/split-view.tsx": 9,
     // Talare och synk efter mötet (molnläge, Pro).
     "lib/auto-finalize.ts": 2,
     "hooks/use-live-diarize.ts": 1,

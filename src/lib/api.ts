@@ -111,7 +111,7 @@ export async function uploadJob(filePath: string, templateId: string = "general"
     // backend returnerar resultatet inline och raderar jobbet (inget moln-spår).
     formData.append("persist", String(persistOverride ?? cloudSync));
     // Fas 2: talarseparering (opt-in, Pro). Skickas bara när påslaget → gamla beteendet
-    // oförändrat annars. Backend ignorerar tyst om DIARIZE_ENABLED=false i miljön.
+    // oförändrat annars. Servern ignorerar tyst `diarize` när omtranskribering med talare är avstängd.
     if (diarize) formData.append("diarize", "true");
     if (numSpeakers && numSpeakers > 0) formData.append("num_speakers", String(numSpeakers));
     // §13.4: DU/mik-kanalens talarantal (stereo) — desktop skickar 1 (ensam vid mikrofonen)

@@ -71,8 +71,10 @@ export function SettingsPage() {
 
     const isPro = useAuthStore((s) => s.isPro());
     const monthlyLimit = useAuthStore((s) => s.monthlyMinutesLimit);
-    // Backendens kill switch för talarseparering: styr vilka av valen nedan som visas.
+    // Backendens kill switchar för talarseparering, en per väg: styr vilka av valen nedan som
+    // visas. diarizeEnabled = efter mötet, jobDiarizeEnabled = omtranskribering med talare.
     const diarizeEnabled = useConfigStore((s) => s.diarizeEnabled);
+    const jobDiarizeEnabled = useConfigStore((s) => s.jobDiarizeEnabled);
     const { openCheckout, isOpening: isOpeningCheckout } = useCheckout();
     const events = usePostHogEvents();
 
@@ -385,14 +387,14 @@ export function SettingsPage() {
                                     </p>
                                 </div>
 
-                                {/* De två valen nedan gäller bara talarsepareringen. "Talare i din mikrofon"
+                                {/* De två valen nedan gäller bara talarsepareringen, ett per väg. "Talare i din mikrofon"
                                     skickas bara vid omtranskribering med separering, och "Talarseparering efter
                                     möte" är auto-diariseringen vid stopp. Med backendens kill switch av påverkar
                                     de ingenting, så de döljs. Värdena ligger kvar i storen. */}
-                                {diarizeEnabled && (
+                                {(diarizeEnabled || jobDiarizeEnabled) && (
                                     <>
                                         {/* §13.4 mic-kanal-hint — en talare vid mikrofonen (default på) */}
-                                        <div className="space-y-3 pt-1">
+                                        {jobDiarizeEnabled && <div className="space-y-3 pt-1">
                                             <div>
                                                 <SettingLabel hint={<>Håller din mikrofonkanal som en enda röst så att du inte delas upp i &quot;Du 1&quot; och &quot;Du 2&quot;. Stäng av om ni sitter flera vid samma mikrofon.<br /><br />Påverkar inte den automatiska talarsepareringen efter mötet — den delar bara upp mötesljudet, aldrig din mikrofon.</>}>
                                                     Talare i din mikrofon
@@ -418,10 +420,10 @@ export function SettingsPage() {
                                                     </button>
                                                 ))}
                                             </div>
-                                        </div>
+                                        </div>}
 
                                         {/* §steg 5 — automatik efter möte (opt-out, default på) */}
-                                        <div className="space-y-3 pt-1">
+                                        {diarizeEnabled && <div className="space-y-3 pt-1">
                                             <div>
                                                 <SettingLabel hint="I manuellt läge kör du samma separering via knappen i transkriptet, när du vill. Kräver att ljudfilen finns kvar på datorn.">
                                                     Talarseparering efter möte
@@ -447,7 +449,7 @@ export function SettingsPage() {
                                                     </button>
                                                 ))}
                                             </div>
-                                        </div>
+                                        </div>}
                                     </>
                                 )}
 
@@ -676,7 +678,7 @@ export function SettingsPage() {
                         {/* Lokal lagring — diskanvändning + gallringspolicy */}
                         <div className="border-t pt-6 space-y-3">
                             <div>
-                                <SettingLabel hint={diarizeEnabled
+                                <SettingLabel hint={jobDiarizeEnabled
                                     ? "Transkript och analyser behålls alltid — bara ljudet gallras. Ljudfilen behövs för att kunna köra om transkriberingen eller talarsepareringen i efterhand."
                                     : "Transkript och analyser behålls alltid — bara ljudet gallras. Ljudfilen behövs för att kunna köra om transkriberingen i efterhand."}>
                                     Ljudfiler på den här datorn

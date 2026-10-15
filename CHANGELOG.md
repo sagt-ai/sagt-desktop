@@ -7,6 +7,32 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.12.1 — 2026-10-15
+
+### Changed
+
+- **A gentler note when the microphone has heard nothing.** If you only listen
+  in a meeting and your microphone or headset suppresses background noise, the
+  app used to warn after 30 seconds that the microphone picked up no sound, and
+  the warning stayed until you spoke. Now it waits a minute, shows a short
+  notice only, and says what to check if your own words do not appear.
+- **A clearer note when local transcription takes a while.** While your computer
+  finishes a long meeting, the note now shows how long the meeting was and how
+  long you have been waiting, and explains that the computer decides the speed and
+  the model decides the quality. When the text is done, a line above the
+  transcript shows how long it took.
+
+### Fixed
+
+- **Opening Sagt again started a second copy of the app.** Clicking the app in
+  the Start menu or on the taskbar while it was already running opened another
+  instance next to the first. Now the window that is already open comes to the
+  front, and a recording in progress carries on.
+- **The copy button left the clipboard empty.** Clicking the copy icon on the
+  transcript, summary, decisions or action items showed the check mark, but nothing
+  was copied. The app now copies through the system clipboard and only shows the
+  check mark once the text is actually there.
+
 ## 0.12.0 — 2026-10-11
 
 ### Added

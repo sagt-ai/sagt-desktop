@@ -324,6 +324,17 @@ pub fn run() {
         std::process::exit(mcp::run_stdio());
     }
     tauri::Builder::default()
+        // Först bland pluginen, som dokumentationen kräver: startas appen igen medan
+        // den redan körs avslutas den nya processen här, innan den hunnit öppna
+        // fönster, mikrofon eller databas, och det fönster som redan finns visas.
+        // MCP-läget ovan avslutar före byggaren och berörs inte.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.webview_windows().into_values().next() {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(|app| {
             // 🔴 FÖRST av allt. Allt som skrivs före den här raden går till /dev/null
             // i en GUI-startad app, inklusive felen från uppstädningen nedan — och
@@ -402,6 +413,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             greet, 
             init_audio_engine, 

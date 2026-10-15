@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button"
 import { ShieldAlert, Loader2 } from "lucide-react"
 import { useConfigStore } from "@/store/config-store"
 import { CURRENT_VERSION } from "@/lib/version"
-import { diarizeAvailable, liveDiarizeAvailable, mcpAvailable, proYearlyAvailable } from "@/lib/system-config"
+import { diarizeAvailable, jobDiarizeAvailable, liveDiarizeAvailable, mcpAvailable, proYearlyAvailable } from "@/lib/system-config"
 
 function compareSemver(a: string, b: string): number {
     const pa = a.split(".").map(Number)
@@ -34,6 +34,7 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
     const setLatestVersion = useConfigStore((s) => s.setLatestVersion)
     const setDownloadUrlStore = useConfigStore((s) => s.setDownloadUrl)
     const setDiarizeEnabled = useConfigStore((s) => s.setDiarizeEnabled)
+    const setJobDiarizeEnabled = useConfigStore((s) => s.setJobDiarizeEnabled)
     const setLiveDiarizeEnabled = useConfigStore((s) => s.setLiveDiarizeEnabled)
     const setProYearlyAvailable = useConfigStore((s) => s.setProYearlyAvailable)
     const setMcpAvailable = useConfigStore((s) => s.setMcpAvailable)
@@ -58,9 +59,10 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
         }
         if (data.motd) setMotd(data.motd)
         if (data.latest_version) setLatestVersion(data.latest_version)
-        // Utan if, till skillnad från fälten ovan: ett svar som saknar fältet (en backend
-        // före diarize_enabled) ska stänga av talarsepareringen, inte lämna ett gammalt true.
+        // Utan if, till skillnad från fälten ovan: ett svar som saknar ett fält (en äldre
+        // backend) ska stänga av valet, inte lämna ett gammalt true.
         setDiarizeEnabled(diarizeAvailable(data))
+        setJobDiarizeEnabled(jobDiarizeAvailable(data))
         setLiveDiarizeEnabled(liveDiarizeAvailable(data))
         setProYearlyAvailable(proYearlyAvailable(data))
         setMcpAvailable(mcpAvailable(data))

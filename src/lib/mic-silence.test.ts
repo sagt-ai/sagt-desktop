@@ -12,7 +12,7 @@ function feed(d: MicSilenceDetector, ms: number, mic: (t: number) => number, sys
 }
 
 describe("varningen för en mikrofon som inget hör", () => {
-    it("varnar en gång efter 30 s när mikrofonen är så gott som tyst", () => {
+    it("varnar en gång efter 60 s när mikrofonen är så gott som tyst", () => {
         const d = new MicSilenceDetector(0);
         const events = feed(d, 120_000, () => 0.0002);
         expect(events).toEqual([{ t: MIC_SILENT_AFTER_MS, e: "warn" }]);
@@ -20,10 +20,15 @@ describe("varningen för en mikrofon som inget hör", () => {
 
     it("varnar när mikrofonen inte ger något alls (behörighet saknas)", () => {
         const d = new MicSilenceDetector(0);
-        expect(feed(d, 40_000, () => 0)).toEqual([{ t: MIC_SILENT_AFTER_MS, e: "warn" }]);
+        expect(feed(d, 70_000, () => 0)).toEqual([{ t: MIC_SILENT_AFTER_MS, e: "warn" }]);
     });
 
-    it("varnar inte före 30 s", () => {
+    it("en tyst lyssnare med brusspärr varnas inte efter 45 s (varnades före 2026-10-14)", () => {
+        const d = new MicSilenceDetector(0);
+        expect(feed(d, 45_000, () => 0)).toEqual([]);
+    });
+
+    it("varnar inte före 60 s", () => {
         const d = new MicSilenceDetector(0);
         expect(feed(d, MIC_SILENT_AFTER_MS - 50, () => 0)).toEqual([]);
     });
@@ -41,29 +46,29 @@ describe("varningen för en mikrofon som inget hör", () => {
 
     it("gränsen: precis under varnar, på gränsen varnar inte", () => {
         const under = new MicSilenceDetector(0);
-        expect(feed(under, 31_000, () => MIC_SILENT_LEVEL * 0.99).map(e => e.e)).toEqual(["warn"]);
+        expect(feed(under, 61_000, () => MIC_SILENT_LEVEL * 0.99).map(e => e.e)).toEqual(["warn"]);
         const at = new MicSilenceDetector(0);
-        expect(feed(at, 31_000, () => MIC_SILENT_LEVEL)).toEqual([]);
+        expect(feed(at, 61_000, () => MIC_SILENT_LEVEL)).toEqual([]);
     });
 
     it("släcks en gång när mikrofonen börjar höras", () => {
         const d = new MicSilenceDetector(0);
-        const events = feed(d, 60_000, t => (t >= 45_000 ? 0.05 : 0.0001));
-        expect(events).toEqual([{ t: MIC_SILENT_AFTER_MS, e: "warn" }, { t: 45_000, e: "recovered" }]);
+        const events = feed(d, 90_000, t => (t >= 75_000 ? 0.05 : 0.0001));
+        expect(events).toEqual([{ t: MIC_SILENT_AFTER_MS, e: "warn" }, { t: 75_000, e: "recovered" }]);
     });
 
     it("en nivå strax över varningsgränsen släcker inte (hysteres)", () => {
         const d = new MicSilenceDetector(0);
-        const events = feed(d, 60_000, t => (t >= 45_000 ? MIC_RECOVERED_LEVEL : 0.0001));
+        const events = feed(d, 90_000, t => (t >= 75_000 ? MIC_RECOVERED_LEVEL : 0.0001));
         expect(events.map(e => e.e)).toEqual(["warn"]);
     });
 
     it("sammanfattningen bär nivåerna per kanal och om varningen visades", () => {
         const d = new MicSilenceDetector(0);
-        feed(d, 40_000, () => 0.0002, 0.3);
-        const s = d.summary(40_000);
-        expect(s.seconds).toBe(40);
-        expect(s.samples).toBe(801);
+        feed(d, 70_000, () => 0.0002, 0.3);
+        const s = d.summary(70_000);
+        expect(s.seconds).toBe(70);
+        expect(s.samples).toBe(1401);
         expect(s.mic_silent_warned).toBe(true);
         expect(s.mic_recovered).toBe(false);
         expect(s.mic_max).toBeCloseTo(0.0002, 6);

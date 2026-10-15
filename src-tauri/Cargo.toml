@@ -14,7 +14,7 @@ name = "sagt"
 # strängen. Att hålla fältet utanför synken gjorde alltså inte problemet ofarligt — det
 # gjorde det osynligt. Rätt svar på en fil som måste vara i synk är att lägga den under
 # grinden, vilket den nu är.
-version = "0.12.0"
+version = "0.12.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -48,6 +48,17 @@ tauri-plugin-process = "2"
 # match tauri 2.10 and the JS packages; the next patch releases require tauri 2.11.
 tauri-plugin-dialog = "=2.7.0"
 tauri-plugin-fs = "=2.5.0"
+# Urklipp via det nativa systemurklippet. Uppmätt 2026-10-13 i appens webbvy på
+# macOS 26.6: `navigator.clipboard.writeText` utan aktiv användargest avvisas med
+# NotAllowedError, medan pluginens writeText lyckas. Kopiera-knappen skrev tidigare
+# via webbläsarens API utan att vänta in svaret, så bocken visades fast urklippet
+# förblev tomt. Pinnad till den sista versionen som bygger mot tauri 2.10.
+tauri-plugin-clipboard-manager = "=2.3.2"
+# En instans av appen. Utan den startade en andra start (Start-menyn eller ikonen
+# medan appen redan körde) en kopia till, som delade lagring, mikrofon och databas
+# med den första. Nu visas det öppna fönstret i stället. 2.4.5 är den sista
+# versionen som bygger mot tauri 2.10 (2.5.x kräver ^2.12, läst på crates.io).
+tauri-plugin-single-instance = "=2.4.5"
 tokio = { version = "1", features = ["sync", "rt", "io-std", "time"] }
 # MCP-läget (`--mcp`, src/mcp/): en lokal stdio-server som en AI-assistent på datorn
 # startar. rmcp är det officiella Rust-SDK:t och sköter versionsförhandlingen

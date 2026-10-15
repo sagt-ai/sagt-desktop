@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { checkoutInterval, diarizeAvailable, liveDiarizeAvailable, mcpAvailable, proYearlyAvailable, type SystemConfig } from "./system-config";
+import { checkoutInterval, diarizeAvailable, jobDiarizeAvailable, liveDiarizeAvailable, mcpAvailable, proYearlyAvailable, type SystemConfig } from "./system-config";
 
 // Samma fall som webbens frontend/lib/system-config.test.ts: talarsepareringen gäller bara
 // när backend uttryckligen svarar true.
@@ -64,6 +64,45 @@ describe("liveDiarizeAvailable", () => {
         // konstant hade sett korrekt ut i produktion i dag, där båda är false.
         expect(liveDiarizeAvailable({ diarize_enabled: true })).toBe(false);
         expect(diarizeAvailable({ live_diarize_enabled: true })).toBe(false);
+    });
+});
+
+// Två vägar, två knappar. Med de nya fälten läses varje väg för sig; utan dem (en äldre
+// backend) gäller det gamla gemensamma fältet för båda.
+describe("talarseparering per väg", () => {
+    it("efter mötet på, omtranskribering av: bara efter mötet visas", () => {
+        const config = { diarize_after_meeting_enabled: true, job_diarize_enabled: false, diarize_enabled: false };
+        expect(diarizeAvailable(config)).toBe(true);
+        expect(jobDiarizeAvailable(config)).toBe(false);
+    });
+
+    it("omtranskribering på, efter mötet av: bara omtranskriberingen visas", () => {
+        const config = { diarize_after_meeting_enabled: false, job_diarize_enabled: true, diarize_enabled: false };
+        expect(diarizeAvailable(config)).toBe(false);
+        expect(jobDiarizeAvailable(config)).toBe(true);
+    });
+
+    it("de nya fälten går före det gamla", () => {
+        // Det gamla fältet är sant bara när båda är på. Läste klienten det, försvann en väg
+        // som är påslagen; läste den det som "båda", visades en som är av.
+        const config = { diarize_after_meeting_enabled: false, job_diarize_enabled: false, diarize_enabled: true };
+        expect(diarizeAvailable(config)).toBe(false);
+        expect(jobDiarizeAvailable(config)).toBe(false);
+    });
+
+    it("äldre backend utan de nya fälten: det gamla fältet gäller båda", () => {
+        expect(jobDiarizeAvailable({ diarize_enabled: true })).toBe(true);
+        expect(jobDiarizeAvailable({ diarize_enabled: false })).toBe(false);
+        expect(jobDiarizeAvailable({})).toBe(false);
+        expect(jobDiarizeAvailable(undefined)).toBe(false);
+    });
+
+    it("av för värden som bara är sanna i JavaScript", () => {
+        for (const value of ["false", "true", 1]) {
+            const config = { diarize_after_meeting_enabled: value, job_diarize_enabled: value } as unknown as SystemConfig;
+            expect(diarizeAvailable(config), JSON.stringify(value)).toBe(false);
+            expect(jobDiarizeAvailable(config), JSON.stringify(value)).toBe(false);
+        }
     });
 });
 

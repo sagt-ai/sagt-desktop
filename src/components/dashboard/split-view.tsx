@@ -31,6 +31,7 @@ import { useAuthStore, WAS_PRO_KEY } from "@/store/auth-store";
 import { markErrorSeen, onAnalysisCompleted } from "@/lib/feedback-runtime";
 import { useConfigStore } from "@/store/config-store";
 import { toast } from "sonner";
+import { copyText } from "@/lib/clipboard";
 import { ModePill } from "./mode-pill";
 import { UpsellModal } from "./upsell-modal";
 import { AccountButton } from "./account-button";
@@ -40,12 +41,17 @@ import { exportClick } from "@/lib/export/quota";
 import type { QuotaLineInput, UpsellSource } from "@/lib/upsell-state";
 import { protocolClick } from "@/lib/protocol-click";
 import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-events";
-import { useSlowLocalHint } from "@/hooks/use-slow-local-hint";
-import { recordingMarker } from "@/lib/recording-marker";
+import { useSlowLocalHint, useSlowLocalResult } from "@/hooks/use-slow-local-hint";
+import { SlowLocalCard, SlowLocalDoneLine } from "@/components/dashboard/slow-local-hint";
+import { recordingMarker, startTimeFromPath, SAME_RECORDING_MS } from "@/lib/recording-marker";
 import { accountButtonPanel, clampSplit } from "@/lib/panel-layout";
 import { useLayoutStore } from "@/store/layout-store";
 import { cn } from "@/lib/utils";
 import { CollapsedPanelStrip, PANEL_HEADER_HEIGHT, PanelControls, PanelResizer } from "./panel-chrome";
+
+// Inspelningar (starttid i ms) som redan fått eventet för raden efter en långsam
+// lokal transkribering. Modulnivå, så att ett flikbyte inte räknar samma rad igen.
+const slowDoneShownFor = new Set<number>();
 
 /**
  * Enda statusindikatorn under pågående inspelning. Visas centrerad medan panelen är tom
@@ -71,9 +77,10 @@ export function SplitView() {
     const isSignedIn = useAuthStore((s) => s.isSignedIn);
     const getToken = useAuthStore((s) => s.getToken);
     const isPro = useAuthStore((s) => s.isPro());
-    // Backendens kill switch för talarseparering. Av → "Transkribera om med talarseparering"
-    // döljs, eftersom servern släpper `diarize` utan felsvar och valet vore en tyst no-op.
-    const diarizeEnabled = useConfigStore((s) => s.diarizeEnabled);
+    // Backendens kill switch för omtranskribering med talare. Av → "Transkribera om med
+    // talarseparering" döljs, eftersom servern släpper `diarize` utan felsvar och valet vore
+    // en tyst no-op.
+    const jobDiarizeEnabled = useConfigStore((s) => s.jobDiarizeEnabled);
     const email = useAuthStore((s) => s.email);
     const clearSession = useAuthStore((s) => s.clearSession);
     const events = usePostHogEvents();
@@ -158,10 +165,35 @@ export function SplitView() {
     // hela auth-sessionen vid expiry, men "köp Pro" ska aldrig visas för
     // någon som redan betalar.
     const isFinalizingLocal = isProcessing && !isRecording && processingStatus !== 'PROCESSING';
-    const { showSlowHint, dismissSlowHint } = useSlowLocalHint(
+    const { showSlowHint, slowTiming, slowHintDismissed, dismissSlowHint } = useSlowLocalHint(
         isFinalizingLocal && !isPro && !cloudStreamingActive
         && !localStorage.getItem(WAS_PRO_KEY)
     );
+    // Raden efteråt hör till exakt den inspelning som visas: starttiden i filnamnet
+    // ska stämma med markörens. En avbruten inspelning sparas aldrig och får ingen rad.
+    const slowResult = useSlowLocalResult((s) => s.result);
+    const activeStart = activeJob?.file_path ? startTimeFromPath(activeJob.file_path) : null;
+    const showSlowDone = !!slowResult && !isPro && !slowHintDismissed && !isRecording && !isFinalizingLocal
+        && !localStorage.getItem(WAS_PRO_KEY)
+        && activeStart !== null && Math.abs(activeStart - slowResult.startedAt) <= SAME_RECORDING_MS;
+    useEffect(() => {
+        // En gång per inspelning, även om SplitView monteras om vid flikbyte.
+        if (showSlowDone && slowResult && !slowDoneShownFor.has(slowResult.startedAt)) {
+            slowDoneShownFor.add(slowResult.startedAt);
+            events.upsellShown('slow_local_done');
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [showSlowDone, slowResult?.startedAt]);
+    // Klicket mäts med mötets längd och väntan; fönstret öppnas med samma källa som
+    // tidigare ('slow_hint'), så jämförelsen med det gamla kortet består.
+    const slowCta = (surface: 'slow_hint' | 'slow_done', meetingSeconds: number | null, waitSeconds: number | null) => {
+        captureEvent('slow_hint_cta', {
+            surface,
+            meeting_minutes: meetingSeconds === null ? null : Math.round(meetingSeconds / 60),
+            waited_seconds: waitSeconds,
+        });
+        openUpsell(surface);
+    };
 
     // Per-modell-vy: en inspelning kan ha BÅDE lokala segment (Du/Mötet) och ett
     // molnresultat (KB-Whisper Large i cloud_transcript). Resultaten skriver aldrig
@@ -322,12 +354,23 @@ export function SplitView() {
     const [isRetranscribing, setIsRetranscribing] = useState(false);
     const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-    const handleCopy = (text: string, key: string, e: React.MouseEvent<HTMLButtonElement>) => {
+    const handleCopy = async (text: string, key: string, e: React.MouseEvent<HTMLButtonElement>) => {
         if (!text) return;
-        navigator.clipboard.writeText(text);
-        e.currentTarget.blur();
+        // currentTarget är null efter await — läs det före.
+        const button = e.currentTarget;
+        try {
+            await copyText(text);
+        } catch (err) {
+            console.error("Kopiering misslyckades:", err);
+            toast.error("Kunde inte kopiera. Markera texten och kopiera den själv.");
+            return;
+        }
+        button.blur();
+        // Bocken och eventet först när texten faktiskt ligger i urklippet.
         setCopiedKey(key);
-        events.transcriptCopied();
+        // Eventet mäter kopiering av transkriptet; sammanfattning, beslut och
+        // åtgärder går genom samma knapp-hanterare men räknas inte som transkript.
+        if (key === "transcript") events.transcriptCopied();
         setTimeout(() => setCopiedKey(null), 2000);
     };
 
@@ -1195,7 +1238,7 @@ export function SplitView() {
                                     <DropdownMenuContent align="start" className="w-64">
                                         {canRetranscribe && (
                                             <>
-                                                {diarizeEnabled && (
+                                                {jobDiarizeEnabled && (
                                                     <DropdownMenuItem onClick={() => handleRetranscribe(true)} className="gap-2 cursor-pointer">
                                                         <Users className="h-3.5 w-3.5 text-brand" />
                                                         <span className="flex-1">Transkribera om med talarseparering</span>
@@ -1205,7 +1248,7 @@ export function SplitView() {
                                                 <DropdownMenuItem onClick={() => handleRetranscribe(false)} className="gap-2 cursor-pointer">
                                                     <RefreshCw className="h-3.5 w-3.5 text-ink-muted" />
                                                     {/* "(standard)" skiljer valet från talarsepareringen ovanför. Utan den finns inget att skilja från. */}
-                                                    {diarizeEnabled ? "Transkribera om (standard)" : "Transkribera om"}
+                                                    {jobDiarizeEnabled ? "Transkribera om (standard)" : "Transkribera om"}
                                                 </DropdownMenuItem>
                                             </>
                                         )}
@@ -1294,6 +1337,14 @@ export function SplitView() {
                             </div>
                         )}
 
+                        {showSlowDone && slowResult && (
+                            <SlowLocalDoneLine
+                                meetingSeconds={slowResult.meetingSeconds}
+                                waitSeconds={slowResult.waitSeconds}
+                                onDismiss={dismissSlowHint}
+                                onCta={() => slowCta('slow_done', slowResult.meetingSeconds, slowResult.waitSeconds)}
+                            />
+                        )}
                         {!activeJob && segments.length === 0 ? (
                             // Två skilda tillstånd, medvetet olika tyngd:
                             //   Vilar  → panelen är genuint tom, ett block som säger vad man gör.
@@ -1506,32 +1557,16 @@ export function SplitView() {
                             bryts släcker hookens effekt showSlowHint först en render senare —
                             utan grinden flashar kortet en frame precis när resultatet visas. */}
                         {isFinalizingLocal && showSlowHint && (
-                            <div className="max-w-sm rounded-xl border border-line bg-paper-dim p-4 mt-3 ml-1">
-                                <div className="flex items-start justify-between gap-3">
-                                    <h4 className="text-xs font-semibold text-ink">Därför tar det tid</h4>
-                                    <button
-                                        onClick={dismissSlowHint}
-                                        className="text-ink-muted hover:text-ink transition-colors flex-none"
-                                        aria-label="Visa inte igen"
-                                        title="Visa inte igen"
-                                    >
-                                        <X className="w-3.5 h-3.5" />
-                                    </button>
-                                </div>
-                                <p className="text-xs text-ink-muted mt-1.5 leading-relaxed">
-                                    AI-transkribering kräver ett kraftfullt grafikkort — utan det kör
-                                    appen den minsta modellen långsamt på processorn. Pro kör samma jobb
-                                    på dedikerade GPU-servrar med den största KB-Whisper-modellen:
-                                    snabbare och med högre kvalitet.
-                                </p>
-                                <Button
-                                    size="sm"
-                                    className="mt-3 h-8 text-xs bg-brand text-paper hover:bg-brand-deep"
-                                    onClick={() => openUpsell('slow_hint')}
-                                >
-                                    Se Pro
-                                </Button>
-                            </div>
+                            <SlowLocalCard
+                                meetingSeconds={slowTiming ? Math.max(0, Math.round((slowTiming.stoppedAt - slowTiming.startedAt) / 1000)) : null}
+                                stoppedAt={slowTiming?.stoppedAt ?? null}
+                                onDismiss={dismissSlowHint}
+                                onCta={() => slowCta(
+                                    'slow_hint',
+                                    slowTiming ? Math.round((slowTiming.stoppedAt - slowTiming.startedAt) / 1000) : null,
+                                    slowTiming ? Math.round((Date.now() - slowTiming.stoppedAt) / 1000) : null,
+                                )}
+                            />
                         )}
                         <div ref={scrollRef} className="h-10" />
                     </div>
