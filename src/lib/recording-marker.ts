@@ -129,6 +129,10 @@ export function createRecordingMarker(deps: MarkerDeps) {
             minutes_since: Math.max(0, Math.round((deps.now() - end) / 60_000)),
             app_version_at_start: m.app_version,
             previous_run: m.run_id !== deps.runId,
+            // Stopp trycktes: appen stängdes mellan Stopp och sparandet, inte under
+            // inspelningen. Sedan raden sparas vid Stopp betyder det att texten kan
+            // sakna slutet, inte att inspelningen är borta.
+            stopped: m.stopped_at !== undefined,
         })
     }
 
@@ -226,3 +230,10 @@ export const recordingMarker = createRecordingMarker({
     version: CURRENT_VERSION,
     runId: RUN_ID,
 })
+
+/**
+ * Markören som den stod när appen startade, läst innan något hunnit ta bort den.
+ * `reportLeftover` tar bort den när analysverktyget laddats, och återställningen av
+ * inspelningar som aldrig sparades behöver dess tider oavsett vilken som hinner först.
+ */
+export const markerAtLaunch: RecordingMarker | null = recordingMarker.current()

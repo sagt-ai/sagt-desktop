@@ -3,12 +3,14 @@ import { listen } from "@tauri-apps/api/event";
 import { useTranscriptionStore, UISegment } from "@/store/transcription-store";
 import { toast } from "sonner";
 import { markErrorSeen } from "@/lib/feedback-runtime";
+import { chunkGate } from "@/lib/chunk-gate";
 
 interface TranscriptionEvent {
     text: string;
     source: string;
     start?: number;
     end?: number;
+    generation?: number;
 }
 
 export function useTranscription() {
@@ -16,6 +18,8 @@ export function useTranscription() {
 
     useEffect(() => {
         const unlistenChunkPromise = listen<TranscriptionEvent>("transcription-chunk", (event) => {
+            // Text från en körning som Avbryt redan lämnat visas inte (se chunk-gate.ts).
+            if (!chunkGate.accept(event.payload.generation)) return;
             const { text, source } = event.payload;
 
             // Map source "mic" -> "DU", "sys" -> "MÖTET" if backend sends raw tags
@@ -51,9 +55,18 @@ export function useTranscription() {
             setIsProcessing(false);
         });
 
+        // En bit som tog för lång tid och avbröts. Kön arbetar vidare, så bearbetningsläget
+        // lämnas orört; transcription-error ovan avslutar det.
+        const unlistenSkippedPromise = listen("transcription-segment-skipped", () => {
+            toast.warning("En del av inspelningen tog för lång tid att transkribera och hoppades över.", {
+                duration: 6000,
+            });
+        });
+
         return () => {
             unlistenChunkPromise.then((unlisten) => unlisten());
             unlistenErrorPromise.then((unlisten) => unlisten());
+            unlistenSkippedPromise.then((unlisten) => unlisten());
         };
     }, []);
 

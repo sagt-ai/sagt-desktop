@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
-use crate::database::{DatabaseManager, Recording, Segment};
+use crate::database::{processing_state, DatabaseManager, Recording, Segment};
 
 // Max 2 concurrent whisper-cli processes to avoid CPU starvation.
 // More than 2 causes all instances to run ~4x slower, making live transcription impossible.
@@ -151,6 +151,9 @@ struct TranscriptionChunk {
     source: String,
     start: f64,
     end: f64,
+    /// Sessionsgenerationen raden hör till. Gränssnittet kastar rader från en
+    /// generation som Avbryt redan lämnat.
+    generation: u64,
 }
 
 // Live cloud-streaming: a finished VAD segment shipped to JS as raw WAV bytes.
@@ -212,6 +215,22 @@ struct SessionState {
     saved_generation: Option<u64>,
     /// Generationen som `wav_path` tillhör, satt av recordern vid stoppet.
     wav_generation: u64,
+    /// Raden som sparades vid Stopp, medan transkriberingen arbetar ikapp. Se
+    /// `next_save_step`.
+    provisional_id: Option<i64>,
+    /// Hur många av `segments` som står i den raden.
+    persisted_segments: usize,
+    /// Avbryt trycktes medan transkriberingar återstod. Inspelningen sparas ändå, men
+    /// märks som avbruten.
+    cancelled_with_work: bool,
+    /// Avbryt trycktes för den här inspelningen. Slutläget aviseras då med
+    /// `recording-settled`, så att gränssnittet inte startar efterbearbetningen (till
+    /// exempel uppladdningen i molnläget) för en inspelning användaren just avbrutit.
+    cancelled: bool,
+    /// Recordern har en öppen sessionsfil som ännu inte lämnats över i `wav_path`. Täcker
+    /// glappet mellan Stopp och sparandet, då varken `is_recording` eller `wav_path`
+    /// säger att en inspelning är på väg.
+    recorder_busy: bool,
 }
 
 /// Mätvärden för en inspelning, rapporterade med `history-updated`.
@@ -278,6 +297,8 @@ mod whisper_error {
     pub const SPAWN_FAILED: &str = "spawn_failed";
     pub const WAIT_FAILED: &str = "wait_failed";
     pub const EXIT_NONZERO: &str = "exit_nonzero";
+    /// Processen svarade inte inom tidsgränsen och dödades.
+    pub const TIMEOUT: &str = "timeout";
     /// Ingen väg satte en kod: panik, eller en ny felväg utan kod.
     pub const UNKNOWN: &str = "unknown";
 }
@@ -308,6 +329,13 @@ struct SavedRecording<'a> {
     #[serde(flatten)]
     recording: &'a Recording,
     diagnostics: SessionDiagnostics,
+}
+
+/// `recording-removed`-payloaden: raden raderades av användaren medan transkriberingen
+/// pågick, så slutläget kommer aldrig. Sökvägen behövs för att känna igen inspelningen.
+#[derive(Serialize, Clone)]
+struct RemovedRecording<'a> {
+    file_path: &'a str,
 }
 
 /// `recording-discarded`-payloaden: en inspelning som var för kort och utan text, och som
@@ -425,6 +453,11 @@ impl AudioMonitor {
                 open_speech: std::collections::BTreeSet::new(),
                 saved_generation: None,
                 wav_generation: 0,
+                provisional_id: None,
+                persisted_segments: 0,
+                cancelled_with_work: false,
+                cancelled: false,
+                recorder_busy: false,
             })),
             desired_mic: Arc::new(Mutex::new(None)),
             mic_preview: Arc::new(Mutex::new(false)),
@@ -1449,7 +1482,14 @@ impl AudioMonitor {
         Ok(())
     }
 
-    pub fn start_recording(&self) -> Result<(), String> {
+    pub fn start_recording(&self, app: &AppHandle) -> Result<(), String> {
+        // Föregående inspelning sparas FÖRST, med de segment den hann få, innan
+        // nollställningen nedan tömmer dem. Tidigare försvann en inspelning vars
+        // transkribering inte hunnit ikapp när nästa startade: segmenten töms, räknaren
+        // nollställs, och sparandet väntade sedan på fel inspelnings räknare.
+        let _save = save_lock();
+        save_session_locked(app, &self.session_state, true, "recording-settled");
+
         let mut rec = self.is_recording.lock().unwrap();
         *rec = true;
         println!("DEBUG: Recording START signal sent");
@@ -1457,6 +1497,10 @@ impl AudioMonitor {
         let mut session = self.session_state.lock().unwrap();
         session.segments.clear();
         session.wav_path = None;
+        session.provisional_id = None;
+        session.persisted_segments = 0;
+        session.cancelled_with_work = false;
+        session.cancelled = false;
         session.start_time = Some(SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         session.pending_transcriptions = 0;
         session.duration_sec = 0.0;
@@ -1473,6 +1517,64 @@ impl AudioMonitor {
         *rec = false;
         println!("DEBUG: Recording STOP signal sent");
         Ok(())
+    }
+
+    /// Avbryt. Anropas efter att sessionsgenerationen bumpats: ingen av de transkriberingar
+    /// som pågår kommer då att minska räknaren (se `PendingTranscription`), så den nollställs
+    /// här. Annars väntade sparandet för evigt, och inspelningen sparades aldrig.
+    ///
+    /// Inspelningen sparas med den text som hann bli klar. Ljudet är helt, och en
+    /// inspelning som tagits bort av misstag går inte att få tillbaka.
+    pub fn cancel_session(&self, app: &AppHandle) {
+        let _save = save_lock();
+        {
+            let mut s = self.session_state.lock().unwrap();
+            if s.pending_transcriptions > 0 {
+                s.cancelled_with_work = true;
+            }
+            s.cancelled = true;
+            s.pending_transcriptions = 0;
+        }
+        save_session_locked(app, &self.session_state, false, "recording-settled");
+    }
+
+    /// Finns en inspelning som inte är färdigsparad? Spelar in, stoppad men inte
+    /// överlämnad, eller sparad med transkribering kvar. Läses av stängvakten och
+    /// uppdateraren, och överlever en omladdning av gränssnittet.
+    pub fn session_busy(&self) -> bool {
+        if *self.is_recording.lock().unwrap() {
+            return true;
+        }
+        let s = self.session_state.lock().unwrap();
+        s.recorder_busy || s.wav_path.is_some()
+    }
+
+    /// Kör återställningen en gång per körning, och aldrig medan en inspelning pågår.
+    ///
+    /// Tar databasens lås själv, efter sparlåset, i samma ordning som sparandet.
+    pub fn recover(
+        &self,
+        db: &Mutex<DatabaseManager>,
+        marker: Option<crate::recovery::LeftoverMarker>,
+    ) -> crate::recovery::RecoveryReport {
+        let mut report = crate::recovery::RecoveryReport::default();
+        let _save = save_lock();
+        if self.session_busy() || RECOVERY_RAN.swap(true, Ordering::SeqCst) {
+            return report;
+        }
+        let db = match db.lock() {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("RECOVERY: databasen är låst: {}", e);
+                return report;
+            }
+        };
+        match db.mark_interrupted_processing() {
+            Ok(n) => report.interrupted = n as u32,
+            Err(e) => eprintln!("RECOVERY: kunde inte märka avbrutna rader: {}", e),
+        }
+        crate::recovery::recover_session_wavs(&db, &std::env::temp_dir(), marker, &mut report);
+        report
     }
 
     pub fn stop(&self) {
@@ -3096,6 +3198,182 @@ fn is_nospeech(text: &str) -> bool {
     text.contains("<|nospeech|>")
 }
 
+/// Vad läsningen av whisper-cli:s stdout gav.
+#[derive(Debug, PartialEq)]
+struct WhisperRead {
+    /// Alla textrader som skickades vidare, sammanfogade med mellanslag.
+    text: String,
+    /// Läsningen avbröts för att sessionen inte längre är den aktuella.
+    aborted: bool,
+}
+
+/// Läser whisper-cli:s stdout rad för rad och lämnar varje textrad till `on_text`.
+///
+/// 🔴 `still_current` frågas FÖRE varje rad lämnas vidare. Tidigare skickades varje rad
+/// till gränssnittet utan kontroll, och generationen prövades först när processen var
+/// klar. Text från en avbruten körning kunde därför nå vyn efter Avbryt, trots att
+/// resultatet sedan slängdes. Svarar den nej slutar läsningen; anroparen dödar processen.
+fn read_whisper_output<R: std::io::BufRead>(
+    reader: R,
+    still_current: impl Fn() -> bool,
+    mut on_text: impl FnMut(String),
+) -> WhisperRead {
+    let mut full = String::new();
+    let mut errors_in_row = 0;
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(line) => {
+                errors_in_row = 0;
+                line
+            }
+            Err(e) => {
+                eprintln!("ERROR: Stdout read error: {}", e);
+                // Ogiltig UTF-8 förbrukar raden och läsningen går vidare. Ett fel som
+                // upprepas utan att något läses hade däremot blivit en evig loop.
+                errors_in_row += 1;
+                if errors_in_row >= 3 {
+                    break;
+                }
+                continue;
+            }
+        };
+        let cleaned_text = line.trim();
+        if cleaned_text.is_empty() { continue; }
+
+        let mut chunk_text = String::new();
+        if let Some(pos) = cleaned_text.find(']') {
+            if pos + 1 < cleaned_text.len() {
+                chunk_text.push_str(cleaned_text[pos+1..].trim());
+            }
+        } else {
+            chunk_text.push_str(cleaned_text);
+        }
+
+        let final_text = avkoda_entiteter(chunk_text.trim());
+
+        // Filter out common whisper boilerplate if NO timestamps were parsed
+        if final_text.is_empty() || final_text.starts_with("whisper_") || final_text.starts_with("system_info:")
+            || is_nospeech(&final_text) {
+            continue;
+        }
+        if !still_current() {
+            return WhisperRead { text: full, aborted: true };
+        }
+        // 🔴 LOGGA ALDRIG TRANSKRIBERAT INNEHÅLL. Raden skrev tidigare ut hela texten,
+        // och sedan filloggningen infördes hamnade mötesinnehållet därmed i en fil på
+        // disk. Den stannar visserligen lokalt, men en användare som bifogar loggen i ett
+        // supportärende hade skickat oss sitt möte — och hela produktlöftet är att
+        // transkriptet är deras. Teckenantalet ger samma diagnostiska svar (kom det text
+        // tillbaka, och hur mycket) utan innehållet.
+        //
+        // Samma regel gäller varje framtida loggrad: `error-slug.ts` rapporterar av samma
+        // skäl en stabil kod och aldrig fri feltext. Loggen får beskriva att något hände,
+        // aldrig vad som sades.
+        println!("DEBUG: Streaming text: {} tecken", final_text.chars().count());
+        if !full.is_empty() {
+            full.push(' ');
+        }
+        full.push_str(&final_text);
+        on_text(final_text);
+    }
+    WhisperRead { text: full, aborted: false }
+}
+
+/// Registrerar en startad whisper-cli så att Avbryt kan döda den, och svarar om den
+/// får köra vidare.
+///
+/// 🔴 Generationen prövas EFTER att PID:t lagts in, inte bara före start. Avbryt
+/// bumpar generationen och tömmer sedan PID-mängden. Prövades generationen bara före
+/// start kunde en process som startade mellan de två stegen hamna i mängden efter att
+/// den tömts, överleva Avbryt och skicka sin text till vyn.
+/// Med den här ordningen ser antingen uppgiften den nya generationen, eller så ser
+/// Avbryt PID:t. Svaret nej betyder att anroparen själv ska döda processen.
+fn register_whisper_pid(
+    pids: &Mutex<std::collections::HashSet<u32>>,
+    pid: u32,
+    still_current: impl Fn() -> bool,
+) -> bool {
+    // Ett förgiftat lås skyddar bara en mängd PID:n: fortsätt hellre än att låta en
+    // process gå oregistrerad, eftersom Avbryt då inte kan döda den.
+    pids.lock().unwrap_or_else(|e| e.into_inner()).insert(pid);
+    println!("[KillSwitch] Registered whisper-cli PID={}", pid);
+    if still_current() {
+        return true;
+    }
+    pids.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+    false
+}
+
+/// Hur länge en whisper-cli får arbeta innan vakten dödar den. Gränsen ska bara fånga
+/// en process som har hängt sig, inte en långsam dator: tio gånger ljudets längd, men
+/// aldrig under en minut.
+fn whisper_time_limit(audio_sec: f64) -> Duration {
+    let tio_ganger = Duration::from_secs_f64((audio_sec.max(0.0) * 10.0).min(3600.0));
+    tio_ganger.max(Duration::from_secs(60))
+}
+
+/// Startar en vakt som dödar processen om `done` inte stängs inom `limit`, och svarar
+/// om den dödade den.
+///
+/// 🔴 Utan vakten fanns ingen väg ut för en whisper-cli som slutade svara. Uppgiften
+/// väntade på den för alltid och höll sin plats i semaforen. Två sådana räcker för att
+/// stoppa hela kön, och då blir inspelningen aldrig färdigsparad. Vakten dödar via
+/// processhandtaget, inte via PID:t, och kan därför inte träffa en annan process som
+/// fått samma PID.
+fn spawn_whisper_watchdog(
+    child: Arc<Mutex<std::process::Child>>,
+    limit: Duration,
+    done: std::sync::mpsc::Receiver<()>,
+) -> thread::JoinHandle<bool> {
+    thread::spawn(move || match done.recv_timeout(limit) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
+            // Redan avslutad: ingenting att döda.
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return false;
+            }
+            if let Err(e) = child.kill() {
+                eprintln!("[KillSwitch] Vakten kunde inte döda whisper-cli PID={}: {}", child.id(), e);
+            }
+            true
+        }
+        // `done` stängdes: uppgiften blev klar i tid.
+        _ => false,
+    })
+}
+
+/// stderr från en avslutad process. Lever processen fortfarande (väntan gav upp efter
+/// sin deadline) väntas tråden inte in: den håller sin ände av pipen tills processen
+/// dör, och en väntan på den hade gjort deadline verkningslös. Tråden lämnas då åt
+/// sitt öde och avslutas när processen gör det.
+fn take_stderr(thread: Option<thread::JoinHandle<Vec<u8>>>, process_reaped: bool) -> Vec<u8> {
+    match thread {
+        Some(t) if process_reaped => t.join().unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Väntar in processen utan att hålla låset mer än ett ögonblick åt gången, så att
+/// vakten kommer åt den om den hänger sig även efter att stdout stängts.
+///
+/// Ger upp efter `deadline`. Vakten försöker döda bara en gång, och misslyckas det hade
+/// väntan annars aldrig tagit slut: uppgiften hade hållit sin plats i kön för alltid,
+/// vilket är just det vakten finns för att förhindra.
+fn wait_whisper(
+    child: &Mutex<std::process::Child>,
+    deadline: Instant,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.lock().unwrap_or_else(|e| e.into_inner()).try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other("processen avslutades inte efter tidsgränsen"));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Lokal transkribering via whisper-cli-sidecarn. Alltid svenska: den enda modell som
 /// paketeras är `ggml-kb-whisper-small.bin`, KB:s SVENSKA finetune. Att skicka `-l no`
 /// eller `-l en` till den gav en svensk modell som låtsades läsa ett annat språk — tyst
@@ -3416,14 +3694,14 @@ fn transcribe(
         }
 
         use std::process::Stdio;
-        use std::io::{BufRead, BufReader};
+        use std::io::BufReader;
 
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
         // Acquire semaphore before spawning — limits concurrent whisper-cli processes to 2.
         // Without this, 5+ simultaneous processes starve each other and all finish too late.
-        let _permit = transcription_semaphore()
+        let permit = transcription_semaphore()
             .acquire()
             .await
             .expect("Transcription semaphore closed");
@@ -3436,150 +3714,187 @@ fn transcribe(
             return;
         }
 
-        match cmd.spawn() {
-            Ok(mut child) => {
-                // Registrera PID:t så att cancel_transcription kan döda ALLA aktiva processer
-                // (inte bara den senaste). PID:t tas bort när processen är klar nedan.
-                {
-                    use crate::TranscriptionProcess;
-                    let proc_state = handle.state::<TranscriptionProcess>();
-                    if let Ok(mut pids) = proc_state.pids.lock() {
-                        pids.insert(child.id());
-                        println!("[KillSwitch] Registered whisper-cli PID={}", child.id());
+        // Allt efter starten blockerar: läsningen av stdout, väntan på processen och
+        // vakten. Det körs därför på en tråd för blockerande arbete, inte på en av
+        // körtidens få arbetartrådar, som annars hölls upptagna så länge processen levde.
+        // Semaforplatsen och temp-filen hålls av den här uppgiften tills tråden är klar.
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            // 🔴 Hela guarden flyttas in med flit. Utan raden fångar closuren bara de
+            // fält som tilldelas, som kopior, och `Drop` bokförde då aldrig utfallet.
+            let mut pending = pending;
+            // 🔴 Efter `pending`, med avsikt: lokala variabler släpps i omvänd ordning, så
+            // platsen i semaforen släpps före guarden. Guardens `Drop` sparar sessionen,
+            // och det kan vara en kopiering av hela ljudfilen; nästa whisper-cli i kön ska
+            // inte vänta på den.
+            let _permit = permit;
+            let started = Instant::now();
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let child_pid = child.id();
+                    // Registrera PID:t så att cancel_transcription kan döda ALLA aktiva processer
+                    // (inte bara den senaste). PID:t tas bort när processen är klar nedan.
+                    let may_run = {
+                        use crate::TranscriptionProcess;
+                        let proc_state = handle.state::<TranscriptionProcess>();
+                        register_whisper_pid(&proc_state.pids, child_pid, || {
+                            generation_is_current(current_session_generation(), my_gen)
+                        })
+                    };
+                    if !may_run {
+                        println!("[gen] Avbruten under start, dödar whisper-cli PID={}", child_pid);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
                     }
-                    drop(proc_state);
-                }
 
-                let stdout = child.stdout.take().expect("Failed to open stdout");
-                let reader = BufReader::new(stdout);
-                
-                let mut full_segment_text = String::new();
+                    // stderr töms i en egen tråd medan stdout läses. Lästes den först när
+                    // stdout tagit slut kunde en process som skriver mer till stderr än
+                    // pipen rymmer blockera, och då tar stdout aldrig slut. Uppmätt
+                    // 2026-10-16 skriver sidecarn ~2,8 KB per segment; att det någon gång
+                    // blir mer är inte visat, men vägen kostar en tråd att stänga.
+                    let stderr_thread = child.stderr.take().map(|mut err| {
+                        std::thread::spawn(move || {
+                            use std::io::Read;
+                            let mut buf = Vec::new();
+                            let _ = err.read_to_end(&mut buf);
+                            buf
+                        })
+                    });
 
-                for line_result in reader.lines() {
-                    match line_result {
-                        Ok(line) => {
-                            let cleaned_text = line.trim();
-                            if cleaned_text.is_empty() { continue; }
+                    let stdout = child.stdout.take().expect("Failed to open stdout");
 
-                            let mut chunk_text = String::new();
-                            if let Some(pos) = cleaned_text.find(']') {
-                                if pos + 1 < cleaned_text.len() {
-                                    chunk_text.push_str(cleaned_text[pos+1..].trim());
-                                }
-                            } else {
-                                chunk_text.push_str(cleaned_text);
-                            }
+                    let limit = whisper_time_limit(duration_sec);
+                    let child = Arc::new(Mutex::new(child));
+                    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+                    let watchdog = spawn_whisper_watchdog(child.clone(), limit, done_rx);
 
-                            let final_text = avkoda_entiteter(chunk_text.trim());
-
-                            // Filter out common whisper boilerplate if NO timestamps were parsed
-                            if !final_text.is_empty() && !final_text.starts_with("whisper_") && !final_text.starts_with("system_info:")
-                                && !is_nospeech(&final_text) {
-                                // 🔴 LOGGA ALDRIG TRANSKRIBERAT INNEHÅLL. Raden skrev
-                                // tidigare ut hela `final_text`, och sedan filloggningen
-                                // infördes hamnade mötesinnehållet därmed i en fil på
-                                // disk. Den stannar visserligen lokalt, men en användare
-                                // som bifogar loggen i ett supportärende hade skickat oss
-                                // sitt möte — och hela produktlöftet är att transkriptet
-                                // är deras. Teckenantalet ger samma diagnostiska svar
-                                // (kom det text tillbaka, och hur mycket) utan innehållet.
-                                //
-                                // Samma regel gäller varje framtida loggrad: `error-slug.ts`
-                                // rapporterar av samma skäl en stabil kod och aldrig fri
-                                // feltext. Loggen får beskriva att något hände, aldrig vad
-                                // som sades.
-                                println!(
-                                    "DEBUG: Streaming text: {} tecken",
-                                    final_text.chars().count()
-                                );
-                                
-                                if !full_segment_text.is_empty() {
-                                    full_segment_text.push(' ');
-                                }
-                                full_segment_text.push_str(&final_text);
-
-                                let _ = handle.emit("transcription-chunk", TranscriptionChunk {
-                                    text: final_text,
-                                    source: source_clone.clone(),
-                                    start: start_offset,
-                                    end: start_offset + duration_sec,
-                                });
-                            }
+                    let read = read_whisper_output(
+                        BufReader::new(stdout),
+                        || generation_is_current(current_session_generation(), my_gen),
+                        |text| {
+                            let _ = handle.emit("transcription-chunk", TranscriptionChunk {
+                                text,
+                                source: source_clone.clone(),
+                                start: start_offset,
+                                end: start_offset + duration_sec,
+                                generation: my_gen,
+                            });
                         },
-                        Err(e) => eprintln!("ERROR: Stdout read error: {}", e),
+                    );
+                    if read.aborted {
+                        // Avbryt hann före processens slut. Avbryt dödar den också, men den
+                        // här uppgiften väntar inte på att det biter.
+                        let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
                     }
-                }
+                    let full_segment_text = read.text;
 
-                let child_pid = child.id();
-                let output = child.wait_with_output();
-                // Avregistrera PID:t — processen är klar.
-                {
-                    use crate::TranscriptionProcess;
-                    let proc_state = handle.state::<TranscriptionProcess>();
-                    if let Ok(mut pids) = proc_state.pids.lock() {
-                        pids.remove(&child_pid);
+                    // Avregistrera PID:t INNAN processen skördas. Avbryt dödar via PID:t, och
+                    // ett skördat PID kan delas ut till en annan process: så länge PID:t står
+                    // i mängden är processen alltså inte skördad. Med stdout stängd är
+                    // processen på väg ut ändå, och hänger den sig här tar vakten den.
+                    {
+                        use crate::TranscriptionProcess;
+                        let proc_state = handle.state::<TranscriptionProcess>();
+                        proc_state.pids.lock().unwrap_or_else(|e| e.into_inner()).remove(&child_pid);
                     }
-                    drop(proc_state);
-                }
-                match output {
-                    Ok(o) => {
-                        // Session ändrad (ny inspelning) eller avbruten av användaren → släng
-                        // resultatet tyst: visa inget fel och spara inget segment.
-                        if current_session_generation() != my_gen {
-                            println!("[gen] Slänger transkriberingsresultat (generation ändrad / avbruten)");
-                            // Inget utfall sätts: `Drop` bokför inte en överspelad generation.
-                            return;
-                        }
 
-                        if !o.status.success() {
-                            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                            let err_msg = format!("Sidecar (whisper-cli) kraschade: {}", stderr);
-                            println!("ERROR: {}", err_msg);
-                            let _ = handle.emit("transcription-error", err_msg);
-                        }
-                        
-                        // Save the full concatenated segment to DB/Session State
-                        let complete_text = full_segment_text.trim().to_string();
-                        // Text vinner över felkoden: kom det text tillbaka syns den för
-                        // användaren, så segmentet räknas inte som ett tomt svar.
-                        pending.outcome = if !complete_text.is_empty() {
-                            WhisperOutcome::Text
-                        } else if !o.status.success() {
-                            pending.error_code = whisper_error::EXIT_NONZERO;
-                            pending.exit_code = o.status.code();
-                            WhisperOutcome::Failed
+                    // Vaktens gräns plus marginal: hinner vakten döda processen ska den
+                // skördas här, inte ge upp samtidigt som vakten.
+                let status = wait_whisper(&child, started + limit + Duration::from_secs(30));
+                    drop(done_tx);
+                    let timed_out = watchdog.join().unwrap_or(false);
+                    let stderr_bytes = take_stderr(stderr_thread, status.is_ok());
+                    // En rad med utfall och tid för varje process som fick köra. Utan den gick
+                    // en process som aldrig blev klar inte att skilja från en tyst app.
+                    println!(
+                        "[KillSwitch] whisper-cli PID={} klar efter {} ms ({}){}",
+                        child_pid,
+                        started.elapsed().as_millis(),
+                        match &status {
+                            Ok(s) => match s.code() {
+                                Some(c) => format!("exit {}", c),
+                                None => "utan exitkod".to_string(),
+                            },
+                            Err(e) => format!("wait-fel: {}", e),
+                        },
+                        if timed_out {
+                            format!(", dödad efter tidsgränsen {} s", limit.as_secs())
                         } else {
-                            WhisperOutcome::Empty
-                        };
-                        if !complete_text.is_empty() {
-                            let segment = Segment {
-                                id: None,
-                                recording_id: None,
-                                start_time: start_offset,
-                                end_time: start_offset + duration_sec,
-                                text: complete_text,
-                                speaker: source_clone.clone(),
-                            };
-                            
-                            session_state_clone.lock().unwrap().segments.push(segment);
+                            String::new()
                         }
-                        // Räkningen och sparförsöket sker när `pending` droppas, på
-                        // vägen ut ur uppgiften — inte här, och inte i någon av de
-                        // andra elva grenarna som tidigare gjorde det för hand.
-                    },
-                    Err(e) => {
-                        eprintln!("ERROR: whisper-cli wait failed: {}", e);
-                        pending.error_code = whisper_error::WAIT_FAILED;
+                    );
+                    let output = status.map(|status| std::process::Output {
+                        status,
+                        stdout: Vec::new(),
+                        stderr: stderr_bytes,
+                    });
+                    match output {
+                        Ok(o) => {
+                            // Session ändrad (ny inspelning) eller avbruten av användaren → släng
+                            // resultatet tyst: visa inget fel och spara inget segment.
+                            if current_session_generation() != my_gen {
+                                println!("[gen] Slänger transkriberingsresultat (generation ändrad / avbruten)");
+                                // Inget utfall sätts: `Drop` bokför inte en överspelad generation.
+                                return;
+                            }
+
+                            if timed_out {
+                                // Eget event: `transcription-error` avslutar bearbetningsläget
+                                // i gränssnittet, och resten av kön arbetar vidare.
+                                let _ = handle.emit("transcription-segment-skipped", ());
+                            } else if !o.status.success() {
+                                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                                let err_msg = format!("Sidecar (whisper-cli) kraschade: {}", stderr);
+                                println!("ERROR: {}", err_msg);
+                                let _ = handle.emit("transcription-error", err_msg);
+                            }
+                        
+                            // Save the full concatenated segment to DB/Session State
+                            let complete_text = full_segment_text.trim().to_string();
+                            // Text vinner över felkoden: kom det text tillbaka syns den för
+                            // användaren, så segmentet räknas inte som ett tomt svar.
+                            pending.outcome = if !complete_text.is_empty() {
+                                WhisperOutcome::Text
+                            } else if timed_out {
+                                pending.error_code = whisper_error::TIMEOUT;
+                                WhisperOutcome::Failed
+                            } else if !o.status.success() {
+                                pending.error_code = whisper_error::EXIT_NONZERO;
+                                pending.exit_code = o.status.code();
+                                WhisperOutcome::Failed
+                            } else {
+                                WhisperOutcome::Empty
+                            };
+                            if !complete_text.is_empty() {
+                                let segment = Segment {
+                                    id: None,
+                                    recording_id: None,
+                                    start_time: start_offset,
+                                    end_time: start_offset + duration_sec,
+                                    text: complete_text,
+                                    speaker: source_clone.clone(),
+                                };
+                            
+                                session_state_clone.lock().unwrap().segments.push(segment);
+                            }
+                            // Räkningen och sparförsöket sker när `pending` droppas, på
+                            // vägen ut ur uppgiften — inte här, och inte i någon av de
+                            // andra elva grenarna som tidigare gjorde det för hand.
+                        },
+                        Err(e) => {
+                            eprintln!("ERROR: whisper-cli wait failed: {}", e);
+                            pending.error_code = whisper_error::WAIT_FAILED;
+                        }
                     }
+                },
+                Err(e) => {
+                    let err_msg = format!("Kunde inte starta processen. Fel: {}", e);
+                    eprintln!("ERROR: {}", err_msg);
+                    let _ = handle.emit("transcription-error", err_msg);
+                    pending.error_code = whisper_error::SPAWN_FAILED;
                 }
-            },
-            Err(e) => {
-                let err_msg = format!("Kunde inte starta processen. Fel: {}", e);
-                eprintln!("ERROR: {}", err_msg);
-                let _ = handle.emit("transcription-error", err_msg);
-                pending.error_code = whisper_error::SPAWN_FAILED;
             }
-        }
+        }).await;
         // Temp-filen raderas av `_temp_wav` när uppgiften avslutas.
     });
 }
@@ -3752,6 +4067,7 @@ fn start_session_recorder(
         };
 
         println!("DEBUG: Session recorder Started Writing: {:?}", filename);
+        session_state.lock().unwrap().recorder_busy = true;
 
         let mut mic_buffer: VecDeque<f32> = VecDeque::new();
         let mut sys_buffer: VecDeque<f32> = VecDeque::new();
@@ -4014,6 +4330,52 @@ fn start_session_recorder(
             (s.vad_threshold, s.cloud_streaming)
         };
 
+        // Uppmätt längd ur filen. Header (44) + frames * 4 (stereo: 2 kanaler × 2 byte/sampel).
+        // OBS: /4.0 (inte /2.0) — annars halveras varaktigheten för stereo-WAV.
+        // En fil på högst 44 byte har inga ramar: längden är uppmätt till noll.
+        let measured_duration = std::fs::metadata(&filename).ok().map(|meta| {
+            let bytes = meta.len();
+            if bytes > 44 { (bytes - 44) as f64 / 4.0 / SAMPLE_RATE as f64 } else { 0.0 }
+        });
+
+        // Under sparlåset: `start_recording` nollställer sessionen under samma lås, så
+        // frågan "har en ny inspelning redan tagit över sessionen?" har ett svar som står
+        // sig tills filen lämnats över.
+        let _save = save_lock();
+        let taken_over = current_session_generation() != session_generation
+            && *is_recording.lock().unwrap();
+        if taken_over {
+            // En ny inspelning startade under väntan ovan. Sessionens segment och räknare
+            // tillhör nu den, så den här filen får en egen rad utan text i stället för att
+            // blandas ihop med den nya inspelningens.
+            session_state.lock().unwrap().recorder_busy = false;
+            let duration = measured_duration.unwrap_or(0.0);
+            let start_ms = crate::recovery::session_start_ms(
+                filename.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+            );
+            match start_ms {
+                Some(start_ms) if duration >= MIN_SAVED_RECORDING_SEC => {
+                    let db_state = app.state::<Mutex<DatabaseManager>>();
+                    let saved = match db_state.lock() {
+                        Ok(db) => crate::recovery::save_unprocessed_wav(
+                            &db, &filename, start_ms, duration, processing_state::INTERRUPTED,
+                        ),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    match saved {
+                        Ok(rec) => {
+                            let _ = app.emit("recording-settled", &rec);
+                        }
+                        Err(e) => eprintln!("ERROR: kunde inte spara den övertagna inspelningen: {}", e),
+                    }
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&filename);
+                }
+            }
+            continue;
+        }
+
         // Update Session State
         {
             let mut state = session_state.lock().unwrap();
@@ -4031,25 +4393,15 @@ fn start_session_recorder(
             }
             state.wav_generation = session_generation;
             state.wav_path = Some(path_str.clone());
-            // Calculate duration (approx based on size if file is closed?)
-            // Or just trust the writer logic which we don't have access to duration easily from finalizing.
-            // But we know samples written... 
-            // Let's use metadata?
-            if let Ok(meta) = std::fs::metadata(&filename) {
-                // Header (44) + frames * 4 (stereo: 2 kanaler × 2 byte/sampel).
-                // OBS: /4.0 (inte /2.0) — annars halveras varaktigheten för stereo-WAV.
-                // En fil på högst 44 byte har inga ramar: längden är uppmätt till noll.
-                let bytes = meta.len();
-                state.duration_sec = if bytes > 44 {
-                    (bytes - 44) as f64 / 4.0 / SAMPLE_RATE as f64
-                } else {
-                    0.0
-                };
+            state.recorder_busy = false;
+            if let Some(d) = measured_duration {
+                state.duration_sec = d;
                 state.duration_measured = true;
             }
         }
         
-        try_save_session(&app, &session_state);
+        save_session_locked(&app, &session_state, false, "history-updated");
+        drop(_save);
 
         let clean_path = if path_str.starts_with("\\\\?\\") {
             path_str[4..].to_string()
@@ -4062,23 +4414,163 @@ fn start_session_recorder(
     }
 }
 
-// Helper to save session to DB only when ready
-fn try_save_session(app: &AppHandle, session_state: &Arc<Mutex<SessionState>>) {
-    let mut state = session_state.lock().unwrap();
-    
-    // Check if recording is done (path exists) and all transcriptions are done
-    if let Some(wav_path) = &state.wav_path {
-        if state.pending_transcriptions == 0 {
-            println!("DEBUG: All conditions met. Saving session to DB...");
-            
-            let start_time_ms = state.start_time.unwrap_or_else(|| SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-            let duration = state.duration_sec;
-            let segments = state.segments.clone();
-            let recording_path = wav_path.clone();
+/// Serialiserar allt som sparar sessionen: recordern vid Stopp, varje transkribering som
+/// blir klar, Avbryt och nästa inspelnings start. Utan låset kunde två av dem se samma
+/// läge och båda skapa en rad, eller en nollställning hamna mitt emellan en avläsning
+/// och skrivningen av dess resultat.
+///
+/// Låsordning: sparlåset först, sedan sessionen, sedan databasen. Sessionens lås hålls
+/// aldrig samtidigt med databasens.
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
-            let measured = state.duration_measured.then_some(duration);
+/// Återställningen körs en gång per körning. En omladdning av gränssnittet får inte köra
+/// den igen medan en inspelning bearbetas.
+static RECOVERY_RAN: AtomicBool = AtomicBool::new(false);
+
+fn save_lock() -> std::sync::MutexGuard<'static, ()> {
+    // Ett förgiftat lås skyddar ingen data (det är `()`): fortsätt hellre spara.
+    SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Nästa steg för en stoppad session.
+#[derive(Debug, PartialEq)]
+enum SaveStep {
+    /// Inget att göra just nu.
+    Wait,
+    /// Spara raden och flytta ljudfilen nu, med status "bearbetas". Transkriberingen
+    /// arbetar vidare och fyller på segmenten.
+    Provisional,
+    /// Raden finns; skriv de segment som blivit klara sedan sist.
+    Append,
+    /// Allt är klart, eller kommer inte att bli det: spara slutläget.
+    Final,
+}
+
+/// Ren beslutsfunktion för sparandet, utbruten för att gå att testa.
+///
+/// 🔴 Tidigare sparades raden först när varje transkribering var klar. Med en lång kö
+/// efter Stopp kunde det dröja många minuter, och stängdes appen under tiden fanns
+/// inspelningen bara som en temporär fil som ingenting läste. Nu sparas raden direkt.
+///
+/// * `force`: spara slutläget oavsett kön (nästa inspelning startar).
+/// * `may_discard`: inspelningen är uppmätt kortare än gränsen. Den kan komma att kasseras
+///   när texten är känd, och får därför ingen rad i förväg.
+fn next_save_step(
+    has_wav: bool,
+    pending: usize,
+    force: bool,
+    has_row: bool,
+    may_discard: bool,
+    unsaved_segments: bool,
+) -> SaveStep {
+    if !has_wav {
+        return SaveStep::Wait;
+    }
+    if pending == 0 || force {
+        return SaveStep::Final;
+    }
+    if !has_row {
+        return if may_discard { SaveStep::Wait } else { SaveStep::Provisional };
+    }
+    if unsaved_segments { SaveStep::Append } else { SaveStep::Wait }
+}
+
+fn try_save_session(app: &AppHandle, session_state: &Arc<Mutex<SessionState>>) {
+    let _save = save_lock();
+    save_session_locked(app, session_state, false, "history-updated");
+}
+
+/// Kräver att sparlåset hålls. `final_event` är eventet för slutläget: `history-updated`
+/// när inspelningen avslutas som vanligt, `recording-settled` när nästa inspelning tar
+/// över. Det senare startar ingen efterbearbetning i gränssnittet, som då redan visar
+/// den nya inspelningen.
+fn save_session_locked(
+    app: &AppHandle,
+    session_state: &Arc<Mutex<SessionState>>,
+    force: bool,
+    final_event: &str,
+) {
+    let mut state = session_state.lock().unwrap();
+    let Some(wav_path) = state.wav_path.clone() else { return };
+
+    let measured = state.duration_measured.then_some(state.duration_sec);
+    let may_discard = matches!(measured, Some(d) if d < MIN_SAVED_RECORDING_SEC);
+    let step = next_save_step(
+        true,
+        state.pending_transcriptions,
+        force,
+        state.provisional_id.is_some(),
+        may_discard,
+        state.segments.len() != state.persisted_segments,
+    );
+
+    match step {
+        SaveStep::Wait => {
+            println!(
+                "DEBUG: Recording check: WAV ready, but {} pending transcriptions.",
+                state.pending_transcriptions
+            );
+        }
+
+        SaveStep::Provisional => {
+            let segments = state.segments.clone();
+            let recording = new_recording_row(&state, wav_path, &segments, Some(processing_state::PROCESSING));
+            drop(state);
+
+            let db_state = app.state::<Mutex<DatabaseManager>>();
+            let saved = match db_state.lock() {
+                Ok(db) => db.save_recording(recording, segments.clone()),
+                Err(e) => Err(e.to_string()),
+            };
+            match saved {
+                Ok(saved) => {
+                    println!("DEBUG: Saved recording ID {:?} at stop, transcription continues.", saved.id);
+                    let mut state = session_state.lock().unwrap();
+                    state.provisional_id = saved.id;
+                    state.persisted_segments = segments.len();
+                    // Filen ligger nu i inspelningskatalogen.
+                    state.wav_path = Some(saved.file_path.clone());
+                    drop(state);
+                    let _ = app.emit("recording-processing", &saved);
+                }
+                // Filen ligger kvar i temp-katalogen; nästa transkribering som blir klar
+                // försöker igen, och slutläget sparar den som förut.
+                Err(e) => eprintln!("ERROR: Could not save recording at stop: {}", e),
+            }
+        }
+
+        SaveStep::Append => {
+            let id = state.provisional_id.expect("Append kräver en rad");
+            // Bara de nya. `segments` växer bara i slutet, så det som redan skrivits är
+            // de första `persisted_segments`.
+            let total = state.segments.len();
+            let new_segments = state.segments[state.persisted_segments.min(total)..].to_vec();
+            drop(state);
+            let db_state = app.state::<Mutex<DatabaseManager>>();
+            let written = match db_state.lock() {
+                Ok(db) => db.append_processing_segments(id, &new_segments),
+                Err(e) => Err(e.to_string()),
+            };
+            match written {
+                // `false`: användaren har raderat raden. Inget mer skrivs till den.
+                Ok(_) => session_state.lock().unwrap().persisted_segments = total,
+                Err(e) => eprintln!("ERROR: Could not write segments: {}", e),
+            }
+        }
+
+        SaveStep::Final => {
+            println!("DEBUG: All conditions met. Saving session to DB...");
+            let segments = state.segments.clone();
+            let duration = state.duration_sec;
+            // Transkriberingar återstod: texten kan sakna slutet.
+            let interrupted = state.pending_transcriptions > 0 || state.cancelled_with_work;
+            // Avbruten, även om slutläget nås först när recordern lämnat över filen.
+            let final_event = if state.cancelled { "recording-settled" } else { final_event };
+            let end_state = interrupted.then_some(processing_state::INTERRUPTED);
+            let provisional_id = state.provisional_id;
+
             let text_known = !state.diagnostics.cloud_streaming && !state.diagnostics.flush_timed_out;
-            if should_discard_recording(measured, !segments.is_empty(), text_known) {
+            if provisional_id.is_none() && should_discard_recording(measured, !segments.is_empty(), text_known) {
                 // Samma bokföring som en sparning, så att en sen transkribering inte
                 // försöker spara sessionen igen.
                 state.wav_path = None;
@@ -4086,13 +4578,13 @@ fn try_save_session(app: &AppHandle, session_state: &Arc<Mutex<SessionState>>) {
                 drop(state);
                 // Filen tas bort här: gallringen av ljud utgår från raderna i databasen och
                 // skulle aldrig hitta en fil utan rad.
-                if let Err(e) = std::fs::remove_file(&recording_path) {
+                if let Err(e) = std::fs::remove_file(&wav_path) {
                     eprintln!("AUDIO: kunde inte ta bort den kasserade inspelningen: {}", e);
                 }
                 println!("DEBUG: Recording discarded ({:.2} s, no text) — not saved.", duration);
                 let _ = app.emit(
                     "recording-discarded",
-                    DiscardedRecording { file_path: &recording_path, duration_sec: duration },
+                    DiscardedRecording { file_path: &wav_path, duration_sec: duration },
                 );
                 return;
             }
@@ -4102,14 +4594,16 @@ fn try_save_session(app: &AppHandle, session_state: &Arc<Mutex<SessionState>>) {
                 .iter()
                 .map(|s| s.text.split_whitespace().count() as u32)
                 .sum();
-            
-            // Allow multiple saves? No, clear logic.
-            // But if we clear wav_path, we can't save again. Good.
-            state.wav_path = None; 
+            let recording = new_recording_row(&state, wav_path.clone(), &segments, end_state);
+
+            // Bokföringen före skrivningen, som förut: misslyckas skrivningen ska inte
+            // varje senare transkribering försöka igen.
+            state.wav_path = None;
             state.saved_generation = Some(state.wav_generation);
-            
+            state.provisional_id = None;
+            state.persisted_segments = 0;
             drop(state);
-            
+
             let db_state = app.state::<Mutex<DatabaseManager>>();
             let db = match db_state.lock() {
                 Ok(d) => d,
@@ -4118,47 +4612,61 @@ fn try_save_session(app: &AppHandle, session_state: &Arc<Mutex<SessionState>>) {
                     return;
                 }
             };
-            
-            // Format created_at manually to avoid chrono dep if not present
-            // (Assuming standard ISO format is fine)
-            // But verify if we can use chrono. 
-            // If not, use simple formatter.
-            // Using a simple SystemTime to ISO string approximation (UTC)
-            let datetime = chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + std::time::Duration::from_millis(start_time_ms as u64));
-            let created_at = datetime.to_rfc3339();
-
-            let recording = Recording {
-                id: None,
-                filename: "recording.wav".to_string(), 
-                file_path: recording_path, 
-                duration_sec: duration,
-                created_at,
-                cloud_job_id: None,
-                analysis_json: None,
-                ai_template_used: None,
-                cloud_transcript: None,
-                cloud_segments: None,
-                sync_status: "local".to_string(),
-                audio_deleted: false,
-                speaker_map: None,
-                has_segments: !segments.is_empty(),
+            let saved = match provisional_id {
+                Some(id) => db.finish_processing(id, &segments, end_state),
+                None => db.save_recording(recording, segments).map(Some),
             };
-            
-            println!("DEBUG: Calling db.save_recording...");
-            match db.save_recording(recording, segments) {
-                Ok(saved_rec) => {
+            drop(db);
+            match saved {
+                Ok(Some(saved_rec)) => {
                     println!("DEBUG: Successfully saved recording ID {} to DB.", saved_rec.id.unwrap_or(-1));
-                    let _ = app.emit(
-                        "history-updated",
-                        SavedRecording { recording: &saved_rec, diagnostics },
-                    );
-                },
+                    if final_event == "history-updated" {
+                        let _ = app.emit(final_event, SavedRecording { recording: &saved_rec, diagnostics });
+                    } else {
+                        let _ = app.emit(final_event, &saved_rec);
+                    }
+                }
+                // Användaren raderade raden medan transkriberingen arbetade. Gränssnittet
+                // väntar fortfarande på slutläget och måste få veta att det inte kommer,
+                // annars står det kvar som upptaget och stängvakten frågar i onödan.
+                Ok(None) => {
+                    println!("DEBUG: Recording row was removed before transcription finished.");
+                    let _ = app.emit("recording-removed", RemovedRecording { file_path: &wav_path });
+                }
                 Err(e) => eprintln!("ERROR: Database save failed: {}", e),
             }
-
-        } else {
-            println!("DEBUG: Recording check: WAV ready, but {} pending transcriptions.", state.pending_transcriptions);
         }
+    }
+}
+
+fn new_recording_row(
+    state: &SessionState,
+    wav_path: String,
+    segments: &[Segment],
+    processing: Option<&str>,
+) -> Recording {
+    let start_time_ms = state
+        .start_time
+        .unwrap_or_else(|| SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    let datetime = chrono::DateTime::<chrono::Utc>::from(
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(start_time_ms as u64),
+    );
+    Recording {
+        id: None,
+        filename: "recording.wav".to_string(),
+        file_path: wav_path,
+        duration_sec: state.duration_sec,
+        created_at: datetime.to_rfc3339(),
+        cloud_job_id: None,
+        analysis_json: None,
+        ai_template_used: None,
+        cloud_transcript: None,
+        cloud_segments: None,
+        sync_status: "local".to_string(),
+        audio_deleted: false,
+        speaker_map: None,
+        has_segments: !segments.is_empty(),
+        processing_state: processing.map(str::to_string),
     }
 }
 
@@ -4315,6 +4823,225 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    mod avbryt_under_transkribering {
+        use super::super::{read_whisper_output, register_whisper_pid};
+        use std::cell::Cell;
+        use std::collections::HashSet;
+        use std::io::Cursor;
+        use std::sync::Mutex;
+
+        const UTDATA: &str = "[00:00:00.000 --> 00:00:02.000]  Hej
+                              [00:00:02.000 --> 00:00:04.000]  och
+                              [00:00:04.000 --> 00:00:06.000]  välkomna
+";
+
+        #[test]
+        fn aktuell_session_far_alla_rader() {
+            let mut sett = Vec::new();
+            let r = read_whisper_output(Cursor::new(UTDATA), || true, |t| sett.push(t));
+            assert_eq!(sett, vec!["Hej", "och", "välkomna"]);
+            assert_eq!(r.text, "Hej och välkomna");
+            assert!(!r.aborted);
+        }
+
+        #[test]
+        fn avbryt_mitt_i_lasningen_stoppar_resten() {
+            // Avbryt kommer efter första raden: ingen rad efter det får nå vyn.
+            let fragor = Cell::new(0);
+            let mut sett = Vec::new();
+            let r = read_whisper_output(
+                Cursor::new(UTDATA),
+                || { fragor.set(fragor.get() + 1); fragor.get() == 1 },
+                |t| sett.push(t),
+            );
+            assert_eq!(sett, vec!["Hej"]);
+            assert!(r.aborted);
+        }
+
+        #[test]
+        fn avbryt_fore_forsta_raden_visar_ingenting() {
+            let mut sett: Vec<String> = Vec::new();
+            let r = read_whisper_output(Cursor::new(UTDATA), || false, |t| sett.push(t));
+            assert!(sett.is_empty());
+            assert!(r.aborted);
+            assert_eq!(r.text, "");
+        }
+
+        #[test]
+        fn utfyllnad_fragar_inte_om_generationen() {
+            // Rader som ändå filtreras bort ska inte avbryta läsningen: en process som
+            // bara gav "nospeech" är inte avbruten.
+            let utdata = "whisper_init: x
+[00:00:00.000 --> 00:00:01.000]  <|nospeech|>
+
+";
+            let mut sett: Vec<String> = Vec::new();
+            let r = read_whisper_output(Cursor::new(utdata), || false, |t| sett.push(t));
+            assert!(sett.is_empty());
+            assert!(!r.aborted);
+        }
+
+        #[test]
+        fn upprepade_lasfel_avslutar_lasningen() {
+            // En ström som bara ger fel, aldrig EOF. Utan spärren snurrar loopen för alltid.
+            struct AlltidFel;
+            impl std::io::Read for AlltidFel {
+                fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                    Err(std::io::Error::other("trasig pipe"))
+                }
+            }
+            let r = read_whisper_output(std::io::BufReader::new(AlltidFel), || true, |_| {});
+            assert_eq!(r.text, "");
+            assert!(!r.aborted);
+        }
+
+        #[test]
+        fn registrering_i_aktuell_session_far_kora() {
+            let pids = Mutex::new(HashSet::new());
+            assert!(register_whisper_pid(&pids, 42, || true));
+            assert!(pids.lock().unwrap().contains(&42));
+        }
+
+        #[test]
+        fn registrering_efter_avbryt_ska_doda_sig_sjalv() {
+            let pids = Mutex::new(HashSet::new());
+            assert!(!register_whisper_pid(&pids, 42, || false));
+            assert!(pids.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn pid_syns_for_avbryt_nar_generationen_provas() {
+            // Kärnan i ordningen: när generationen läses ska PID:t redan ligga i mängden.
+            // Bumpar Avbryt generationen direkt efter läsningen hittar dess tömning då
+            // processen. Prövades generationen före insättningen syns PID:t inte här.
+            // `try_lock` och inte `lock`: hålls låset under frågan är det också fel,
+            // eftersom Avbryt då inte kan tömma mängden förrän frågan är besvarad.
+            let pids = Mutex::new(HashSet::new());
+            let sag_pid = Cell::new(false);
+            let ok = register_whisper_pid(&pids, 42, || {
+                sag_pid.set(pids.try_lock().map(|s| s.contains(&42)).unwrap_or(false));
+                true
+            });
+            assert!(ok);
+            assert!(sag_pid.get(), "PID:t var inte synligt för Avbryt när generationen lästes");
+        }
+    }
+
+    mod whisper_vakten {
+        use super::super::{spawn_whisper_watchdog, take_stderr, wait_whisper, whisper_time_limit};
+
+        #[test]
+        fn stderr_vantas_inte_in_fran_en_process_som_lever() {
+            // Tråden blir aldrig klar så länge avsändaren lever, precis som en läsare av
+            // stderr från en process som inte gått att döda. Väntade funktionen in den
+            // hade testet hängt.
+            let (_lever, rx) = std::sync::mpsc::channel::<()>();
+            let t = std::thread::spawn(move || {
+                let _ = rx.recv();
+                b"aldrig".to_vec()
+            });
+            let start = Instant::now();
+            assert!(take_stderr(Some(t), false).is_empty());
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn stderr_lases_fran_en_skordad_process() {
+            let t = std::thread::spawn(|| b"fel".to_vec());
+            assert_eq!(take_stderr(Some(t), true), b"fel");
+            assert!(take_stderr(None, true).is_empty());
+        }
+        use crate::test_util::langlivad_process;
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn vakten_dodar_en_process_som_inte_blir_klar() {
+            let child = Arc::new(Mutex::new(langlivad_process()));
+            let (_done, rx) = mpsc::channel::<()>();
+            let vakt = spawn_whisper_watchdog(child.clone(), Duration::from_millis(200), rx);
+            assert!(vakt.join().unwrap(), "vakten svarade att den inte dödade något");
+            let status = wait_whisper(&child, Instant::now() + Duration::from_secs(20)).expect("wait");
+            assert!(!status.success());
+        }
+
+        #[test]
+        fn vakten_ror_inte_en_process_som_blev_klar_i_tid() {
+            let child = Arc::new(Mutex::new(langlivad_process()));
+            let (done, rx) = mpsc::channel::<()>();
+            let vakt = spawn_whisper_watchdog(child.clone(), Duration::from_millis(200), rx);
+            drop(done);
+            assert!(!vakt.join().unwrap());
+            std::thread::sleep(Duration::from_millis(300));
+            let mut c = child.lock().unwrap();
+            assert!(c.try_wait().unwrap().is_none(), "vakten dödade en process som blev klar i tid");
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+
+        #[test]
+        fn vantan_ger_upp_efter_sin_deadline() {
+            // Misslyckas vaktens kill får väntan ändå inte bli evig.
+            let child = Mutex::new(langlivad_process());
+            let svar = wait_whisper(&child, Instant::now() + Duration::from_millis(200));
+            assert!(svar.is_err(), "väntan på en levande process returnerade {:?}", svar);
+            let mut c = child.lock().unwrap();
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+
+        #[test]
+        fn tidsgransen_ar_tio_ganger_ljudet_men_minst_en_minut() {
+            assert_eq!(whisper_time_limit(1.0), Duration::from_secs(60));
+            assert_eq!(whisper_time_limit(8.0), Duration::from_secs(80));
+            assert_eq!(whisper_time_limit(-5.0), Duration::from_secs(60));
+            assert_eq!(whisper_time_limit(1.0e9), Duration::from_secs(3600));
+        }
+    }
+
+    mod spara_vid_stopp {
+        use super::super::{next_save_step, SaveStep};
+
+        // (has_wav, pending, force, has_row, may_discard, unsaved_segments)
+
+        #[test]
+        fn raden_sparas_vid_stopp_fast_kon_inte_ar_tom() {
+            // Kärnan i rättelsen. Tidigare väntade sparandet tills kön var tom, och
+            // stängdes appen under tiden fanns ingen rad.
+            assert_eq!(next_save_step(true, 3, false, false, false, false), SaveStep::Provisional);
+        }
+
+        #[test]
+        fn utan_ljudfil_sparas_inget() {
+            assert_eq!(next_save_step(false, 0, false, false, false, false), SaveStep::Wait);
+            assert_eq!(next_save_step(false, 0, true, true, false, true), SaveStep::Wait);
+        }
+
+        #[test]
+        fn tom_ko_ger_slutlage_med_eller_utan_rad() {
+            assert_eq!(next_save_step(true, 0, false, false, false, false), SaveStep::Final);
+            assert_eq!(next_save_step(true, 0, false, true, false, true), SaveStep::Final);
+        }
+
+        #[test]
+        fn nasta_inspelning_tvingar_slutlaget() {
+            assert_eq!(next_save_step(true, 5, true, true, false, true), SaveStep::Final);
+            assert_eq!(next_save_step(true, 5, true, false, true, false), SaveStep::Final);
+        }
+
+        #[test]
+        fn nya_segment_skrivs_till_raden() {
+            assert_eq!(next_save_step(true, 2, false, true, false, true), SaveStep::Append);
+            assert_eq!(next_save_step(true, 2, false, true, false, false), SaveStep::Wait);
+        }
+
+        #[test]
+        fn kort_inspelning_far_ingen_rad_i_forvag() {
+            // Kan kasseras när texten är känd; en rad i förväg skulle synas och försvinna.
+            assert_eq!(next_save_step(true, 1, false, false, true, false), SaveStep::Wait);
+        }
+    }
+
     #[test]
     fn kort_inspelning_utan_text_kasseras() {
         assert!(should_discard_recording(Some(0.0), false, true));
@@ -4386,6 +5113,7 @@ mod tests {
             speaker_map: None,
             audio_deleted: false,
             has_segments: false,
+            processing_state: None,
         };
         let d = SessionDiagnostics { vad_segments: 2, whisper_empty: 2, ..Default::default() };
         let v = serde_json::to_value(SavedRecording { recording: &rec, diagnostics: d }).unwrap();

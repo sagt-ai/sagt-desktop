@@ -1,6 +1,6 @@
 import { format } from "date-fns";
 import { sv } from "date-fns/locale";
-import { Cloud, CloudUpload, Trash2, FileAudio, FileText, FolderOpen, Download } from "lucide-react";
+import { Cloud, CloudUpload, Trash2, FileAudio, FileText, FolderOpen, Download, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { openRecordingsFolder } from "@/lib/storage";
 import { useSyncStore } from "@/store/sync-store";
@@ -34,6 +34,8 @@ interface Recording {
     speaker_map?: string | null;
     audio_deleted: boolean;
     has_segments: boolean;
+    /** Saknas eller null när inspelningen är färdig. */
+    processing_state?: 'processing' | 'interrupted' | 'recovered' | null;
 }
 
 /** "Välj alla" med tredje läget (delvis valt), som bara går att sätta via DOM:en. */
@@ -113,6 +115,12 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
         const unlistenSynced = listen("recording-synced", () => {
             loadRecordings();
         });
+        // Raden sparas vid Stopp och blir färdig senare; en ny inspelning kan också ta
+        // över medan den förra bearbetas, och vid start återställs inspelningar som
+        // aldrig hann sparas.
+        const unlistenProcessing = listen("recording-processing", () => loadRecordings());
+        const unlistenSettled = listen("recording-settled", () => loadRecordings());
+        const unlistenRecovered = listen("recordings-recovered", () => loadRecordings());
         // Auto-gallring kan radera ljudfiler medan listan visas — uppdatera badges.
         const unlistenCleaned = listen("storage-cleaned", () => {
             loadRecordings();
@@ -121,6 +129,9 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
         return () => {
             unlistenHistory.then(f => f());
             unlistenSynced.then(f => f());
+            unlistenProcessing.then(f => f());
+            unlistenSettled.then(f => f());
+            unlistenRecovered.then(f => f());
             unlistenCleaned.then(f => f());
         };
     }, []);
@@ -316,7 +327,31 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
                                                 )}
                                             </td>
                                             <td className="px-6 py-4">
-                                                {rec.has_segments || rec.analysis_json ? (
+                                                {rec.processing_state === 'processing' ? (
+                                                    <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-brand/10 text-brand border border-brand/20"
+                                                        title="Inspelningen är sparad. Texten fylls på medan transkriberingen blir klar."
+                                                    >
+                                                        <Loader2 className="w-3 h-3 animate-spin" />
+                                                        Bearbetas
+                                                    </span>
+                                                ) : (rec.processing_state === 'recovered' || rec.processing_state === 'interrupted') && !rec.has_segments && !rec.analysis_json ? (
+                                                    <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-ochre-soft text-ochre border border-ochre/20"
+                                                        title="Ljudet är sparat, men texten hann inte bli klar innan transkriberingen avbröts eller Sagt.ai stängdes."
+                                                    >
+                                                        <FileText className="w-3 h-3" />
+                                                        Återställd inspelning
+                                                    </span>
+                                                ) : rec.processing_state === 'interrupted' && rec.has_segments ? (
+                                                    <span
+                                                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-ochre-soft text-ochre border border-ochre/20"
+                                                        title="Transkriberingen avbröts innan den var klar. Ljudet är helt, men slutet av texten kan saknas."
+                                                    >
+                                                        <FileText className="w-3 h-3" />
+                                                        Ofullständig
+                                                    </span>
+                                                ) : rec.has_segments || rec.analysis_json ? (
                                                     <span
                                                         className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-verified/10 text-verified border border-verified/20"
                                                         title="Transkript och analys finns på den här datorn"

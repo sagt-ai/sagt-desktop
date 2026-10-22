@@ -1,4 +1,29 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+
+// Craten egna utskriftsmakron. De skuggar std:s i hela craten och skriver via
+// `applog::write_line`, som efter `init` går direkt till loggen. Skälet står där:
+// på Windows tappar std:s `println!` all text när appen startats från Start-menyn.
+// 🔴 De måste stå FÖRE `mod`-raderna nedan: ett `macro_rules!` syns bara i det som
+// kommer efter det i källtexten.
+macro_rules! println {
+    () => { $crate::applog::write_line(::std::format_args!(""), true, false) };
+    ($($arg:tt)*) => { $crate::applog::write_line(::std::format_args!($($arg)*), true, false) };
+}
+// Oanvända i dag, men måste finnas: ett framtida print! hade annars gått via std och
+// tappats på samma sätt.
+#[allow(unused_macros)]
+macro_rules! print {
+    ($($arg:tt)*) => { $crate::applog::write_line(::std::format_args!($($arg)*), false, false) };
+}
+macro_rules! eprintln {
+    () => { $crate::applog::write_line(::std::format_args!(""), true, true) };
+    ($($arg:tt)*) => { $crate::applog::write_line(::std::format_args!($($arg)*), true, true) };
+}
+#[allow(unused_macros)]
+macro_rules! eprint {
+    ($($arg:tt)*) => { $crate::applog::write_line(::std::format_args!($($arg)*), false, true) };
+}
+
 pub mod applog;
 mod audio;
 mod audio_meter;
@@ -7,6 +32,7 @@ mod audio_meter;
 #[cfg(target_os = "macos")]
 mod mac_sysaudio;
 mod database;
+mod recovery;
 mod mcp;
 
 use database::{CleanupResult, DatabaseManager, Recording, Segment, StorageUsage};
@@ -45,8 +71,14 @@ fn get_audio_devices(
     state.get_input_devices()
 }
 
+// Synkront med avsikt, som `stop_recording`: båda körs då på huvudtråden i den ordning
+// de kom. Som `async` hade en Stopp direkt efter en start kunnat köras först, och
+// starten sedan lämnat motorn inspelande medan gränssnittet visade stoppat. Priset är
+// att fönstret står stilla medan den förra inspelningen sparas, vilket bara märks om
+// den sparningen är en kopiering mellan volymer.
 #[tauri::command]
 fn start_recording(
+    app: tauri::AppHandle,
     state: tauri::State<'_, audio::AudioMonitor>,
     proc: tauri::State<'_, TranscriptionProcess>,
 ) -> Result<(), String> {
@@ -54,12 +86,8 @@ fn start_recording(
     // (döda kvarvarande whisper-cli + invalidera köade) så gammal text inte läcker in
     // i den nya inspelningen.
     audio::bump_session_generation();
-    if let Ok(mut pids) = proc.pids.lock() {
-        for pid in pids.drain() {
-            kill_pid(pid);
-        }
-    }
-    state.start_recording()
+    kill_registered(&proc.pids, kill_pid);
+    state.start_recording(&app)
 }
 
 #[tauri::command]
@@ -125,35 +153,102 @@ fn set_live_diarize_mode(
     state.set_live_diarize(enabled);
 }
 
-#[tauri::command]
+// `async`: kommandot kör annars på huvudtråden, och taskkill och sparandet nedan låste
+// då fönstret medan de pågick.
+#[tauri::command(async)]
 fn cancel_transcription(
+    app: tauri::AppHandle,
     state: tauri::State<'_, TranscriptionProcess>,
-) -> Result<(), String> {
+    monitor: tauri::State<'_, audio::AudioMonitor>,
+) -> Result<u64, String> {
+    // Först av allt, så att ett klick syns i loggen även när det inte fanns något att döda.
+    println!("[KillSwitch] Avbryt begärt");
     // Bumpa generationen → köade OCH pågående uppgifter slänger sina resultat (se audio.rs).
-    audio::bump_session_generation();
+    // 🔴 Före tömningen nedan: uppgiften registrerar sitt PID och prövar generationen i
+    // omvänd ordning, så att en process som startar under Avbryt inte överlever det.
+    let generation = audio::bump_session_generation();
     // Döda ALLA aktiva whisper-cli-processer, inte bara den senast spawnade.
-    if let Ok(mut pids) = state.pids.lock() {
-        for pid in pids.drain() {
-            kill_pid(pid);
-        }
-    }
-    Ok(())
+    let (attempted, killed) = kill_registered(&state.pids, kill_pid);
+    println!(
+        "[KillSwitch] Generation nu {}, {} av {} whisper-cli dödade",
+        generation, killed, attempted
+    );
+    // Spara det som finns. Utan detta väntade sparandet på transkriberingar som just
+    // avbrutits, och inspelningen sparades aldrig.
+    monitor.cancel_session(&app);
+    // Gränssnittet visar bara text från den här generationen och senare.
+    Ok(generation)
 }
 
-/// Dödar en whisper-cli-process via OS:ets kill-kommando (best-effort).
-fn kill_pid(pid: u32) {
+/// Finns en inspelning som inte är färdigsparad? Frågas av stängvakten och uppdateraren.
+/// Svaret kommer från ljudmotorn, inte från gränssnittets tillstånd, så att det stämmer
+/// även efter en omladdning av gränssnittet.
+#[tauri::command]
+fn session_busy(monitor: tauri::State<'_, audio::AudioMonitor>) -> bool {
+    monitor.session_busy()
+}
+
+/// Vid start: inspelningar som aldrig blev färdigsparade får en rad. Körs en gång per
+/// körning, och inte medan en inspelning pågår. Asynkront, så att en flytt av en stor
+/// ljudfil mellan volymer inte fryser fönstret.
+#[tauri::command]
+async fn recover_recordings(
+    monitor: tauri::State<'_, audio::AudioMonitor>,
+    db: tauri::State<'_, Mutex<DatabaseManager>>,
+    marker: Option<recovery::LeftoverMarker>,
+) -> Result<recovery::RecoveryReport, String> {
+    Ok(monitor.recover(&db, marker))
+}
+
+/// Tömmer mängden och anropar `kill` för varje PID medan låset hålls. Svarar med
+/// (antal försök, antal som lyckades).
+///
+/// 🔴 Under låset. En uppgift avregistrerar sitt PID innan den skördar processen, så ett
+/// PID i mängden tillhör alltid en process som inte skördats. Dödades de efter att låset
+/// släppts kunde en process hinna avslutas och dess PID delas ut till en annan process
+/// innan kill kom fram. Ett förgiftat lås får inte hindra att processerna dödas.
+fn kill_registered(pids: &Mutex<HashSet<u32>>, kill: impl Fn(u32) -> bool) -> (usize, usize) {
+    let mut pids = pids.lock().unwrap_or_else(|e| e.into_inner());
+    let attempted = pids.len();
+    let killed = pids.drain().filter(|&pid| kill(pid)).count();
+    (attempted, killed)
+}
+
+/// Dödar en whisper-cli-process via OS:ets kill-kommando (best-effort) och svarar om det
+/// lyckades. Utfallet loggas: ett misslyckat kill var tidigare osynligt, och en process
+/// som överlevt Avbryt gick då inte att skilja från en som aldrig fanns.
+fn kill_pid(pid: u32) -> bool {
     println!("[KillSwitch] Killing whisper-cli process PID={}", pid);
     #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("taskkill")
+    let result = {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW, som för whisper-cli: taskkill är ett konsolprogram, och
+        // startat från en app utan konsol får det annars ett eget konsolfönster.
+        // ⚠️ ANTAGANDE: att det fönstret (och muspekaren som visar att ett program
+        // startar) är vad som syntes efter Avbryt. Inte kört i appen.
+        std::process::Command::new("taskkill")
             .args(&["/F", "/PID", &pid.to_string()])
-            .output();
-    }
+            .creation_flags(0x08000000)
+            .output()
+    };
     #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(&["-9", &pid.to_string()])
-            .output();
+    let result = std::process::Command::new("kill")
+        .args(&["-9", &pid.to_string()])
+        .output();
+    match result {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            eprintln!(
+                "[KillSwitch] Kunde inte döda PID={} ({:?})",
+                pid,
+                out.status.code()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("[KillSwitch] Kunde inte starta kill för PID={}: {}", pid, e);
+            false
+        }
     }
 }
 
@@ -329,7 +424,13 @@ pub fn run() {
         // fönster, mikrofon eller databas, och det fönster som redan finns visas.
         // MCP-läget ovan avslutar före byggaren och berörs inte.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.webview_windows().into_values().next() {
+            // Raden skrivs av den process som redan körde. Den nya avslutas i pluginet,
+            // före `setup` där loggen öppnas, så utan raden lämnar en omstart inget spår.
+            // ⚠️ ANTAGANDE: att pluginet avslutar den nya processen före `setup`. Följer
+            // av dokumentationen, inte kört och mätt.
+            let windows = app.webview_windows();
+            println!("DEBUG: Ny start begärd medan appen körde ({} fönster)", windows.len());
+            if let Some(window) = windows.into_values().next() {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -420,6 +521,8 @@ pub fn run() {
             get_audio_devices,
             start_recording,
             stop_recording,
+            session_busy,
+            recover_recordings,
             start_mic_preview,
             stop_mic_preview,
             stop_audio_listener,
@@ -447,6 +550,112 @@ pub fn run() {
             mcp::commands::mcp_clear_session,
             mcp::commands::mcp_server_command
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, event| match event {
+            // Avslutet syns i loggen. Utan raderna gick en process som levde vidare
+            // utan fönster inte att skilja från en som avslutats.
+            tauri::RunEvent::ExitRequested { code, .. } => {
+                println!("DEBUG: Avslut begärt (kod {:?})", code);
+            }
+            tauri::RunEvent::Exit => println!("DEBUG: Appen avslutas"),
+            _ => {}
+        });
+}
+
+/// Delat mellan modulernas tester.
+#[cfg(test)]
+pub(crate) mod test_util {
+    /// En process som lever i 30 sekunder om ingen dödar den.
+    pub fn langlivad_process() -> std::process::Child {
+        #[cfg(target_os = "windows")]
+        let mut cmd = std::process::Command::new("ping");
+        #[cfg(target_os = "windows")]
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = std::process::Command::new("sleep");
+        #[cfg(not(target_os = "windows"))]
+        cmd.arg("30");
+        cmd.stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("kunde inte starta testprocessen")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kill_pid, kill_registered};
+    use crate::test_util::langlivad_process;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    #[test]
+    fn println_i_craten_gar_till_loggen_och_inte_via_std() {
+        // Kopplingen mellan craten utskrifter och loggen. Saknas makrot, eller står det
+        // efter mod-raderna, går println! via std och testharnessens fångst i stället.
+        let path = std::env::temp_dir().join(format!("sagt-makro-{}.txt", std::process::id()));
+        let file = std::fs::File::create(&path).expect("temporär fil");
+        crate::applog::set_pipe_for_test(file);
+        println!("MAKRO_NADDE_LOGGEN_8d1e");
+        eprintln!("MAKRO_STDERR_8d1e");
+        crate::applog::println_from_module("MAKRO_I_MODUL_8d1e");
+        let innehall = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        assert!(innehall.contains("MAKRO_NADDE_LOGGEN_8d1e
+"), "println! gick inte via loggen: {innehall:?}");
+        assert!(innehall.contains("MAKRO_STDERR_8d1e
+"), "eprintln! gick inte via loggen: {innehall:?}");
+        assert!(
+            innehall.contains("MAKRO_I_MODUL_8d1e
+"),
+            "println! i en modul gick via std; står makrona efter mod-raderna? {innehall:?}"
+        );
+    }
+
+    #[test]
+    fn rakningen_skiljer_forsok_fran_lyckade() {
+        let pids = Mutex::new(HashSet::from([4u32, 8, 12]));
+        let (forsok, lyckade) = kill_registered(&pids, |pid| pid != 8);
+        assert_eq!((forsok, lyckade), (3, 2));
+    }
+
+    #[test]
+    fn avbryt_dodar_medan_mangden_ar_last() {
+        // En uppgift avregistrerar sitt PID innan den skördar processen. Hålls låset under
+        // kill kan processen alltså inte ha skördats, och PID:t inte ha delats ut på nytt.
+        let pids = Mutex::new(HashSet::from([4u32, 8]));
+        let lasta = std::cell::Cell::new(0);
+        let (n, _) = kill_registered(&pids, |_| {
+            if pids.try_lock().is_err() {
+                lasta.set(lasta.get() + 1);
+            }
+            true
+        });
+        assert_eq!(n, 2);
+        assert_eq!(lasta.get(), 2, "kill anropades utan att mängden var låst");
+        assert!(pids.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kill_pid_dodar_processen_och_svarar_ja() {
+        let mut child = langlivad_process();
+        assert!(kill_pid(child.id()));
+        let status = child.wait().expect("wait");
+        assert!(!status.success(), "processen avslutades inte av kill");
+    }
+
+    #[test]
+    fn kill_pid_svarar_nej_nar_inget_dog() {
+        // Svaret ska vara nej när ingenting dödades, inte det tysta ja som det kastade
+        // utfallet tidigare motsvarade.
+        //
+        // 🔴 Ett PID som aldrig kan finnas, inte ett som just avslutats: Windows återanvänder
+        // PID:n snabbt, och testet hade då kunnat döda en främmande process. Värdet är
+        // ingen multipel av fyra; uppmätt 2026-10-16 var samtliga 283 PID:n på en
+        // Windows 11-maskin det, och `taskkill` svarade 128 ("not found") på just det här.
+        // Det ryms i ett i32, så att `kill` inte kan tolka det som -1 (alla processer).
+        // ⚠️ ANTAGANDE: att det ligger över PID-taket på macOS och Linux. Inte kört där.
+        const FINNS_INTE: u32 = 99_999_999;
+        assert!(!kill_pid(FINNS_INTE));
+    }
 }

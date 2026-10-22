@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Mic2, Minus, Square, Copy, X } from "lucide-react";
 import { isMacOS } from "@/lib/platform";
+import { allowLeave, blockContextMenu, blockReload, LEAVE_MESSAGE, LEAVE_TITLE } from "@/lib/session-busy";
+import { appSessionBusy } from "@/lib/session-busy-app";
 
 /**
  * Titelrad — samma komponent på båda plattformarna, med TVÅ oberoende villkor.
@@ -47,6 +49,42 @@ export function TitleBar() {
         appWindow.isDecorated()
             .then(setDecorated)
             .catch(() => { /* behåll plattformsgissningen — hellre fel padding än ingen titelrad */ });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Stängvakten. Med en lyssnare här stänger Tauri inte fönstret själv vid
+    // CloseRequested, utan lämnar beslutet hit. Utan vakten kunde appen stängas mellan
+    // Stopp och sparandet, och mötet fanns då bara som en temporär fil.
+    // ⚠️ ANTAGANDE: att Alt+F4 och stängning från aktivitetsfältet går samma väg som
+    // krysset. Inte kört i appen.
+    useEffect(() => {
+        const unlistenPromise = appWindow.onCloseRequested(async (event) => {
+            const ok = await allowLeave(appSessionBusy, async () => {
+                const { ask } = await import("@tauri-apps/plugin-dialog");
+                return ask(LEAVE_MESSAGE, {
+                    title: LEAVE_TITLE,
+                    kind: "warning",
+                    okLabel: "Stäng ändå",
+                    cancelLabel: "Fortsätt",
+                });
+            });
+            if (!ok) event.preventDefault();
+        });
+        // Omladdningsspärren: i fångstfasen, före allt annat som lyssnar på tangenter.
+        const onKey = (e: KeyboardEvent) => { blockReload(e, import.meta.env.DEV); };
+        window.addEventListener("keydown", onKey, true);
+        const onMenu = (e: MouseEvent) => {
+            const t = e.target as HTMLElement | null;
+            const editable = !!t?.closest?.("input, textarea, [contenteditable=''], [contenteditable='true']");
+            const hasSelection = (window.getSelection()?.toString() ?? "").length > 0;
+            blockContextMenu(e, { editable }, hasSelection, import.meta.env.DEV);
+        };
+        window.addEventListener("contextmenu", onMenu, true);
+        return () => {
+            window.removeEventListener("contextmenu", onMenu, true);
+            unlistenPromise.then((unlisten) => unlisten());
+            window.removeEventListener("keydown", onKey, true);
+        };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 

@@ -47,6 +47,7 @@ import { recordingMarker, startTimeFromPath, SAME_RECORDING_MS } from "@/lib/rec
 import { accountButtonPanel, clampSplit } from "@/lib/panel-layout";
 import { useLayoutStore } from "@/store/layout-store";
 import { cn } from "@/lib/utils";
+import { chunkGate } from "@/lib/chunk-gate";
 import { CollapsedPanelStrip, PANEL_HEADER_HEIGHT, PanelControls, PanelResizer } from "./panel-chrome";
 
 // Inspelningar (starttid i ms) som redan fått eventet för raden efter en långsam
@@ -382,11 +383,17 @@ export function SplitView() {
         // #11: töm moln-kön också — annars fortsätter buffrade chunks att POSTas och text dimpa in.
         cancelCloudStream();
         useTranscriptionStore.getState().setIsProcessing(false);
+        // Stäng spärren för lokal text redan nu: en rad som skickats före klicket kan
+        // annars hinna fram innan Avbryt svarat.
+        chunkGate.beginCancel();
+        let generation: number | undefined;
         try {
             // Kill the active whisper-cli child process in Rust
-            await invoke('cancel_transcription');
+            generation = await invoke<number>('cancel_transcription');
         } catch (e) {
             console.error("Failed to kill transcription process:", e);
+        } finally {
+            chunkGate.finishCancel(generation);
         }
         try {
             await invoke("stop_recording");

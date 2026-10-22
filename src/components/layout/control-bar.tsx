@@ -20,6 +20,7 @@ import { usePostHogEvents, showError, captureEvent } from "@/hooks/use-posthog-e
 import { resetCloudStream } from "@/hooks/use-cloud-stream";
 import { transcriptOutcomeProps, type SessionDiagnostics } from "@/lib/session-diagnostics";
 import { recordingMarker, HEARTBEAT_MS } from "@/lib/recording-marker";
+import { settleRemovedRecording } from "@/lib/recording-removed";
 import { MicSilenceDetector, MIC_SILENT_TEXT } from "@/lib/mic-silence";
 import { useAmplitudeStore } from "@/store/amplitude-store";
 
@@ -296,6 +297,31 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
             useTranscriptionStore.getState().setIsProcessing(false);
             setUploadStatus('idle');
             toast.info("Inspelningen var kortare än tre sekunder och sparades inte.");
+        });
+        return () => { unlistenPromise.then(f => f()); };
+    }, [setUploadStatus]);
+
+    // Avbryt, eller en ny inspelning som tog över medan den förra transkriberades: den
+    // förra sparas med den text den hann få, utan efterbearbetning. Markören tas bort här
+    // i stället för vid history-updated. `saved` matchar på filens starttid och rör inte
+    // en ny inspelnings markör.
+    useEffect(() => {
+        const unlistenPromise = listen<{ file_path: string }>("recording-settled", (event) => {
+            recordingMarker.saved(event.payload.file_path);
+        });
+        return () => { unlistenPromise.then(f => f()); };
+    }, []);
+
+    // Inspelningen raderades medan den transkriberades: inget slutläge kommer (se
+    // recording-removed.ts).
+    useEffect(() => {
+        const unlistenPromise = listen<{ file_path: string }>("recording-removed", (event) => {
+            settleRemovedRecording(event.payload.file_path, {
+                isRecording: useSyncStore.getState().isRecording,
+                markSaved: (p) => recordingMarker.saved(p),
+                setIsProcessing: (v) => useTranscriptionStore.getState().setIsProcessing(v),
+                setUploadStatus,
+            });
         });
         return () => { unlistenPromise.then(f => f()); };
     }, [setUploadStatus]);

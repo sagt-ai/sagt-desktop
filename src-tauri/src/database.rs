@@ -39,6 +39,24 @@ pub struct Recording {
     /// "Transkribering & analys"-kolumnen i Inspelningar-vyn.
     #[serde(default)]
     pub has_segments: bool,
+    /// Var inspelningen står efter Stopp. `None` = färdig. Se `processing_state`.
+    #[serde(default)]
+    pub processing_state: Option<String>,
+}
+
+/// Värdena i kolumnen `processing_state`. `NULL` betyder att inspelningen är färdig.
+///
+/// Raden och ljudfilen sparas direkt vid Stopp, innan den lokala transkriberingen hunnit
+/// ikapp. Stängs appen under tiden finns inspelningen redan i biblioteket, med den text
+/// som hann bli klar.
+pub mod processing_state {
+    /// Sparad vid Stopp. Segmenten fylls på medan transkriberingen arbetar ikapp.
+    pub const PROCESSING: &str = "processing";
+    /// Transkriberingen avbröts: av Avbryt, av en ny inspelning, eller av att appen
+    /// stängdes. Ljudet är helt, texten kan saknas i slutet.
+    pub const INTERRUPTED: &str = "interrupted";
+    /// Hittad vid start som en ljudfil utan rad. Ljudet finns, texten saknas.
+    pub const RECOVERED: &str = "recovered";
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -91,6 +109,16 @@ impl DatabaseManager {
         let manager = Self { db_path, recordings_dir };
         manager.init_db().expect("Failed to init DB");
         manager
+    }
+
+    /// Samma som `new`, men i en given katalog och utan appen. För tester.
+    #[cfg(test)]
+    pub fn new_in(app_data_dir: PathBuf) -> Result<Self, String> {
+        let recordings_dir = app_data_dir.join("recordings");
+        fs::create_dir_all(&recordings_dir).map_err(|e| e.to_string())?;
+        let manager = Self { db_path: app_data_dir.join("whisper.db"), recordings_dir };
+        manager.init_db().map_err(|e| e.to_string())?;
+        Ok(manager)
     }
 
     fn get_connection(&self) -> Result<Connection> {
@@ -200,6 +228,18 @@ impl DatabaseManager {
             let _ = conn.execute("ALTER TABLE recordings ADD COLUMN cloud_segments TEXT", []);
         }
 
+        // Migration: processing_state — inspelningen sparas vid Stopp och blir färdig senare.
+        // NULL för alla befintliga rader: de sparades först när de var färdiga.
+        let processing_state_col_exists: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('recordings') WHERE name='processing_state'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0) > 0;
+
+        if !processing_state_col_exists {
+            let _ = conn.execute("ALTER TABLE recordings ADD COLUMN processing_state TEXT", []);
+        }
+
         Ok(())
     }
 
@@ -210,13 +250,12 @@ impl DatabaseManager {
             if temp_path.exists() {
                 let filename = temp_path.file_name().ok_or("Invalid filename")?;
                 let new_path = self.recordings_dir.join(filename);
-                
-                fs::copy(temp_path, &new_path).map_err(|e| format!("Failed to copy file: {}", e))?;
-                // Best-effort cleanup: delete temp WAV from %TEMP% after copying to persistent storage.
-                // Failure is non-fatal — the recording is already saved.
-                if let Err(e) = fs::remove_file(temp_path) {
-                    eprintln!("Warning: could not delete temp file {:?}: {}", temp_path, e);
-                }
+
+                // Flytt först: på samma volym är den omedelbar, och sparandet vid Stopp
+                // ska inte behöva kopiera en timslång inspelning medan appen kan stängas.
+                // Ligger temp-katalogen på en annan volym misslyckas flytten, och då
+                // kopieras filen som förut.
+                move_file(temp_path, &new_path).map_err(|e| format!("Failed to copy file: {}", e))?;
                 
                 (new_path.to_string_lossy().to_string(), filename.to_string_lossy().to_string())
             } else {
@@ -224,16 +263,32 @@ impl DatabaseManager {
             }
         };
 
-        recording.file_path = new_path_str;
+        let original_path = std::mem::replace(&mut recording.file_path, new_path_str);
         recording.filename = filename_str;
 
+        match self.insert_recording(&mut recording, segments) {
+            Ok(()) => Ok(recording),
+            Err(e) => {
+                // Utan rad hittas filen aldrig i inspelningskatalogen: gallringen och
+                // återställningen utgår från raderna respektive temp-katalogen. Den
+                // flyttas därför tillbaka, så att nästa försök, eller återställningen
+                // vid nästa start, hittar den där den låg.
+                if let Err(back) = move_file(Path::new(&recording.file_path), Path::new(&original_path)) {
+                    eprintln!("Warning: could not move {:?} back after failed save: {}", recording.file_path, back);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn insert_recording(&self, recording: &mut Recording, segments: Vec<Segment>) -> Result<(), String> {
         let mut conn = self.get_connection().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
 
         // 2. Insert Recording
         tx.execute(
-            "INSERT INTO recordings (filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map, cloud_segments)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO recordings (filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map, cloud_segments, processing_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 recording.filename,
                 recording.file_path,
@@ -246,7 +301,8 @@ impl DatabaseManager {
                 recording.cloud_transcript,
                 recording.audio_deleted,
                 recording.speaker_map,
-                recording.cloud_segments
+                recording.cloud_segments,
+                recording.processing_state
             ],
         ).map_err(|e| e.to_string())?;
 
@@ -254,32 +310,36 @@ impl DatabaseManager {
         recording.id = Some(recording_id);
 
         // 3. Insert Segments
-        let mut stmt = tx.prepare(
-            "INSERT INTO segments (recording_id, start_time, end_time, text, speaker)
-             VALUES (?1, ?2, ?3, ?4, ?5)"
-        ).map_err(|e| e.to_string())?;
-
-        for segment in segments {
-            stmt.execute(params![
-                recording_id,
-                segment.start_time,
-                segment.end_time,
-                segment.text,
-                segment.speaker
-            ]).map_err(|e| e.to_string())?;
-        }
-        drop(stmt);
+        Self::insert_segments(&tx, recording_id, &segments)?;
 
         tx.commit().map_err(|e| e.to_string())?;
-
-        Ok(recording)
+        Ok(())
     }
 
     pub fn get_all_recordings(&self) -> Result<Vec<Recording>, String> {
         let conn = self.get_connection().map_err(|e| e.to_string())?;
-        let mut stmt = conn.prepare("SELECT id, filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map, cloud_segments, EXISTS(SELECT 1 FROM segments WHERE segments.recording_id = recordings.id) FROM recordings ORDER BY created_at DESC").map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare("SELECT id, filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map, cloud_segments, EXISTS(SELECT 1 FROM segments WHERE segments.recording_id = recordings.id), processing_state FROM recordings ORDER BY created_at DESC").map_err(|e| e.to_string())?;
 
-        let recordings_iter = stmt.query_map([], |row| {
+        let recordings_iter = stmt.query_map([], Self::map_recording).map_err(|e| e.to_string())?;
+
+        let mut recordings = Vec::new();
+        for recording in recordings_iter {
+            recordings.push(recording.map_err(|e| e.to_string())?);
+        }
+        Ok(recordings)
+    }
+
+    /// En rad, med samma kolumner som `get_all_recordings`.
+    pub fn get_recording(&self, id: i64) -> Result<Recording, String> {
+        let conn = self.get_connection().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT id, filename, file_path, duration_sec, created_at, sync_status, cloud_job_id, analysis_json, ai_template_used, cloud_transcript, audio_deleted, speaker_map, cloud_segments, EXISTS(SELECT 1 FROM segments WHERE segments.recording_id = recordings.id), processing_state FROM recordings WHERE id = ?1",
+            params![id],
+            Self::map_recording,
+        ).map_err(|e| e.to_string())
+    }
+
+    fn map_recording(row: &rusqlite::Row) -> rusqlite::Result<Recording> {
             Ok(Recording {
                 id: Some(row.get(0)?),
                 filename: row.get(1)?,
@@ -295,14 +355,96 @@ impl DatabaseManager {
                 speaker_map: row.get(11)?,
                 cloud_segments: row.get(12)?,
                 has_segments: row.get(13)?,
+                processing_state: row.get(14)?,
             })
-        }).map_err(|e| e.to_string())?;
+    }
 
-        let mut recordings = Vec::new();
-        for recording in recordings_iter {
-            recordings.push(recording.map_err(|e| e.to_string())?);
+    /// Avslutar en inspelning som sparades vid Stopp: ersätter segmenten och sätter
+    /// slutläget (`None` = färdig, eller `INTERRUPTED`).
+    ///
+    /// Rör bara en rad som fortfarande står på `PROCESSING`. Har användaren raderat den,
+    /// eller har den redan avslutats, returneras `Ok(None)` och ingenting skrivs: en sen
+    /// transkribering får inte återuppliva en raderad inspelning.
+    pub fn finish_processing(&self, id: i64, segments: &[Segment], end_state: Option<&str>) -> Result<Option<Recording>, String> {
+        let mut conn = self.get_connection().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let changed = tx.execute(
+            "UPDATE recordings SET processing_state = ?1 WHERE id = ?2 AND processing_state = ?3",
+            params![end_state, id, processing_state::PROCESSING],
+        ).map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Ok(None);
         }
-        Ok(recordings)
+        Self::replace_segments(&tx, id, segments)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.get_recording(id).map(Some)
+    }
+
+    /// Lägger till segment som blivit klara för en inspelning som fortfarande bearbetas.
+    /// Bara de nya: segmenten kommer i den ordning de blir klara och läggs alltid till
+    /// sist, så det som redan står i raden ändras aldrig. Samma vakt som
+    /// `finish_processing`: en raderad eller avslutad rad rörs inte.
+    pub fn append_processing_segments(&self, id: i64, new_segments: &[Segment]) -> Result<bool, String> {
+        let mut conn = self.get_connection().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let still_processing: bool = tx.query_row(
+            "SELECT count(*) FROM recordings WHERE id = ?1 AND processing_state = ?2",
+            params![id, processing_state::PROCESSING],
+            |row| row.get::<_, i64>(0),
+        ).map_err(|e| e.to_string())? > 0;
+        if !still_processing {
+            return Ok(false);
+        }
+        Self::insert_segments(&tx, id, new_segments)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// Finns en rad vars ljudfil har det här namnet? Sessionsfilens namn behålls när den
+    /// flyttas till inspelningskatalogen.
+    pub fn has_recording_named(&self, filename: &str) -> Result<bool, String> {
+        let conn = self.get_connection().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT count(*) FROM recordings WHERE filename = ?1",
+            params![filename],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .map_err(|e| e.to_string())
+    }
+
+    /// Rader som stod på `PROCESSING` när appen startade: appen stängdes medan
+    /// transkriberingen arbetade ikapp. Ljudet och texten fram till dess finns kvar.
+    /// Returnerar antalet.
+    pub fn mark_interrupted_processing(&self) -> Result<usize, String> {
+        let conn = self.get_connection().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE recordings SET processing_state = ?1 WHERE processing_state = ?2",
+            params![processing_state::INTERRUPTED, processing_state::PROCESSING],
+        ).map_err(|e| e.to_string())
+    }
+
+    fn replace_segments(tx: &rusqlite::Transaction, recording_id: i64, segments: &[Segment]) -> Result<(), String> {
+        tx.execute("DELETE FROM segments WHERE recording_id = ?1", params![recording_id])
+            .map_err(|e| e.to_string())?;
+        Self::insert_segments(tx, recording_id, segments)
+    }
+
+    fn insert_segments(tx: &rusqlite::Transaction, recording_id: i64, segments: &[Segment]) -> Result<(), String> {
+        let mut stmt = tx.prepare(
+            "INSERT INTO segments (recording_id, start_time, end_time, text, speaker)
+             VALUES (?1, ?2, ?3, ?4, ?5)"
+        ).map_err(|e| e.to_string())?;
+        for segment in segments {
+            stmt.execute(params![
+                recording_id,
+                segment.start_time,
+                segment.end_time,
+                segment.text,
+                segment.speaker
+            ]).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn get_recording_segments(&self, recording_id: i64) -> Result<Vec<Segment>, String> {
@@ -333,23 +475,8 @@ impl DatabaseManager {
     pub fn update_recording_segments(&self, recording_id: i64, segments: Vec<Segment>) -> Result<(), String> {
         let mut conn = self.get_connection().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM segments WHERE recording_id = ?1", params![recording_id])
-            .map_err(|e| e.to_string())?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO segments (recording_id, start_time, end_time, text, speaker)
-                 VALUES (?1, ?2, ?3, ?4, ?5)"
-            ).map_err(|e| e.to_string())?;
-            for segment in &segments {
-                stmt.execute(params![
-                    recording_id,
-                    segment.start_time,
-                    segment.end_time,
-                    segment.text,
-                    segment.speaker
-                ]).map_err(|e| e.to_string())?;
-            }
-        }
+        Self::replace_segments(&tx, recording_id, &segments)?;
+        mark_text_complete(&tx, recording_id)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -408,11 +535,19 @@ impl DatabaseManager {
             "UPDATE recordings SET cloud_transcript = ?1 WHERE id = ?2",
             params![transcript, id]
         ).map_err(|e| e.to_string())?;
+        // Texten är sparad. Går märket inte att nollställa ska det inte se ut som att
+        // sparandet misslyckades; det rättas vid nästa skrivning.
+        if let Err(e) = mark_text_complete(&conn, id) {
+            eprintln!("Warning: could not clear interrupted state for recording {}: {}", id, e);
+        }
 
         Ok(())
     }
 
     /// Persistera strukturerade molnsegment (DU/MÖTET-turer från stereo-omtranskribering)
+    /// Används också när talare döps om i molnturerna; då är läget redan nollställt.
+    /// Skriver en framtida väg här delvisa molnsegment måste den få en egen metod, annars
+    /// märks en ofullständig text som komplett.
     /// som JSON. Lokala segment + `cloud_transcript` lämnas orörda — molnvyn renderar
     /// dessa turer i stället för den flata textblobben (Fas 1c).
     pub fn save_cloud_segments(&self, id: i64, cloud_segments: String) -> Result<(), String> {
@@ -422,6 +557,11 @@ impl DatabaseManager {
             "UPDATE recordings SET cloud_segments = ?1 WHERE id = ?2",
             params![cloud_segments, id]
         ).map_err(|e| e.to_string())?;
+        // Texten är sparad. Går märket inte att nollställa ska det inte se ut som att
+        // sparandet misslyckades; det rättas vid nästa skrivning.
+        if let Err(e) = mark_text_complete(&conn, id) {
+            eprintln!("Warning: could not clear interrupted state for recording {}: {}", id, e);
+        }
 
         Ok(())
     }
@@ -490,7 +630,9 @@ impl DatabaseManager {
 
         let conn = self.get_connection().map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare("SELECT id, file_path FROM recordings WHERE audio_deleted = 0 ORDER BY created_at ASC")
+            // En inspelning som bearbetas är aldrig en kandidat: den är den nyaste, och ljudet
+            // behövs tills transkriberingen är klar.
+            .prepare("SELECT id, file_path FROM recordings WHERE audio_deleted = 0 AND processing_state IS NOT 'processing' ORDER BY created_at ASC")
             .map_err(|e| e.to_string())?;
         let rows: Vec<(i64, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -561,3 +703,193 @@ impl DatabaseManager {
     }
 }
 
+
+/// En avbruten inspelning som fått ny text för hela sin ljudfil (omtranskriberad i
+/// molnet, eller molnströmningens segment) är inte längre ofullständig.
+///
+/// 🔴 Anropas av VARJE väg som skriver en hel text: `update_recording_segments`,
+/// `save_cloud_transcript` och `save_cloud_segments`. Omtranskriberingen i molnet går
+/// genom de två senare. Satt nollställningen bara i den första stod "Ofullständig" kvar
+/// efter en lyckad omtranskribering.
+///
+/// Bara `interrupted`: där är ljudet helt och bara transkriberingen avbröts, så en text
+/// för hela filen är hela texten. En `recovered` inspelning kan ha klippts av vid en
+/// krasch, och märket säger något sant om ljudet även när texten för filen är komplett.
+/// En inspelning som fortfarande bearbetas lokalt rörs inte; den sätter själv sitt
+/// slutläge.
+fn mark_text_complete(conn: &rusqlite::Connection, id: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE recordings SET processing_state = NULL WHERE id = ?1 AND processing_state = 'interrupted'",
+        params![id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Flyttar en fil, även mellan volymer. På samma volym är det ett namnbyte. Annars
+/// kopieras filen och originalet tas bort; går det inte att ta bort är flytten ändå
+/// gjord, eftersom kopian är komplett. Används åt båda hållen vid sparandet, så att en
+/// misslyckad sparning kan lägga tillbaka filen även när temp-katalogen ligger på en
+/// annan volym.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    fs::copy(from, to)?;
+    if let Err(e) = fs::remove_file(from) {
+        eprintln!("Warning: could not delete {:?} after copying it: {}", from, e);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db(name: &str) -> (DatabaseManager, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sagt-db-test-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        (DatabaseManager::new_in(dir.join("data")).unwrap(), dir)
+    }
+
+    fn seg(text: &str, start: f64) -> Segment {
+        Segment { id: None, recording_id: None, start_time: start, end_time: start + 1.0, text: text.into(), speaker: "DU".into() }
+    }
+
+    fn row(dir: &Path, state: Option<&str>) -> Recording {
+        let wav = dir.join("session_1760000000000000.wav");
+        fs::write(&wav, vec![0u8; 100]).unwrap();
+        Recording {
+            id: None,
+            filename: "recording.wav".into(),
+            file_path: wav.to_string_lossy().to_string(),
+            duration_sec: 60.0,
+            created_at: "2026-10-15T08:00:00Z".into(),
+            sync_status: "local".into(),
+            cloud_job_id: None,
+            analysis_json: None,
+            ai_template_used: None,
+            cloud_transcript: None,
+            cloud_segments: None,
+            speaker_map: None,
+            audio_deleted: false,
+            has_segments: false,
+            processing_state: state.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn rad_vid_stopp_fylls_pa_och_avslutas() {
+        let (db, dir) = db("provisional");
+        let saved = db.save_recording(row(&dir, Some(processing_state::PROCESSING)), vec![seg("ett", 0.0)]).unwrap();
+        let id = saved.id.unwrap();
+        // Filen flyttades redan vid Stopp.
+        assert!(saved.file_path.contains("recordings"));
+        assert!(Path::new(&saved.file_path).exists());
+        assert_eq!(db.get_recording(id).unwrap().processing_state.as_deref(), Some("processing"));
+
+        assert!(db.append_processing_segments(id, &[seg("två", 1.0)]).unwrap());
+        assert_eq!(db.get_recording_segments(id).unwrap().len(), 2);
+
+        let done = db.finish_processing(id, &[seg("ett", 0.0), seg("två", 1.0), seg("tre", 2.0)], None).unwrap().unwrap();
+        assert_eq!(done.processing_state, None);
+        assert!(done.has_segments);
+        assert_eq!(db.get_recording_segments(id).unwrap().len(), 3);
+
+        // Avslutad: en sen skrivning rör den inte.
+        assert!(!db.append_processing_segments(id, &[seg("sen", 3.0)]).unwrap());
+        assert!(db.finish_processing(id, &[], None).unwrap().is_none());
+        assert_eq!(db.get_recording_segments(id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn ny_text_gor_en_avbruten_inspelning_komplett_via_varje_skrivvag() {
+        let (db, dir) = db("new-text");
+        // Varje väg som skriver en hel text. Omtranskriberingen i molnet går genom de två
+        // sista; det var där märket "Ofullständig" stod kvar.
+        let vagar: [(&str, &dyn Fn(&DatabaseManager, i64)); 3] = [
+            ("lokala segment", &|db, id| db.update_recording_segments(id, vec![seg("hel", 0.0)]).unwrap()),
+            ("molntext", &|db, id| db.save_cloud_transcript(id, "hel text".into()).unwrap()),
+            ("molnsegment", &|db, id| db.save_cloud_segments(id, "[]".into()).unwrap()),
+        ];
+        for (vag, skriv) in vagar {
+            for (state, efter) in [
+                (processing_state::INTERRUPTED, None),
+                // Ljudet kan ha klippts av vid en krasch; märket står kvar.
+                (processing_state::RECOVERED, Some("recovered")),
+                // Den lokala transkriberingen sätter själv slutläget.
+                (processing_state::PROCESSING, Some("processing")),
+            ] {
+                let id = db.save_recording(row(&dir, Some(state)), vec![seg("halv", 0.0)]).unwrap().id.unwrap();
+                skriv(&db, id);
+                assert_eq!(
+                    db.get_recording(id).unwrap().processing_state.as_deref(),
+                    efter,
+                    "fel läge efter {vag} för en inspelning som var {state}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flytt_av_fil_lamnar_bara_malet_kvar() {
+        let (_db, dir) = db("move");
+        let from = dir.join("fran.wav");
+        let to = dir.join("till.wav");
+        fs::write(&from, b"ljud").unwrap();
+        move_file(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(&to).unwrap(), b"ljud");
+        // En källa som inte finns är ett fel, inte ett tyst lyckat utfall.
+        assert!(move_file(&from, &dir.join("annan.wav")).is_err());
+    }
+
+    #[test]
+    fn raderad_rad_ateruppstar_inte() {
+        let (db, dir) = db("deleted");
+        let id = db.save_recording(row(&dir, Some(processing_state::PROCESSING)), vec![]).unwrap().id.unwrap();
+        db.delete_recording(id).unwrap();
+        assert!(!db.append_processing_segments(id, &[seg("sen", 0.0)]).unwrap());
+        assert!(db.finish_processing(id, &[seg("sen", 0.0)], None).unwrap().is_none());
+        assert!(db.get_all_recordings().unwrap().is_empty());
+        assert!(db.get_recording_segments(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn misslyckad_sparning_flyttar_tillbaka_filen() {
+        // Utan rad hittas filen aldrig i inspelningskatalogen. Den ska ligga kvar där
+        // nästa försök och återställningen letar.
+        let (db, dir) = db("failed-insert");
+        db.get_connection().unwrap().execute("DROP TABLE segments", []).unwrap();
+        let rec = row(&dir, Some(processing_state::PROCESSING));
+        let temp = PathBuf::from(&rec.file_path);
+        assert!(db.save_recording(rec, vec![seg("ett", 0.0)]).is_err());
+        assert!(temp.exists(), "filen flyttades men flyttades inte tillbaka");
+        assert!(!dir.join("data").join("recordings").join(temp.file_name().unwrap()).exists());
+    }
+
+    #[test]
+    fn bearbetning_vid_start_blir_avbruten() {
+        let (db, dir) = db("interrupted");
+        let id = db.save_recording(row(&dir, Some(processing_state::PROCESSING)), vec![]).unwrap().id.unwrap();
+        assert_eq!(db.mark_interrupted_processing().unwrap(), 1);
+        assert_eq!(db.get_recording(id).unwrap().processing_state.as_deref(), Some("interrupted"));
+        assert_eq!(db.mark_interrupted_processing().unwrap(), 0);
+    }
+
+    #[test]
+    fn gallringen_ror_inte_en_rad_som_bearbetas() {
+        let (db, dir) = db("cleanup");
+        let processing = db.save_recording(row(&dir, Some(processing_state::PROCESSING)), vec![]).unwrap();
+        // Kvot noll: allt som är en kandidat raderas.
+        let result = db.cleanup_audio(None, Some(0)).unwrap();
+        assert_eq!(result.deleted_count, 0, "raden som bearbetas gallrades");
+        assert!(Path::new(&processing.file_path).exists());
+
+        // Negativ kontroll: samma rad, färdig, gallras.
+        db.finish_processing(processing.id.unwrap(), &[], None).unwrap();
+        let result = db.cleanup_audio(None, Some(0)).unwrap();
+        assert_eq!(result.deleted_count, 1);
+    }
+}

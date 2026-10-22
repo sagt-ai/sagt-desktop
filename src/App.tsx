@@ -14,6 +14,7 @@ import { Toaster, toast } from "sonner";
 import { useConnectivity } from "@/hooks/use-connectivity";
 import { useSessionRefresh } from "@/hooks/use-session-refresh";
 import { useUpdater } from "@/hooks/use-updater";
+import { useRecordingRecovery } from "@/hooks/use-recording-recovery";
 import { useCloudStream } from "@/hooks/use-cloud-stream";
 import { useLiveSpeakerNaming } from "@/hooks/use-live-speaker-naming";
 import { useLiveDiarize } from "@/hooks/use-live-diarize";
@@ -30,6 +31,7 @@ import { CloudChoiceDialog } from "@/components/dashboard/cloud-choice-dialog";
 function App() {
   useConnectivity();
   useUpdater();
+  useRecordingRecovery();
   useCloudStream();
   useLiveSpeakerNaming();
   useLiveDiarize();

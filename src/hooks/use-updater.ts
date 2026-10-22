@@ -1,7 +1,7 @@
 import { useEffect } from "react"
 import { toast } from "sonner"
 import type { Update } from "@tauri-apps/plugin-updater"
-import { useSyncStore } from "@/store/sync-store"
+import { appSessionBusy } from "@/lib/session-busy-app"
 
 // Ett gemensamt toast-id gör att erbjudande → nedladdning → installation → fel
 // är EN toast som byter innehåll, i stället för en hög staplade kopior.
@@ -13,14 +13,17 @@ const toMb = (bytes: number) => Math.round(bytes / 1048576)
 // starta två samtidiga nedladdningar av samma installer.
 let updateInProgress = false
 
-async function runUpdate(update: Update) {
+export async function runUpdate(update: Update, isBusy: () => Promise<boolean> = appSessionBusy) {
     if (updateInProgress) return
-    // NSIS-installern avslutar appen — en pågående inspelning skulle klippas mitt i.
-    if (useSyncStore.getState().isRecording) {
-        toast.warning("Avsluta inspelningen först", {
+    updateInProgress = true
+    // NSIS-installern avslutar appen. Under inspelningen klipps den mitt i, och efter
+    // Stopp avbryts sparandet och transkriberingen som fortfarande pågår.
+    if (await isBusy()) {
+        updateInProgress = false
+        toast.warning("Vänta tills inspelningen sparats", {
             id: UPDATE_TOAST_ID,
-            description: "Uppdateringen startar om Sagt.ai och skulle avbryta din inspelning.",
-            action: { label: "Uppdatera nu", onClick: () => { void runUpdate(update) } },
+            description: "Uppdateringen startar om Sagt.ai och skulle avbryta inspelningen eller transkriberingen.",
+            action: { label: "Uppdatera nu", onClick: () => { void runUpdate(update, isBusy) } },
             duration: Infinity,
         })
         return
@@ -30,7 +33,6 @@ async function runUpdate(update: Update) {
     let receivedBytes = 0
     let lastShownStep = -1
 
-    updateInProgress = true
     try {
         toast.loading("Laddar ner uppdatering…", {
             id: UPDATE_TOAST_ID,

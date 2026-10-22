@@ -65,6 +65,127 @@ use std::path::{Path, PathBuf};
 /// bifogas i ett supportärende.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Hur ofta vakten kontrollerar att std-handtagen fortfarande pekar på loggen.
+#[cfg(windows)]
+const GUARD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Loggens skrivände, satt när omdirigeringen lyckats. Bara Windows sätter den; på
+/// unix når fd 1 loggen och std:s egna makron räcker. Handtaget stängs aldrig.
+static LOG_PIPE: std::sync::OnceLock<std::mem::ManuallyDrop<File>> = std::sync::OnceLock::new();
+
+/// Kroppen bakom craten egna `println!`, `print!`, `eprintln!` och `eprint!` (överst
+/// i `lib.rs`), som skuggar std:s makron i hela craten.
+///
+/// 🔴 Varför appens utskrifter inte går via std-handtaget på Windows: startas ett
+/// GUI-program från Start-menyn eller Utforskaren sätter skalet `STARTF_USEMONITOR`
+/// och lägger ett skärmhandtag i stdout-fältet. Windows svarar då NULL på
+/// `GetStdHandle(STD_OUTPUT_HANDLE)`, även efter `SetStdHandle`, vid varje anrop.
+/// stderr påverkas inte. Rusts `println!` frågar vid varje skrivning, får NULL och
+/// kastar texten utan fel. Uppmätt 2026-10-18, dels i appen (stdout-fältet i
+/// processens parameterblock stod på pipen medan `GetStdHandle` svarade 0), dels med
+/// en sond: ett GUI-program startat med flaggan fick 0x0 efter `SetStdHandle`, utan
+/// flaggan pipens värde. Ett konsolprogram fick pipens värde i båda fallen, och
+/// därför såg inget test det. Följden var att en app som startats från Start-menyn
+/// inte loggade en enda rad.
+///
+/// Raden formateras först och skrivs med ett anrop, så att rader från olika trådar
+/// inte klyvs. Före `init` går utskriften till std, vilket också håller MCP-läget
+/// (som aldrig anropar `init`) och testharnessens fångst orörda.
+///
+/// Kvar: bibliotek som skriver till stdout med std:s egna makron når inte loggen
+/// när appen startats från Start-menyn. Deras stderr gör det.
+#[doc(hidden)]
+pub fn write_line(args: std::fmt::Arguments<'_>, newline: bool, to_stderr: bool) {
+    use std::io::Write;
+    if let Some(pipe) = LOG_PIPE.get() {
+        let mut text = std::fmt::format(args);
+        if newline {
+            text.push('\n');
+        }
+        let mut w: &File = pipe;
+        let _ = w.write_all(text.as_bytes());
+        return;
+    }
+    // `::std::` uttryckligen: utan prefix hade craten egna makron anropats, och de
+    // leder hit igen.
+    match (to_stderr, newline) {
+        (false, true) => ::std::println!("{args}"),
+        (false, false) => ::std::print!("{args}"),
+        (true, true) => ::std::eprintln!("{args}"),
+        (true, false) => ::std::eprint!("{args}"),
+    }
+}
+
+/// För enhetstestet av makrona i `lib.rs`: en utskrift inifrån en modul. Makrona måste
+/// stå före `mod`-raderna för att nå hit, och det är det testet prövar.
+#[cfg(test)]
+pub(crate) fn println_from_module(text: &str) {
+    println!("{text}");
+}
+
+/// För enhetstestet av makrona i `lib.rs`: pekar `write_line` på en fil.
+///
+/// Processglobal och sätts en gång: efter anropet går varje `println!` i det
+/// testbinäret till filen. Ett andra anrop fäller, i stället för att tyst ignoreras.
+#[cfg(test)]
+pub(crate) fn set_pipe_for_test(file: File) {
+    assert!(
+        LOG_PIPE.set(std::mem::ManuallyDrop::new(file)).is_ok(),
+        "loggens pipe var redan satt i det här testbinäret"
+    );
+}
+
+/// Startflaggorna processen fick (`STARTF_*`). Läses en gång, för loggen och vakten.
+#[cfg(windows)]
+fn startup_flags() -> u32 {
+    #[repr(C)]
+    struct StartupInfoW {
+        cb: u32,
+        reserved: *mut u16,
+        desktop: *mut u16,
+        title: *mut u16,
+        x: u32,
+        y: u32,
+        x_size: u32,
+        y_size: u32,
+        x_count_chars: u32,
+        y_count_chars: u32,
+        fill_attribute: u32,
+        flags: u32,
+        show_window: u16,
+        reserved2_len: u16,
+        reserved2: *mut u8,
+        std_input: *mut core::ffi::c_void,
+        std_output: *mut core::ffi::c_void,
+        std_error: *mut core::ffi::c_void,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStartupInfoW(si: *mut StartupInfoW);
+    }
+    // SAFETY: nollad struktur med rätt storlek i `cb`; funktionen fyller i den.
+    let mut si: StartupInfoW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<StartupInfoW>() as u32;
+    unsafe { GetStartupInfoW(&mut si) };
+    si.flags
+}
+
+/// `STARTF_USEMONITOR`: stdout-fältet bär ett skärmhandtag (se `write_line`).
+#[cfg(windows)]
+const STARTF_USEMONITOR: u32 = 0x400;
+
+/// Satt: vakten avslutas vid nästa varv och rör inte std-handtagen mer.
+#[cfg(windows)]
+static GUARD_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stoppar vakten. Finns för testet, som måste kunna återställa konsolens handtag
+/// utan att vakten pekar om dem till loggen igen före assertionerna.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn stop_guard() {
+    GUARD_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Startar filloggningen och returnerar sökvägen till den aktiva loggfilen.
 ///
 /// Anropas så tidigt som möjligt i `setup`, så att även uppstartens utskrifter
@@ -72,6 +193,30 @@ const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 /// köra för att den inte kunde öppna sin loggfil vore ett sämre fel än det den
 /// försöker göra felsökbart. Därför `Result` som anroparen får logga och släppa.
 pub fn init(app_data_dir: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(windows)]
+    return init_with_guard(app_data_dir, GUARD_INTERVAL, None);
+    #[cfg(not(windows))]
+    return init_with_guard(app_data_dir, std::time::Duration::ZERO, None);
+}
+
+/// `init` med ett valbart intervall för vakten och, för testerna, ett påtvingat svar
+/// på om stdout maskeras (`None` = läs processens startflaggor). Bara Windows använder
+/// dem. Finns för att testerna ska kunna köra vakten på en bråkdel av en sekund och
+/// pröva båda lägena, eftersom ett testbinär aldrig får skalets flagga.
+#[doc(hidden)]
+pub fn init_with_guard(
+    app_data_dir: &Path,
+    guard_interval: std::time::Duration,
+    stdout_masked: Option<bool>,
+) -> std::io::Result<PathBuf> {
+    // Läses en gång och delas av loggraden och vakten, så att de inte kan vara oense.
+    #[cfg(windows)]
+    let flags = startup_flags();
+    #[cfg(windows)]
+    let stdout_masked = stdout_masked.unwrap_or(flags & STARTF_USEMONITOR != 0);
+    #[cfg(not(windows))]
+    let stdout_masked = stdout_masked.unwrap_or(false);
+
     let dir = app_data_dir.join("logs");
     fs::create_dir_all(&dir)?;
     let path = dir.join("sagt.log");
@@ -84,7 +229,7 @@ pub fn init(app_data_dir: &Path) -> std::io::Result<PathBuf> {
     }
 
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
-    spawn_redirect(path.clone(), file)?;
+    spawn_redirect(path.clone(), file, guard_interval, stdout_masked)?;
 
     println!(
         "=== Sagt.ai {} ({}) startad {} ===",
@@ -92,6 +237,17 @@ pub fn init(app_data_dir: &Path) -> std::io::Result<PathBuf> {
         std::env::consts::OS,
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f")
     );
+    #[cfg(windows)]
+    {
+        println!(
+            "DEBUG: Startflaggor {flags:#x}{}",
+            if stdout_masked {
+                " (startad från skalet: stdout maskeras av Windows, appens utskrifter går direkt till loggen)"
+            } else {
+                ""
+            }
+        );
+    }
     Ok(path)
 }
 
@@ -158,7 +314,12 @@ fn pump<R: std::io::BufRead>(mut reader: R, path: PathBuf, mut file: File, mut w
 /// Kopplar processens stdout och stderr till en pipe vars läsände stämplas och
 /// skrivs till `file`.
 #[cfg(unix)]
-fn spawn_redirect(path: PathBuf, mut file: File) -> std::io::Result<()> {
+fn spawn_redirect(
+    path: PathBuf,
+    mut file: File,
+    _guard_interval: std::time::Duration,
+    _stdout_masked: bool,
+) -> std::io::Result<()> {
     // Importerna bor HÄR, inte på modulnivå: de används bara i den unix-gatade
     // vägen, och på Windows kompileras funktionen bort — då blir de oanvända och
     // `Desktop Rust (release warnings)` fäller bygget. Fångat av just den grinden
@@ -227,7 +388,12 @@ fn spawn_redirect(path: PathBuf, mut file: File) -> std::io::Result<()> {
 /// `dup2`. Se modulens doc-kommentar för de tre skillnader som spelar roll, och
 /// för vad som mättes upp för att belägga var och en av dem.
 #[cfg(windows)]
-fn spawn_redirect(path: PathBuf, mut file: File) -> std::io::Result<()> {
+fn spawn_redirect(
+    path: PathBuf,
+    mut file: File,
+    guard_interval: std::time::Duration,
+    stdout_masked: bool,
+) -> std::io::Result<()> {
     // Samma skäl som i unix-armen: importerna bor här därför att funktionen
     // kompileras bort på andra plattformar och de annars blir oanvända, vilket
     // fäller `Desktop Rust (release warnings)`.
@@ -301,6 +467,13 @@ fn spawn_redirect(path: PathBuf, mut file: File) -> std::io::Result<()> {
     unsafe { SetStdHandle(STD_OUTPUT_HANDLE, write_handle) }
         .map_err(|e| std::io::Error::other(format!("SetStdHandle(stdout): {e}")))?;
 
+    // Appens egna utskrifter går härefter direkt till pipen (se `write_line`).
+    // SAFETY: handtaget är öppet och stängs aldrig; ManuallyDrop hindrar File från
+    // att stänga det.
+    let _ = LOG_PIPE.set(std::mem::ManuallyDrop::new(unsafe {
+        File::from_raw_handle(write_handle.0)
+    }));
+
     // SAFETY: samma handtag, fortfarande öppet och giltigt.
     if let Err(e) = unsafe { SetStdHandle(STD_ERROR_HANDLE, write_handle) } {
         // println! och inte eprintln!: stdout är omdirigerad sedan raden ovan, så
@@ -309,13 +482,84 @@ fn spawn_redirect(path: PathBuf, mut file: File) -> std::io::Result<()> {
         println!("VARNING: stderr kunde inte omdirigeras, panics når inte loggen: {e}");
     }
 
+    // Noll betyder ingen vakt. En vakt med intervallet noll hade snurrat utan paus.
+    if !guard_interval.is_zero() {
+        spawn_guard(write_handle.0 as isize, guard_interval, stdout_masked);
+    }
     Ok(())
+}
+
+/// Skriver en rad rakt till loggens pipe, förbi std-handtagen och Rusts stdout. Det
+/// är vaktens enda väg att rapportera när just de vägarna inte fungerar.
+#[cfg(windows)]
+fn write_direct(pipe: isize, text: &str) {
+    use std::io::Write;
+    use std::os::windows::io::FromRawHandle;
+    // SAFETY: `pipe` är loggens skrivhandtag, som aldrig stängs (se ovan).
+    // ManuallyDrop: File får inte stänga det när funktionen är klar.
+    let mut f = std::mem::ManuallyDrop::new(unsafe {
+        File::from_raw_handle(pipe as std::os::windows::io::RawHandle)
+    });
+    let _ = f.write_all(text.as_bytes());
+}
+
+/// Startar vakten, som var `interval` kontrollerar att std-handtagen fortfarande pekar
+/// på loggen. Appens egna utskrifter behöver dem inte längre (se `write_line`), men
+/// panics och bibliotekens utskrifter går via dem. Har ett handtag ändrats skrivs de
+/// gamla och nya värdena direkt till pipen, och handtagen återställs.
+///
+/// stdout kontrolleras inte när `stdout_masked`: Windows svarar då alltid NULL för
+/// den, och vakten hade larmat varje minut om något som inte går att ändra.
+///
+/// Avvägning: återställningen skriver över varje ändring av std-handtagen, även en
+/// avsiktlig. Ingen del av appen pekar om dem i dag. Gör någon det i framtiden måste
+/// vakten få veta det, annars förlorar den delen sin omdirigering inom en minut.
+/// Det gamla värdet står alltid i rapporten.
+#[cfg(windows)]
+fn spawn_guard(pipe: isize, interval: std::time::Duration, stdout_masked: bool) {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{
+        GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    let _ = std::thread::Builder::new().name("applog-vakt".into()).spawn(move || {
+        // SAFETY: GetStdHandle läser bara processens std-handtagstabell.
+        let current = |id| unsafe { GetStdHandle(id) }.map(|h| h.0 as isize).unwrap_or(0);
+        loop {
+            std::thread::sleep(interval);
+            if GUARD_STOP.load(Ordering::SeqCst) {
+                return;
+            }
+            let (out, err) = (current(STD_OUTPUT_HANDLE), current(STD_ERROR_HANDLE));
+            if err != pipe || (!stdout_masked && out != pipe) {
+                write_direct(
+                    pipe,
+                    &format!(
+                        "[applog] std-handtagen har ändrats (stdout={out:#x}, stderr={err:#x}, \
+                         loggen={pipe:#x}). Återställer.\n"
+                    ),
+                );
+                let h = HANDLE(pipe as *mut core::ffi::c_void);
+                // SAFETY: loggens skrivhandtag, öppet så länge processen lever.
+                unsafe {
+                    let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+                    let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+                }
+            }
+        }
+    });
 }
 
 /// Övriga plattformar. Ingen av dem byggs idag — appen levereras för Windows och
 /// macOS — så armen finns för att `cfg`-täckningen ska vara total, inte för att
 /// någon ska falla hit.
 #[cfg(not(any(unix, windows)))]
-fn spawn_redirect(_path: PathBuf, _file: File) -> std::io::Result<()> {
+fn spawn_redirect(
+    _path: PathBuf,
+    _file: File,
+    _guard_interval: std::time::Duration,
+    _stdout_masked: bool,
+) -> std::io::Result<()> {
     Ok(())
 }

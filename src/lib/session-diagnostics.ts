@@ -22,7 +22,7 @@ export interface SessionDiagnostics {
     whisper_failed: number;
     /** Stabil kod för sessionens första misslyckade körning: `wav_write`, `exe_path`,
      *  `model_missing`, `sidecar_missing`, `spawn_failed`, `wait_failed`,
-     *  `exit_nonzero` eller `unknown`. Aldrig fri feltext. */
+     *  `exit_nonzero`, `timeout` eller `unknown`. Aldrig fri feltext. */
     whisper_error: string | null;
     /** whisper-clis exitkod vid `exit_nonzero`. */
     whisper_exit_code: number | null;

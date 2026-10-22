@@ -59,6 +59,21 @@ struct Row {
     cloud_transcript: Option<String>,
     cloud_segments: Option<String>,
     speaker_map: Option<String>,
+    /// `processing_state`: `None` för ett färdigt möte. Saknas kolumnen (en databas som
+    /// appen inte hunnit uppdatera) läses den som `None`.
+    state: Option<String>,
+}
+
+/// Om mötets text är komplett, och i så fall varför inte. Assistenten ska inte
+/// sammanfatta ett möte vars slut kan saknas som om det vore helt.
+fn completeness(state: Option<&str>) -> (bool, Option<&'static str>) {
+    match state {
+        None => (true, None),
+        Some("processing") => (false, Some("Mötet transkriberas fortfarande. Slutet av texten kan saknas.")),
+        Some("interrupted") => (false, Some("Transkriberingen avbröts. Slutet av texten kan saknas.")),
+        Some("recovered") => (false, Some("Inspelningen återställdes efter att appen stängts. Ljudet kan sluta innan mötet gjorde det.")),
+        Some(_) => (false, Some("Mötets text är inte komplett.")),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,6 +276,18 @@ impl Store {
 
     const COLUMNS: &'static str = "id, filename, created_at, duration_sec, analysis_json, ai_template_used, cloud_transcript, cloud_segments, speaker_map";
 
+    /// Kolumnlistan, med `processing_state` om databasen har den och annars `NULL`.
+    /// MCP-läget är samma program som appen men kan köras innan appen startat efter en
+    /// uppdatering, och då har databasen ännu inte fått kolumnen.
+    fn columns(c: &Connection) -> StoreResult<String> {
+        let has_state: bool = c.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('recordings') WHERE name = 'processing_state'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(format!("{}, {}", Self::COLUMNS, if has_state { "processing_state" } else { "NULL" }))
+    }
+
     fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         Ok(Row {
             id: r.get(0)?,
@@ -272,17 +299,21 @@ impl Store {
             cloud_transcript: r.get(6)?,
             cloud_segments: r.get(7)?,
             speaker_map: r.get(8)?,
+            state: r.get(9)?,
         })
     }
 
+    /// Möten för listning och sökning. Ett möte som fortfarande transkriberas tas inte
+    /// med: dess text växer ännu, och en sammanfattning av halva mötet vore missvisande.
+    /// Det går fortfarande att läsa med sitt id, märkt som ofullständigt.
     fn rows(&self, c: &Connection) -> StoreResult<Vec<Row>> {
-        let mut st = c.prepare(&format!("SELECT {} FROM recordings ORDER BY created_at DESC, id DESC", Self::COLUMNS))?;
+        let mut st = c.prepare(&format!("SELECT {} FROM recordings ORDER BY created_at DESC, id DESC", Self::columns(c)?))?;
         let rows = st.query_map([], Self::map_row)?.collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        Ok(rows.into_iter().filter(|r| r.state.as_deref() != Some("processing")).collect())
     }
 
     fn row(&self, c: &Connection, id: i64) -> StoreResult<Row> {
-        c.query_row(&format!("SELECT {} FROM recordings WHERE id = ?1", Self::COLUMNS), [id], Self::map_row)
+        c.query_row(&format!("SELECT {} FROM recordings WHERE id = ?1", Self::columns(c)?), [id], Self::map_row)
             .optional()?
             .ok_or(StoreError::NotFound(id))
     }
@@ -344,6 +375,7 @@ impl Store {
                 "duration_minutes": (r.duration_sec / 60.0).round() as i64,
                 "word_count": Self::word_count(&turns),
                 "transcript_source": source,
+                "complete": completeness(r.state.as_deref()).0,
                 "has_protocol": parse_protocol(r.analysis_json.as_deref(), r.template.as_deref()).is_some(),
             }));
         }
@@ -418,6 +450,11 @@ impl Store {
                 "remaining_turns": total.saturating_sub(offset + page.len()),
             },
         });
+        let (complete, note) = completeness(r.state.as_deref());
+        out["metadata"]["complete"] = json!(complete);
+        if let Some(note) = note {
+            out["metadata"]["note"] = json!(note);
+        }
         if !as_text {
             out["turns"] = Value::Array(page.iter().map(|t| json!({"speaker": t.speaker, "start_seconds": t.start.round() as i64, "text": t.text})).collect());
         }
@@ -427,7 +464,7 @@ impl Store {
     pub fn get_protocol(&self, id: i64) -> StoreResult<Value> {
         let c = self.conn()?;
         let r = self.row(&c, id)?;
-        let base = json!({"id": r.id.to_string(), "title": self.title(&r.filename, &r.created_at), "url": meeting_url(r.id), "date": r.created_at});
+        let base = json!({"id": r.id.to_string(), "title": self.title(&r.filename, &r.created_at), "url": meeting_url(r.id), "date": r.created_at, "complete": completeness(r.state.as_deref()).0});
         Ok(match parse_protocol(r.analysis_json.as_deref(), r.template.as_deref()) {
             Some(p) => {
                 let mut v = base;
@@ -453,7 +490,7 @@ impl Store {
                     meetings += 1;
                 }
                 for a in p.actions {
-                    items.push(json!({"action": a, "meeting_id": r.id.to_string(), "meeting_title": self.title(&r.filename, &r.created_at), "date": r.created_at, "url": meeting_url(r.id)}));
+                    items.push(json!({"action": a, "meeting_id": r.id.to_string(), "meeting_title": self.title(&r.filename, &r.created_at), "date": r.created_at, "url": meeting_url(r.id), "meeting_complete": completeness(r.state.as_deref()).0}));
                 }
             }
         }
@@ -496,6 +533,58 @@ pub mod tests {
         )
         .unwrap();
         dir
+    }
+
+    /// Fixturen med kolumnen `processing_state`, som appen lägger till: möte 1 transkriberas
+    /// fortfarande och möte 2 avbröts.
+    fn store_with_state(name: &str) -> Store {
+        let dir = fixture(name);
+        let c = Connection::open(dir.join(super::super::session::DB_FILE)).unwrap();
+        c.execute_batch(
+            "ALTER TABLE recordings ADD COLUMN processing_state TEXT;
+             UPDATE recordings SET processing_state = 'processing' WHERE id = 1;
+             UPDATE recordings SET processing_state = 'interrupted' WHERE id = 2;",
+        )
+        .unwrap();
+        Store::in_dir(&dir).with_tz(chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+    }
+
+    #[test]
+    fn meeting_still_transcribing_is_left_out_of_list_and_search() {
+        let s = store_with_state("processing");
+        let v = s.list_meetings(10, 0, None, None).unwrap();
+        let ids: Vec<&str> = v["meetings"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["3", "2"], "ett möte som transkriberas fortfarande syntes i listan");
+        // Ordet finns bara i möte 1.
+        let r = s.search("Ängelholm", 10).unwrap();
+        assert!(r["results"].as_array().unwrap().is_empty(), "ett möte som transkriberas fortfarande gav träff");
+    }
+
+    #[test]
+    fn incomplete_meetings_are_marked_as_such() {
+        let s = store_with_state("incomplete");
+        let v = s.list_meetings(10, 0, None, None).unwrap();
+        let m: Vec<(&str, bool)> = v["meetings"].as_array().unwrap().iter()
+            .map(|m| (m["id"].as_str().unwrap(), m["complete"].as_bool().unwrap())).collect();
+        assert_eq!(m, [("3", true), ("2", false)]);
+        let t = s.get_transcript(2, 0, 100, true).unwrap();
+        assert_eq!(t["metadata"]["complete"], false);
+        assert!(t["metadata"]["note"].as_str().unwrap().contains("avbröts"));
+        assert_eq!(s.get_protocol(2).unwrap()["complete"], false);
+        let a = s.list_action_items(None, None, 10).unwrap();
+        assert_eq!(a["action_items"][0]["meeting_complete"], false, "{a}");
+        // Med sitt id går ett möte som transkriberas fortfarande att läsa, märkt.
+        let t = s.get_transcript(1, 0, 100, true).unwrap();
+        assert_eq!(t["metadata"]["complete"], false);
+        assert!(t["metadata"]["note"].as_str().unwrap().contains("fortfarande"));
+    }
+
+    #[test]
+    fn database_without_the_state_column_reads_as_complete() {
+        // Fixturen saknar kolumnen, som en databas appen inte hunnit uppdatera.
+        let v = store("nostate").list_meetings(10, 0, None, None).unwrap();
+        assert_eq!(v["total"], 3);
+        assert!(v["meetings"].as_array().unwrap().iter().all(|m| m["complete"] == true));
     }
 
     /// Testerna låser tidszonen, så att datumfilter och titlar inte beror på datorn de körs på.

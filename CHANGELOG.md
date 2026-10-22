@@ -7,6 +7,33 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.12.2 — 2026-10-22
+
+### Fixed
+
+- **A meeting could be lost if the app closed while it was still transcribing.**
+  The recording used to be saved only once all of its text was ready. On a slow
+  computer that could take minutes after you pressed Stop, and closing the app,
+  restarting it for an update or pressing Cancel in that time lost the meeting.
+  Now the meeting is saved as soon as you press Stop and the text fills in as it
+  is ready. Cancel keeps the recording with the text that was finished.
+- **Recordings interrupted by a crash or shutdown are recovered.** If the app
+  stopped unexpectedly during or after a recording, the next start finds the
+  audio and adds it to Recordings, marked as recovered.
+- **Closing the app while a meeting is being saved now asks first.**
+- **Text could still appear after pressing Cancel.** A few seconds after
+  cancelling, text from the cancelled transcription could show up. It no longer
+  does.
+- **A transcription step that stops responding no longer stalls the rest.**
+  If one part of a recording takes far too long to transcribe, it is skipped with
+  a notice and the remaining text still arrives.
+- **Deleting a recording while it was being transcribed left the app busy.**
+  The app kept showing that it was processing, and asked about unsaved work when
+  you closed it. It now returns to normal.
+- **The diagnostic log stayed empty when the app was started from the Start
+  menu.** This only mattered if you sent us a log file for support, but then the
+  log was missing everything. It now records normally however the app is started.
+
 ## 0.12.1 — 2026-10-15
 
 ### Changed

@@ -137,6 +137,7 @@ describe("markören för en pågående inspelning", () => {
             minutes_since: 121,
             app_version_at_start: "0.9.0",
             previous_run: true,
+            stopped: false,
         });
     });
 
@@ -155,6 +156,7 @@ describe("markören för en pågående inspelning", () => {
         expect(capture).toHaveBeenCalledWith("recording_unsaved", expect.objectContaining({
             duration_seconds: 30 * 60 + 20,
             minutes_since: 5,
+            stopped: true,
         }));
     });
 
