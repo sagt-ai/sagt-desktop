@@ -101,7 +101,11 @@ Some of these fire *while a local transcription is running*: if local processing
 
 **Analytics never carry audio, transcript text, or file names.** Error events send a stable slug such as `network_error` or `unauthorized` (see [`src/lib/error-slug.ts`](src/lib/error-slug.ts)) — never free-form error text, which could otherwise leak content. If you are signed in, these events are linked to your account rather than being anonymous.
 
-There is currently **no in-app switch to turn analytics off**. If that matters to you, [open an issue](../../issues) — it is a fair thing to ask for. Full details: [Privacy Policy](https://sagt.ai/integritetspolicy).
+There is currently **no in-app switch to turn analytics off**. If that matters to you, [open an issue](../../issues) — it is a fair thing to ask for.
+
+**Who is responsible for what.** For your account and usage data, EDI Labs AB is the data controller. For your recordings and transcripts you are — we are only the processor, acting on your instructions, and those instructions are simply the settings you pick in the app. When you transcribe locally, nothing leaves your computer and we process none of your content. The distinction matters most when you record other people: informing them and having a legal basis is your call, not ours. If you are using Sagt at work, your employer is the controller, we act as its sub-processor, and your employer needs to know the tool is in use.
+
+Full details: [Your data](https://sagt.ai/dina-uppgifter) in plain language, or the formal [Privacy Policy](https://sagt.ai/integritetspolicy), [Data Processing Agreement](https://sagt.ai/en/dpa) and [sub-processor list](https://sagt.ai/en/subprocessors).
 
 ### If you are evaluating this for an organisation
 
