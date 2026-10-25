@@ -14,7 +14,7 @@ name = "sagt"
 # strängen. Att hålla fältet utanför synken gjorde alltså inte problemet ofarligt — det
 # gjorde det osynligt. Rätt svar på en fil som måste vara i synk är att lägga den under
 # grinden, vilket den nu är.
-version = "0.12.2"
+version = "0.12.3"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -32,7 +32,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# Golv 2.11.1: CVE-2026-42184 (GHSA-7gmj-67g7-phm9), en fjärrsida kunde anropa
+# IPC-kommandon som bara lokala sidor får nå. Lockfilen håller hela tauri-familjen på
+# 2.11-linjen (tauri 2.11.6, runtime-wry 2.11.4, utils 2.9.3, build/macros/codegen
+# 2.6.3). Kravet "2" släpper annars igenom en blandning: `cargo update -p tauri`
+# hämtade 2026-10-23 tauri 2.11.6 med runtime-wry 2.12.3 och utils 2.10.2 från
+# 2.12-linjen, som semver tillåter men ingen har släppt ihop.
+tauri = { version = "2.11.1", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -44,20 +50,21 @@ hound = "3.5"
 tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
-# Save dialog + writing the chosen file (transcript export). Pinned to the minors that
-# match tauri 2.10 and the JS packages; the next patch releases require tauri 2.11.
+# Save dialog + writing the chosen file (transcript export). Pinnade till samma minor
+# som JS-paketen (@tauri-apps/plugin-*). 2.7.x och 2.5.x kräver tauri ^2.10; nästa
+# minor (dialog 2.8, fs 2.6) kräver ^2.12 (läst på crates.io 2026-10-23).
 tauri-plugin-dialog = "=2.7.0"
 tauri-plugin-fs = "=2.5.0"
 # Urklipp via det nativa systemurklippet. Uppmätt 2026-10-13 i appens webbvy på
 # macOS 26.6: `navigator.clipboard.writeText` utan aktiv användargest avvisas med
 # NotAllowedError, medan pluginens writeText lyckas. Kopiera-knappen skrev tidigare
 # via webbläsarens API utan att vänta in svaret, så bocken visades fast urklippet
-# förblev tomt. Pinnad till den sista versionen som bygger mot tauri 2.10.
+# förblev tomt. 2.3.2 kräver tauri ^2.8.2; 2.4.0 och senare kräver ^2.12.
 tauri-plugin-clipboard-manager = "=2.3.2"
 # En instans av appen. Utan den startade en andra start (Start-menyn eller ikonen
 # medan appen redan körde) en kopia till, som delade lagring, mikrofon och databas
 # med den första. Nu visas det öppna fönstret i stället. 2.4.5 är den sista
-# versionen som bygger mot tauri 2.10 (2.5.x kräver ^2.12, läst på crates.io).
+# versionen före 2.12-kravet (kräver ^2.10, 2.5.x kräver ^2.12, läst på crates.io).
 tauri-plugin-single-instance = "=2.4.5"
 tokio = { version = "1", features = ["sync", "rt", "io-std", "time"] }
 # MCP-läget (`--mcp`, src/mcp/): en lokal stdio-server som en AI-assistent på datorn

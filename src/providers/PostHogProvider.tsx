@@ -24,7 +24,10 @@ if (KEY) {
         // inspelning påslagen där laddar 1.372.1 inspelaren (CSP:n i
         // tauri.conf.json släpper igenom den) och skickar vyernas text,
         // transkript inräknade. Kört i en harness 2026-09-22. Webben fick
-        // samma rad 2026-09-23.
+        // samma rad 2026-09-23. Omkört 2026-10-23 med 1.438.15 och den här
+        // init-konfigen, fjärrkonfigen med inspelning och enkäter påslagna:
+        // utan raderna laddades lazy-recorder.js och surveys.js och $snapshot
+        // gick till /s/, med dem inget av det.
         disable_session_recording: true,
         // Frågorna till användaren ställs av appens eget kort (components/feedback),
         // som fungerar utan nät och ser ut som appen. Utan raden kan en enkät som

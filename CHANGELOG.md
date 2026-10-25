@@ -7,6 +7,17 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.12.3 — 2026-10-25
+
+### Changed
+
+- **Security updates to the components the app is built on.** The app
+  framework, the libraries that secure its connections and several smaller
+  libraries are updated to versions where known security issues are fixed.
+  Nothing changes in how the app works, and the update installs as usual.
+
+---
+
 ## 0.12.2 — 2026-10-22
 
 ### Fixed
