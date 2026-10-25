@@ -14,7 +14,7 @@ name = "sagt"
 # strängen. Att hålla fältet utanför synken gjorde alltså inte problemet ofarligt — det
 # gjorde det osynligt. Rätt svar på en fil som måste vara i synk är att lägga den under
 # grinden, vilket den nu är.
-version = "0.12.3"
+version = "0.12.4"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -73,7 +73,15 @@ tokio = { version = "1", features = ["sync", "rt", "io-std", "time"] }
 # tauri-plugin-updater med samma funktioner; MCP-läget installerar själv rustls
 # kryptoleverantör eftersom uppdateraren inte startar där.
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls-no-provider"] }
+# Uppladdning till molnet (src/cloud_upload.rs): inspelningen kodas till Ogg Opus före
+# uppladdningen, en tiondel av WAV-filens storlek. libopus byggs ur källkod med CMake
+# (funktionen `bundled`), så inget systembibliotek behövs. På Windows krävs Ninja i bygget:
+# med Visual Studio-generatorn skriver cmake-craten över optimeringsflaggorna och libopus
+# byggs utan optimering, ungefär tre gånger långsammare (uppmätt 2026-10-25). Release-
+# bygget kontrollerar flaggorna.
+opusic-sys = "0.7.5"
+ogg = "0.9.2"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }

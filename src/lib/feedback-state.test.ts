@@ -7,6 +7,7 @@ import {
     type FeedbackState,
     type SessionContext,
     analysisCompleted,
+    asked,
     decline,
     finished,
     ignored,
@@ -14,6 +15,7 @@ import {
     parseState,
     shouldAskPaywall,
     shouldAskPro,
+    shouldAskTranscript,
     shouldInvite,
     shown,
     snooze,
@@ -125,5 +127,27 @@ describe("sparat tillstånd", () => {
         expect(s.done).toEqual(["paywall"])
         expect(s.analyses).toBe(0)
         expect(s.snoozeUntil).toBeNull()
+    })
+})
+
+describe("frågan om texten blev rätt", () => {
+    it("kommer efter ett transkript", () => {
+        expect(shouldAskTranscript(fresh(), NOW, OK)).toBe(true)
+    })
+    it("kommer en gång", () => {
+        expect(shouldAskTranscript(finished(fresh(), "transcript"), NOW + 30 * DAY_MS, OK)).toBe(false)
+    })
+    it("följer de gemensamma spärrarna", () => {
+        expect(shouldAskTranscript(fresh(), NOW, { ...OK, firstLaunch: true })).toBe(false)
+        expect(shouldAskTranscript(decline(fresh()), NOW, OK)).toBe(false)
+        expect(shouldAskTranscript(shown(fresh(), NOW), NOW + 1000, OK)).toBe(false)
+    })
+    it("räknas som frågad när kortet visas, utan att nollställa orörda kort", () => {
+        const s = asked(ignored(fresh(), NOW), "transcript")
+        expect(shouldAskTranscript(s, NOW + 30 * DAY_MS, OK)).toBe(false)
+        expect(s.ignoredInARow).toBe(1)
+    })
+    it("överlever omladdning", () => {
+        expect(parseState(JSON.stringify({ done: ["transcript"] })).done).toEqual(["transcript"])
     })
 })

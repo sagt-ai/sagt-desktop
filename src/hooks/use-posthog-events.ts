@@ -55,8 +55,17 @@ export function usePostHogEvents() {
         analysisRequested: (source: string = 'manual') =>
             captureEvent('analysis_requested', { source }),
 
-        analysisCompleted: (source: string = 'manual') =>
-            captureEvent('analysis_completed', { source }),
+        // extra: namnförslagen med protokollet (names_applied, groups_applied, hint_count).
+        // Bara antal, aldrig namn.
+        analysisCompleted: (source: string = 'manual', extra?: Record<string, unknown>) =>
+            captureEvent('analysis_completed', { source, ...extra }),
+
+        // Användaren bytte eller tog bort ett talarnamn. was_auto: namnet var ett förslag;
+        // source: varifrån förslaget kom ('protocol' | 'identify', 'other' för molninspelningens
+        // namngivning under och efter mötet, 'manual' när namnet var användarens eget). Andelen
+        // förslag som rättas är måttet på om förslagen hjälper. Inga namn skickas.
+        speakerRenamed: (p: { was_auto: boolean; source: string; cleared: boolean; is_group: boolean }) =>
+            captureEvent('speaker_renamed', p),
 
         analysisFailed: (error: string, source: string = 'manual') =>
             captureEvent('analysis_failed', { error, source }),

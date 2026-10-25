@@ -155,3 +155,59 @@ describe("bestSavedText", () => {
         expect(bestSavedText(null, local)).toBe("lokal rad ett lokal rad två");
     });
 });
+
+describe("namnförslag med protokollet", () => {
+    const NAMING = {
+        turns: [{ speaker: "DU", text: "Anna här.", start: 0 }],
+        participantHints: ["Anna"],
+    };
+    // Kropparna till /analyze (omkörningen av molnjobbet skickar ett formulär, inte JSON).
+    const bodies = () => fetchMock.mock.calls
+        .filter(([url]) => new URL(url, "http://x").pathname.endsWith("/analyze"))
+        .map((call) => JSON.parse(String(((call as unknown[])[1] as RequestInit | undefined)?.body ?? "null")));
+
+    it("skickar turer, deltagarlista och name_speakers på den stateless vägen", async () => {
+        await run({ cloudSync: false, naming: NAMING });
+        expect(bodies()).toEqual([{
+            text: TEXT, template_id: "general",
+            turns: NAMING.turns, participant_hints: ["Anna"], name_speakers: true,
+        }]);
+    });
+
+    it("skickar inga namnfält vid omkörning av ett synkat molnjobb", async () => {
+        routes["/jobs/job-1/reanalyze"] = { status: 200, body: { id: "job-1", analysis: ANALYSIS } };
+        await run({ naming: NAMING });
+        expect(paths()).toEqual(["/api/v1/jobs/job-1/reanalyze"]);
+        expect(bodies()).toEqual([]);
+    });
+
+    it("skickar namnfälten när molnjobbet är borta och texten analyseras här", async () => {
+        routes["/jobs/job-1/reanalyze"] = { status: 404, body: { detail: "Job not found" } };
+        await run({ naming: NAMING });
+        expect(bodies()).toHaveLength(1);
+        expect(bodies()[0].name_speakers).toBe(true);
+    });
+
+    it("utan naming är kroppen som förut", async () => {
+        await run({ cloudSync: false });
+        expect(bodies()).toEqual([{ text: TEXT, template_id: "general" }]);
+    });
+
+    it("ett möte över serverns tak för namnförslag får protokollet utan namnförslag", async () => {
+        const big = { turns: [{ speaker: "DU", text: "a".repeat(250_000), start: 0 }], participantHints: [] };
+        await run({ cloudSync: false, naming: big });
+        expect(bodies()).toEqual([{ text: TEXT, template_id: "general" }]);
+    });
+
+    it("ett omförsök med ändrad deltagarlista återanvänder nyckeln", async () => {
+        let n = 0;
+        const keys = new IdempotencyKeys(() => `nyckel-${++n}-abcdef`);
+        routes["/analyze"] = { status: 503, body: { detail: "nere" } };
+        await expect(run({ cloudSync: false, keys, naming: NAMING })).rejects.toThrow();
+        routes["/analyze"] = { status: 200, body: ANALYSIS };
+        await run({ cloudSync: false, keys, naming: { ...NAMING, participantHints: ["Anna", "Per"] } });
+        const sent = fetchMock.mock.calls.map((call) =>
+            new Headers(((call as unknown[])[1] as RequestInit | undefined)?.headers).get("X-Idempotency-Key"));
+        expect(sent).toEqual(["nyckel-1-abcdef", "nyckel-1-abcdef"]);
+    });
+});

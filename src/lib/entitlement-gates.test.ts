@@ -61,6 +61,8 @@ const ALLOWED: Record<string, number> = {
     "hooks/use-live-diarize.ts": 1,
     "hooks/use-live-speaker-naming.ts": 1,
     "pages/recordings-page.tsx": 3,
+    // Planen som egenskap i uppladdningseventet. Ingen kontroll: servern avgör vem som får ladda upp.
+    "lib/api.ts": 1,
     // Frågorna till användaren och provperiodens banner.
     "components/feedback/feedback-card.tsx": 3,
     "lib/feedback-questions.ts": 2,

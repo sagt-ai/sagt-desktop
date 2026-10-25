@@ -246,7 +246,7 @@ export function ControlBar({ onViewChange }: ControlBarProps) {
                         
                         toast.success(`Påbörjar automatisk uppladdning (${shouldAnalyze ? 'med analys' : 'endast transkribering'})...`);
 
-                        const job = await uploadJob(recording.file_path, "general", token, shouldAnalyze);
+                        const job = await uploadJob("desktop_autosync", recording.file_path, "general", token, shouldAnalyze);
                         setUploadStatus('success');
 
                         if (useSettingsStore.getState().cloudSync) {

@@ -4674,8 +4674,9 @@ fn new_recording_row(
 /// som mono 16 kHz i16 till `app_data/diarize_temp/`. Returnerar sökvägen till mono-filen.
 ///
 /// Motiv: sessions-WAV:en är stereo (L = mic/DU, R = sys/MÖTET, se sessions-recordern ovan).
-/// 4h stereo ≈ 880 MB överstiger backendens 500 MB-gräns; mono-MÖTET ≈ 440 MB räcker för
-/// auto-diarisering vid stopp — DU-kanalen är redan en känd enskild talare via mic-hinten (§13.4).
+/// Mono halverar storleken (≈110 MB/h mot ≈220 MB/h för stereo); DU-kanalen är redan en känd
+/// enskild talare via mic-hinten (§13.4). Molnet tar emot högst 31 MiB per fil, så bara
+/// ungefär 17 minuter mono går att skicka.
 ///
 /// JS anropar med camelCase-nyckel: `invoke("extract_meeting_channel", { path })`.
 #[tauri::command]

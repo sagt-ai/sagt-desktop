@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button"
 import { ShieldAlert, Loader2 } from "lucide-react"
 import { useConfigStore } from "@/store/config-store"
 import { CURRENT_VERSION } from "@/lib/version"
-import { diarizeAvailable, jobDiarizeAvailable, liveDiarizeAvailable, mcpAvailable, proYearlyAvailable } from "@/lib/system-config"
+import { cloudUploadPolicy, diarizeAvailable, jobDiarizeAvailable, liveDiarizeAvailable, maxCloudJobMinutes, mcpAvailable, proYearlyAvailable } from "@/lib/system-config"
 
 function compareSemver(a: string, b: string): number {
     const pa = a.split(".").map(Number)
@@ -38,6 +38,8 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
     const setLiveDiarizeEnabled = useConfigStore((s) => s.setLiveDiarizeEnabled)
     const setProYearlyAvailable = useConfigStore((s) => s.setProYearlyAvailable)
     const setMcpAvailable = useConfigStore((s) => s.setMcpAvailable)
+    const setMaxCloudJobMinutes = useConfigStore((s) => s.setMaxCloudJobMinutes)
+    const setUploadPolicy = useConfigStore((s) => s.setUploadPolicy)
 
     useEffect(() => {
         validateAccess()
@@ -66,6 +68,8 @@ export function AppGuard({ children }: { children: React.ReactNode }) {
         setLiveDiarizeEnabled(liveDiarizeAvailable(data))
         setProYearlyAvailable(proYearlyAvailable(data))
         setMcpAvailable(mcpAvailable(data))
+        setMaxCloudJobMinutes(maxCloudJobMinutes(data))
+        setUploadPolicy(cloudUploadPolicy(data))
     }
 
     // Hämta config i bakgrunden (utan timeout) efter att användaren släppts in via

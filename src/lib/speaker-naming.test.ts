@@ -5,6 +5,9 @@ import {
     mergeSuggestions,
     parseSpeakerData,
     serializeSpeakerData,
+    formatSpeakerGroup,
+    suggestionsFromResult,
+    applyNamingResult,
 } from "@/lib/speaker-naming";
 import type { UISegment } from "@/store/transcription-store";
 
@@ -118,5 +121,99 @@ describe("parseSpeakerData / serializeSpeakerData", () => {
     it("roundtrip bevarar map, participants och auto", () => {
         const data = { map: { DU: "Anna" }, participants: ["Erik"], auto: ["DU"] };
         expect(parseSpeakerData(serializeSpeakerData(data))).toEqual(data);
+    });
+});
+
+describe("formatSpeakerGroup", () => {
+    it("visar upp till tre namn med snedstreck", () => {
+        expect(formatSpeakerGroup(["Anna", "Lasse"])).toBe("Anna/Lasse");
+        expect(formatSpeakerGroup(["Anna", "Lasse", "Per"])).toBe("Anna/Lasse/Per");
+    });
+    it("visar fyra eller fler som två namn och ett antal", () => {
+        expect(formatSpeakerGroup(["Anna", "Lasse", "Per", "Eva"])).toBe("Anna, Lasse +2");
+    });
+});
+
+describe("suggestionsFromResult", () => {
+    it("gör grupper till vanliga namn och behåller enskilda personer", () => {
+        expect(suggestionsFromResult({ speaker_map: { "MÖTET": "Per" }, speaker_groups: { DU: ["Anna", "Lasse"] } }))
+            .toEqual({ "MÖTET": "Per", DU: "Anna/Lasse" });
+    });
+    it("tål en äldre server utan grupper och ett tomt svar", () => {
+        expect(suggestionsFromResult({ speaker_map: { DU: "Anna" } })).toEqual({ DU: "Anna" });
+        expect(suggestionsFromResult(null)).toEqual({});
+        expect(suggestionsFromResult({})).toEqual({});
+    });
+});
+
+describe("applyNamingResult", () => {
+    const empty = { map: {}, participants: ["Anna", "Lasse"], auto: [] as string[] };
+
+    it("lägger in en grupp som Anna/Lasse, automatisk och med källa", () => {
+        const out = applyNamingResult(empty, { speaker_groups: { DU: ["Anna", "Lasse"] } }, "protocol");
+        expect(out.data.map).toEqual({ DU: "Anna/Lasse" });
+        expect(out.data.auto).toEqual(["DU"]);
+        expect(out.data.auto_source).toEqual({ DU: "protocol" });
+        expect(out.data.participants).toEqual(["Anna", "Lasse"]);
+        expect(out.applied).toBe(1);
+        expect(out.groupsApplied).toBe(1);
+    });
+
+    it("fyra namn i en grupp visas som Anna, Lasse +2", () => {
+        const out = applyNamingResult(empty, { speaker_groups: { DU: ["Anna", "Lasse", "Per", "Eva"] } }, "protocol");
+        expect(out.data.map.DU).toBe("Anna, Lasse +2");
+    });
+
+    it("rör aldrig ett namn som användaren satt", () => {
+        const current = { map: { DU: "Daniel" }, participants: [], auto: [] as string[] };
+        const out = applyNamingResult(current, { speaker_map: { DU: "Anna", "MÖTET": "Per" } }, "protocol");
+        expect(out.data.map).toEqual({ DU: "Daniel", "MÖTET": "Per" });
+        expect(out.applied).toBe(1);
+        expect(out.groupsApplied).toBe(0);
+    });
+
+    it("ett tomt förslag ändrar ingenting och ger antal 0", () => {
+        const current = { map: { DU: "Anna" }, participants: [], auto: ["DU"], auto_source: { DU: "identify" as const } };
+        const out = applyNamingResult(current, { speaker_map: {}, speaker_groups: {} }, "protocol");
+        expect(out.data.map).toEqual(current.map);
+        expect(out.data.auto).toEqual(["DU"]);
+        expect(out.data.auto_source).toEqual({ DU: "identify" });
+        expect(out.applied).toBe(0);
+    });
+
+    it("samma förslag igen räknas inte som ett nytt namn", () => {
+        const current = { map: { DU: "Anna" }, participants: [], auto: ["DU"] };
+        expect(applyNamingResult(current, { speaker_map: { DU: "Anna" } }, "protocol").applied).toBe(0);
+    });
+
+    it("muterar inte indata", () => {
+        const current = { map: { "MÖTET": "Per" }, participants: [], auto: ["MÖTET"] };
+        applyNamingResult(current, { speaker_map: { DU: "Anna" } }, "protocol");
+        expect(current).toEqual({ map: { "MÖTET": "Per" }, participants: [], auto: ["MÖTET"] });
+    });
+});
+
+describe("källan till automatiska namn", () => {
+    it("en gammal rad utan källa läses som förut", () => {
+        const parsed = parseSpeakerData(JSON.stringify({ map: { DU: "Anna" }, participants: [], auto: ["DU"] }));
+        expect(parsed.auto_source).toBeUndefined();
+    });
+
+    it("källan sparas och läses tillbaka, bara för nycklar som fortfarande är automatiska", () => {
+        const raw = serializeSpeakerData({
+            map: { DU: "Anna", "MÖTET": "Per" }, participants: [], auto: ["DU"],
+            auto_source: { DU: "protocol", "MÖTET": "identify" },
+        });
+        expect(parseSpeakerData(raw).auto_source).toEqual({ DU: "protocol" });
+    });
+
+    it("okända källor släpps vid inläsning", () => {
+        const parsed = parseSpeakerData(JSON.stringify({ map: {}, participants: [], auto: ["DU"], auto_source: { DU: "hackad" } }));
+        expect(parsed.auto_source).toBeUndefined();
+    });
+
+    it("utan källa är payloaden byte för byte som förut", () => {
+        expect(serializeSpeakerData({ map: { DU: "Anna" }, participants: ["Erik"], auto: ["DU"] }))
+            .toBe(JSON.stringify({ map: { DU: "Anna" }, participants: ["Erik"], auto: ["DU"] }));
     });
 });

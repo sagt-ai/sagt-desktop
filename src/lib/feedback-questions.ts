@@ -9,6 +9,8 @@ export interface FeedbackQuestion {
     thumb?: string
     /** Frågan i fri text. */
     text: string
+    /** Fritextfrågan efter tumme upp, när den ska skilja sig från `text`. */
+    textUp?: string
 }
 
 const QUESTIONNAIRE_START: FeedbackQuestion[] = [
@@ -55,6 +57,13 @@ export function questionsFor(surface: FeedbackSurface, isPro: boolean): Feedback
                 id: "paywall_why_not",
                 thumb: "Var det tydligt vad du får med Pro?",
                 text: "Vad gjorde att du inte valde Pro?",
+            }]
+        case "transcript":
+            return [{
+                id: "text_correct",
+                thumb: "Blev texten rätt?",
+                text: "Vad blev fel?",
+                textUp: "Något du vill lägga till?",
             }]
         case "pro":
             return [

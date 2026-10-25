@@ -37,6 +37,7 @@ export interface AnswerProperties {
     app_version: string
     os: string
     environment: string
+    build_channel?: "release" | "test" | "dev"
 }
 
 export interface OutboxItem {

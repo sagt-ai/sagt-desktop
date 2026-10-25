@@ -15,7 +15,7 @@ import { bestSavedText, forgetCloudJob, reanalyzeRecording, protocolKeys } from 
 import { AnalyzeHttpError } from "@/lib/entitlements";
 import { entitlementFor, quotaForUpsell, useEntitlement, useEntitlementsStore, useQuotaCounter } from "@/store/entitlements-store";
 import { applyInlineCloudResult, analysisFromJob, ANALYSIS_FAILED_MESSAGE, cloudSegmentsJsonFromJob, segmentsHaveDiarizationLabels, invalidateStaleSpeakerMap, stripUnstableSpeakerMapKeys } from "@/lib/cloud-sync";
-import { speakerKey, mergeSuggestions, parseSpeakerData, serializeSpeakerData } from "@/lib/speaker-naming";
+import { speakerKey, applyNamingResult, suggestionsFromResult, parseSpeakerData, serializeSpeakerData, type AutoSource } from "@/lib/speaker-naming";
 import {
     buildCopyText as buildCopyTextFromLines,
     defaultLabel,
@@ -277,6 +277,12 @@ export function SplitView() {
     useEffect(() => { speakerMapRef.current = speakerMap; }, [speakerMap]);
     useEffect(() => { participantsRef.current = participants; }, [participants]);
     useEffect(() => { autoKeysRef.current = autoKeys; }, [autoKeys]);
+    // Varifrån varje automatiskt namn kom (protokollet eller "Namnge talare igen"). Bara för
+    // eventet när användaren rättar ett namn; visas aldrig. En ref räcker: inget ritas om av den.
+    const autoSourceRef = useRef<Record<string, AutoSource>>({});
+    // Förklaringen till "Vilka är med?" visas bara medan fältet redigeras.
+    const [participantsFocused, setParticipantsFocused] = useState(false);
+    const nameSpeakersWithProtocol = useSettingsStore((s) => s.nameSpeakersWithProtocol);
     // §13.3: in-flight-guard för slå-ihop (popovern stängs synkront, men skyddar mot
     // blixtsnabb återöppning + nytt merge medan första invoken är i luften).
     const mergingRef = useRef(false);
@@ -425,7 +431,7 @@ export function SplitView() {
         setUploadStatus('uploading');
         try {
             const job = await uploadJob(
-                uploadPath, "general", token, true, undefined,
+                "desktop_retranscribe", uploadPath, "general", token, true, undefined,
                 diarize,
                 diarize && participants.length > 0 ? participants.length : undefined,
                 // §13.4: hint om att mikrofonkanalen (DU) bara har en talare → hindrar
@@ -485,14 +491,15 @@ export function SplitView() {
     // flushar den live-buffrade datan (pendingSpeakerData i store) vid history-updated, eftersom
     // SplitView kan vara avmonterad när lokal transkribering sparar inspelningen efter stopp.
     useEffect(() => {
-        if (!activeJob) { setSpeakerMap({}); setParticipants([]); setAutoKeys([]); return; }
+        if (!activeJob) { setSpeakerMap({}); setParticipants([]); setAutoKeys([]); autoSourceRef.current = {}; return; }
         if (!useSyncStore.getState().activeJobFromHistory) return;
         const raw = activeJob.speaker_map;
-        if (!raw) { setSpeakerMap({}); setParticipants([]); setAutoKeys([]); return; }
+        if (!raw) { setSpeakerMap({}); setParticipants([]); setAutoKeys([]); autoSourceRef.current = {}; return; }
         const parsed = parseSpeakerData(raw);
         setSpeakerMap(parsed.map);
         setParticipants(parsed.participants);
         setAutoKeys(parsed.auto);
+        autoSourceRef.current = parsed.auto_source ?? {};
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [activeJob?.id, activeJob?.speaker_map]);
 
@@ -508,6 +515,7 @@ export function SplitView() {
         setSpeakerMap(parsed.map);
         setParticipants(parsed.participants);
         setAutoKeys(parsed.auto);
+        autoSourceRef.current = parsed.auto_source ?? {};
     }, [isRecording, activeJobFromHistory, activeJob?.speaker_map]);
 
     // STEG 2: under LIVE (inspelning pågår, ej ett historik-jobb) speglar SplitView store:ns
@@ -536,7 +544,7 @@ export function SplitView() {
             sync.setPendingSpeakerData({ map, participants: parts });
             return;
         }
-        const payload = serializeSpeakerData({ map, participants: parts, auto });
+        const payload = serializeSpeakerData({ map, participants: parts, auto, auto_source: autoSourceRef.current });
         try {
             // camelCase: Rust-param speaker_map → speakerMap i JS-invoke (annars None tyst).
             await invoke("save_speaker_map_to_db", { id, speakerMap: payload });
@@ -566,6 +574,20 @@ export function SplitView() {
     const commitRename = (sp: string) => {
         const k = speakerKey(sp);
         const name = editingName.trim();
+        const prev = speakerMap[k] ?? "";
+        if (name !== prev) {
+            // Rättade användaren ett förslag? Andelen rättade förslag är måttet på om förslagen
+            // hjälper. Bara flaggor, aldrig namnen.
+            const wasAuto = !!prev && autoKeys.includes(k);
+            events.speakerRenamed({
+                was_auto: wasAuto,
+                source: wasAuto ? (autoSourceRef.current[k] ?? "other") : "manual",
+                cleared: !name,
+                is_group: wasAuto && (prev.includes("/") || / \+\d+$/.test(prev)),
+            });
+        }
+        const { [k]: _dropped, ...restSource } = autoSourceRef.current;
+        autoSourceRef.current = restSource;
         const next = { ...speakerMap };
         if (name) next[k] = name; else delete next[k];
         setSpeakerMap(next);
@@ -686,22 +708,24 @@ export function SplitView() {
         if (!silent) events.speakersIdentifyRequested();
         try {
             const result = await identifySpeakers(apiTurns, parts, token);
-            const suggested = result.speaker_map || {};
-            if (Object.keys(suggested).length === 0) {
+            if (Object.keys(suggestionsFromResult(result)).length === 0) {
                 if (!silent) toast.info("Kunde inte härleda namn ur samtalet. Klicka på en etikett för att namnge manuellt.");
                 return;
             }
-            const merged = mergeSuggestions(baseMap, suggested, baseAuto);
             // Antal FAKTISKT applicerade namn (förslag mot användarsatta nycklar avvisas).
-            let count = 0;
-            for (const [k, v] of Object.entries(merged.map)) if (baseMap[k] !== v) count++;
+            const { data, applied: count } = applyNamingResult(
+                { map: baseMap, participants: parts, auto: baseAuto, auto_source: autoSourceRef.current },
+                result,
+                "identify",
+            );
             if (count === 0) {
                 if (!silent) toast.info("Namnen är redan satta. Klicka på en etikett för att ändra manuellt.");
                 return;
             }
-            setSpeakerMap(merged.map);
-            setAutoKeys(merged.autoKeys);
-            persistSpeakerData(merged.map, parts, merged.autoKeys);
+            setSpeakerMap(data.map);
+            setAutoKeys(data.auto);
+            autoSourceRef.current = data.auto_source ?? {};
+            persistSpeakerData(data.map, parts, data.auto);
             toast.success(
                 silent
                     ? `Namngav ${count} talare automatiskt. Klicka på ett namn för att ändra.`
@@ -724,13 +748,14 @@ export function SplitView() {
         }
     };
 
-    // Manuell "Namnge talare igen": bygger turer ur den visade vyn (hoppar MOLN).
-    const handleIdentifySpeakers = () => {
-        const apiTurns: SpeakerTurn[] = turns
-            .filter(t => t.speaker !== "MOLN")
-            .map(t => ({ speaker: speakerKey(t.speaker), text: t.text, start: t.start_time ?? null }));
-        return runIdentify(apiTurns, participants, speakerMap, autoKeys, { silent: false });
-    };
+    // Turerna ur den visade vyn (hoppar MOLN). Delas av "Namnge talare igen" och protokollet.
+    const visibleApiTurns = (): SpeakerTurn[] => turns
+        .filter(t => t.speaker !== "MOLN")
+        .map(t => ({ speaker: speakerKey(t.speaker), text: t.text, start: t.start_time ?? null }));
+
+    // Manuell "Namnge talare igen".
+    const handleIdentifySpeakers = () =>
+        runIdentify(visibleApiTurns(), participants, speakerMap, autoKeys, { silent: false });
 
     // Felen från protokollanropet. Kvoten slut → fönstret med kvotraden, och serverns siffror
     // in i räknaren direkt. Övriga 402 ("Pro krävs") → fönstret som tidigare.
@@ -807,6 +832,15 @@ export function SplitView() {
             if (!activeJob && segments.length === 0) return;
             events.analysisRequested();
             setIsReanalyzing(true);
+            // Namnförslag i samma anrop (reglaget i Inställningar, på som standard). Bara när
+            // vyn har talaretiketter: en sammanhängande molntext har inga talare att namnge.
+            const namingTurns = nameSpeakersWithProtocol && hasNamableSpeakers ? visibleApiTurns() : [];
+            const naming = namingTurns.length > 0
+                ? { turns: namingTurns, participantHints: participantsRef.current }
+                : undefined;
+            // Inspelningen som protokollet gäller. Byter användaren inspelning medan anropet
+            // pågår ska namnen inte hamna på den nya.
+            const namingFor = activeJob?.id ?? null;
             try {
                 const fullText = bestSavedText(activeJob, segments);
 
@@ -822,6 +856,7 @@ export function SplitView() {
                     templateId: "general",
                     token,
                     keys: protocolKeys,
+                    naming,
                 });
 
                 const mappedAnalysis = {
@@ -832,7 +867,6 @@ export function SplitView() {
                 };
 
                 setAnalysisData(mappedAnalysis as AnalysisData);
-                events.analysisCompleted();
                 onAnalysisCompleted();
                 // Stop polling so it doesn't overwrite this re-analysis result
                 setUploadedJobId(null);
@@ -846,8 +880,12 @@ export function SplitView() {
                         template: "general"
                     });
 
+                    // Talarkartan läses färsk: ett namnbyte medan protokollet skapades har redan
+                    // sparats, och inspelningen från klicket hade skrivit tillbaka den gamla.
+                    const fresh = useSyncStore.getState().activeJob;
                     let updatedJob = {
                         ...activeJob,
+                        speaker_map: fresh?.id === activeJob.id ? fresh.speaker_map : activeJob.speaker_map,
                         analysis_json: JSON.stringify(mappedAnalysis),
                         ai_template_used: "general"
                     };
@@ -858,6 +896,43 @@ export function SplitView() {
                     }
                     setActiveJob(updatedJob);
                 }
+                // Namnen läggs på EFTER att analysen sparats: setActiveJob ovan bygger på
+                // inspelningen som den var vid klicket, och hade annars skrivit tillbaka den gamla
+                // talarkartan. Talardatan läses färsk, så att ett namnbyte under anropet vinner.
+                // Servern svarade på begäran om namn (stateless väg och en server som kan det).
+                // Omkörningen av ett synkat molnjobb och äldre servrar svarar utan fälten.
+                const namingAnswered = !!naming && raw && typeof raw === "object" && "speaker_map" in raw;
+                // Samma inspelning som vid klicket. Sparades en stoppad inspelning först under
+                // anropet (inget id vid klicket) är det den som nu visas, så länge användaren
+                // inte öppnat en annan ur historiken.
+                const sync = useSyncStore.getState();
+                const nowId = sync.activeJob?.id ?? null;
+                const sameRecording = nowId === namingFor || (namingFor === null && !sync.activeJobFromHistory);
+                let namesApplied = 0, groupsApplied = 0;
+                if (naming && namingAnswered && sameRecording) {
+                    const { data, applied, groupsApplied: groups } = applyNamingResult(
+                        {
+                            map: speakerMapRef.current,
+                            participants: participantsRef.current,
+                            auto: autoKeysRef.current,
+                            auto_source: autoSourceRef.current,
+                        },
+                        raw,
+                        "protocol",
+                    );
+                    if (applied > 0) {
+                        setSpeakerMap(data.map);
+                        setAutoKeys(data.auto);
+                        autoSourceRef.current = data.auto_source ?? {};
+                        await persistSpeakerData(data.map, data.participants, data.auto);
+                        toast.success(`Föreslog namn på ${applied} talare. Klicka på ett namn för att ändra.`);
+                    }
+                    namesApplied = applied;
+                    groupsApplied = groups;
+                }
+                events.analysisCompleted('manual', naming && namingAnswered
+                    ? { names_applied: namesApplied, groups_applied: groupsApplied, hint_count: naming.participantHints.length }
+                    : undefined);
                 if (cloudJobGone) {
                     toast.info("Molnkopian finns inte längre, så analysen gjordes på texten på den här datorn.");
                 }
@@ -896,7 +971,7 @@ export function SplitView() {
             setErrorMessage(null);
 
             try {
-                const job = await uploadJob(uploadPath, "general", token, useSettingsStore.getState().autoAnalyzeCloud);
+                const job = await uploadJob("desktop_autosync", uploadPath, "general", token, useSettingsStore.getState().autoAnalyzeCloud);
                 setUploadStatus('success');
 
                 const targetDbId = activeJob ? activeJob.id : (currentSessionId ? parseInt(currentSessionId) : null);
@@ -1406,7 +1481,7 @@ export function SplitView() {
                                 {hasNamableSpeakers && (
                                     <div className="flex flex-wrap items-center gap-1.5 mb-4 pb-3 border-b border-line/60">
                                         <Users className="w-3.5 h-3.5 text-ink-muted mr-0.5" />
-                                        <span className="text-xs text-ink-muted mr-1">Vilka är med?</span>
+                                        <label htmlFor="participants-input" className="text-xs text-ink-muted mr-1 cursor-text">Vilka är med?</label>
                                         {participants.map((p) => (
                                             <span key={p} className="inline-flex items-center gap-1 text-xs bg-brand/5 text-brand border border-brand/10 rounded-full pl-2.5 pr-1 py-0.5">
                                                 {p}
@@ -1416,13 +1491,23 @@ export function SplitView() {
                                             </span>
                                         ))}
                                         <input
+                                            id="participants-input"
                                             value={newParticipant}
                                             onChange={(e) => setNewParticipant(e.target.value)}
                                             onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addParticipant(); } }}
-                                            onBlur={addParticipant}
+                                            onFocus={() => setParticipantsFocused(true)}
+                                            onBlur={() => { addParticipant(); setParticipantsFocused(false); }}
                                             placeholder="Lägg till namn…"
                                             className="text-xs bg-transparent border-b border-dashed border-line focus:border-brand outline-none px-1 py-0.5 w-28 text-ink placeholder:text-ink-muted/60"
                                         />
+                                        {/* Förklaringen syns bara medan fältet redigeras, aldrig permanent. */}
+                                        {participantsFocused && (
+                                            <p className="basis-full text-[11px] text-ink-muted pt-1">
+                                                {nameSpeakersWithProtocol
+                                                    ? "Namnen skickas med texten när du skapar ett protokoll, så att det kan föreslå vem som talar."
+                                                    : "Namnen används som snabbval när du namnger en talare. Förslag med protokollet är avstängt i Inställningar."}
+                                            </p>
+                                        )}
                                     </div>
                                 )}
                                 {turns.map((turn, index, arr) => {

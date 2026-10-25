@@ -2,6 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore } from "@/store/settings-store";
 import { ChunkHttpError } from "./cloud-chunks";
 import { analyzeErrorFrom, parseEntitlements, parseQuotaExhausted, type EntitlementsResponse, type OfflineAllowance, type QuotaExhaustedInfo } from "./entitlements";
+import { MAX_UPLOAD_FILE_BYTES, uploadTooLargeMessage, uploadTooLongMessage } from "./upload-limits";
+import { onceReporter, outcomeForStatus, wavInfo, type CloudUploadPath } from "./cloud-upload-outcome";
+import { captureEvent } from "@/hooks/use-posthog-events";
+import { useAuthStore } from "@/store/auth-store";
+import { useConfigStore } from "@/store/config-store";
 
 // Re-export så alla `import { errorSlug } from "@/lib/api"` fungerar; själva funktionen
 // bor i en ren fil utan Tauri-beroenden (error-slug.ts) → enhetstestbar i node.
@@ -80,12 +85,141 @@ export async function transcribeChunk(
     return await response.json();
 }
 
-export async function uploadJob(filePath: string, templateId: string = "general", token: string, performAnalysis: boolean = true, persistOverride?: boolean, diarize: boolean = false, numSpeakers?: number, micSpeakers?: number): Promise<Job> {
-    const { backendUrl, retentionPolicy, transcriptionLanguage, cloudSync } = useSettingsStore.getState();
+/** Planen som egenskap i uppladdningseventet. Ingen grind: servern avgör vem som får ladda upp. */
+function currentPlan(): "pro" | "free" {
+    return useAuthStore.getState().isPro() ? "pro" : "free";
+}
 
-    // TODO: Replace localhost with https://api.sagt.ai for production builds. (We will inject this variable during the actual build command).
+/** Rapportör för `cloud_upload_outcome`, ett event per försök. Se cloud-upload-outcome.ts. */
+function uploadReporter(path: CloudUploadPath, fileBytes: ArrayLike<number>) {
+    return onceReporter(captureEvent, {
+        path,
+        sizeBytes: fileBytes.length,
+        info: wavInfo(fileBytes),
+        plan: currentPlan(),
+    });
+}
 
-    // 1. Read file content from Tauri backend
+/** Formulärfälten till POST /jobs utöver filen. Samma för Opus-vägen och WAV-vägen. */
+function jobFields(templateId: string, performAnalysis: boolean, persistOverride: boolean | undefined, diarize: boolean, numSpeakers?: number, micSpeakers?: number): [string, string][] {
+    const { retentionPolicy, transcriptionLanguage, cloudSync } = useSettingsStore.getState();
+    const fields: [string, string][] = [
+        ["retention_policy", retentionPolicy],
+        ["template_id", templateId],
+        ["perform_analysis", String(performAnalysis)],
+        ["language", transcriptionLanguage ?? "sv"],
+        // Opt-in molnsynk: persist=true → resultatet sparas i molnet (dashboard). Default av →
+        // backend returnerar resultatet inline och raderar jobbet (inget moln-spår).
+        ["persist", String(persistOverride ?? cloudSync)],
+    ];
+    // Fas 2: talarseparering (opt-in, Pro). Skickas bara när påslaget → gamla beteendet
+    // oförändrat annars. Servern ignorerar tyst `diarize` när omtranskribering med talare är avstängd.
+    if (diarize) fields.push(["diarize", "true"]);
+    if (numSpeakers && numSpeakers > 0) fields.push(["num_speakers", String(numSpeakers)]);
+    // §13.4: DU/mik-kanalens talarantal (stereo) — desktop skickar 1 (ensam vid mikrofonen)
+    // som default → ingen Du 1/Du 2-översegmentering. Skickas bara vid diarisering.
+    if (diarize && micSpeakers && micSpeakers > 0) fields.push(["mic_speakers", String(micSpeakers)]);
+    return fields;
+}
+
+function apiBaseUrl(): string {
+    const baseUrl = useSettingsStore.getState().backendUrl.replace(/\/$/, "");
+    return baseUrl.endsWith("/api/v1") ? baseUrl : `${baseUrl}/api/v1`;
+}
+
+function unreachable(baseUrl: string): Error {
+    return new Error(`Kunde inte nå servern på "${baseUrl}". Kontrollera att servern är igång och att URL:en i inställningar är korrekt.`);
+}
+
+/** Felet för ett svar som inte är 2xx. Texterna läses av errorSlug och av anroparna. */
+function jobHttpError(status: number, body: string): Error {
+    let detail = body;
+    try {
+        const parsed = JSON.parse(body);
+        if (parsed.detail) detail = parsed.detail;
+    } catch { }
+    if (status === 401) return new Error(`Unauthorized: ${detail}`);
+    if (status === 402) return new Error(`Payment Required: Denna funktion kräver Pro. Vänligen uppgradera via webbportalen.`);
+    // Serverns längdtak svarar 413 med en text som redan börjar med "För långt:".
+    if (status === 413) return new Error(/^För långt:/.test(detail) ? detail : `För stort: ${detail}`);
+    return new Error(`Kunde inte ladda upp: ${detail}`);
+}
+
+/** Svaret från Rust-kommandot `upload_cloud_audio`. */
+interface CloudUploadResult {
+    outcome: "sent" | "blocked_size" | "blocked_duration";
+    status: number;
+    body: string;
+    format: string;
+    size_bytes: number;
+    duration_secs: number;
+    channels: number;
+    /** Bitraten per kanal när filen skickades som Opus, 0 när den skickades som WAV. */
+    opus_bitrate: number;
+}
+
+/**
+ * Laddar upp en inspelning till POST /jobs från Rust. Servern bestämmer formatet
+ * (`cloudUploadPolicy`): alltid WAV, Opus bara när WAV-filen inte ryms, eller alltid Opus,
+ * och bitraten. Kan filen inte läsas av kodaren (ett format äldre versioner skrev) skickas
+ * WAV-filen från webbvyn som förut.
+ *
+ * `path` först och utan standardvärde: en ny anropare kan inte glömma att säga var den laddar upp ifrån.
+ */
+export async function uploadJob(path: CloudUploadPath, filePath: string, templateId: string = "general", token: string, performAnalysis: boolean = true, persistOverride?: boolean, diarize: boolean = false, numSpeakers?: number, micSpeakers?: number): Promise<Job> {
+    const fields = jobFields(templateId, performAnalysis, persistOverride, diarize, numSpeakers, micSpeakers);
+    const baseUrl = apiBaseUrl();
+    const plan = currentPlan();
+    const { maxCloudJobMinutes: maxMinutes, uploadPolicy } = useConfigStore.getState();
+
+    let r: CloudUploadResult;
+    try {
+        r = await invoke<CloudUploadResult>("upload_cloud_audio", {
+            path: filePath, url: `${baseUrl}/jobs`, token, fields,
+            maxBytes: MAX_UPLOAD_FILE_BYTES, maxMinutes,
+            opusBitratePerChannel: uploadPolicy.opusBitratePerChannel,
+            wavWhenFits: uploadPolicy.onlyWhenNeeded,
+        });
+    } catch (error) {
+        const msg = String(error);
+        if (msg.startsWith("UNSUPPORTED:")) {
+            console.warn("[Upload] Filen kan inte kodas till Opus, skickar WAV:", msg);
+            return uploadJobWav(path, filePath, token, fields, baseUrl);
+        }
+        if (msg.startsWith("NETWORK:")) {
+            onceReporter(captureEvent, { path, sizeBytes: 0, info: { format: "unknown", channels: null, durationSec: null }, plan, policySource: uploadPolicy.source })("failed_network");
+            throw unreachable(baseUrl);
+        }
+        throw new Error(`Uppladdningen misslyckades: ${msg}`);
+    }
+
+    const report = onceReporter(captureEvent, {
+        path,
+        sizeBytes: r.size_bytes,
+        info: { format: r.format, channels: r.channels || null, durationSec: r.duration_secs },
+        plan,
+        opusBitrate: r.opus_bitrate || null,
+        policySource: uploadPolicy.source,
+    });
+    if (r.outcome === "blocked_duration") {
+        report("blocked_duration");
+        throw new Error(uploadTooLongMessage(r.duration_secs, maxMinutes));
+    }
+    if (r.outcome === "blocked_size") {
+        report("blocked_size");
+        throw new Error(uploadTooLargeMessage(r.size_bytes) ?? `För stort: ${r.size_bytes} byte`);
+    }
+    report(outcomeForStatus(r.status), r.status);
+    if (r.status < 200 || r.status >= 300) throw jobHttpError(r.status, r.body);
+    try {
+        return JSON.parse(r.body) as Job;
+    } catch {
+        throw new Error("Kunde inte ladda upp: oväntat svar från servern.");
+    }
+}
+
+/** WAV-vägen: filen läses till webbvyn och skickas därifrån, med molnets storlekstak (~8 min stereo). */
+async function uploadJobWav(path: CloudUploadPath, filePath: string, token: string, fields: [string, string][], baseUrl: string): Promise<Job> {
     let fileBytes: number[];
     try {
         fileBytes = await invoke<number[]>("read_audio_file", { path: filePath });
@@ -93,98 +227,37 @@ export async function uploadJob(filePath: string, templateId: string = "general"
         console.error("Failed to read audio file:", error);
         throw new Error(`Could not read file at ${filePath}: ${error}`);
     }
+    // Före uppladdningen: över taket avvisas anropet med ett svar som webbvyn inte får läsa, och
+    // fetch kastar då "Failed to fetch", som nedan blir "Kunde inte nå servern".
+    const report = uploadReporter(path, fileBytes);
+    const tooLarge = uploadTooLargeMessage(fileBytes.length);
+    if (tooLarge) {
+        report("blocked_size");
+        throw new Error(tooLarge);
+    }
 
-    // 2. Create Blob/File
-    const uint8Array = new Uint8Array(fileBytes);
-    const blob = new Blob([uint8Array], { type: "audio/wav" });
     const filename = filePath.split(/[/\\]/).pop() || "session.wav";
-    const file = new File([blob], filename, { type: "audio/wav" });
-
-    // 3. Prepare FormData
+    const file = new File([new Blob([new Uint8Array(fileBytes)], { type: "audio/wav" })], filename, { type: "audio/wav" });
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("retention_policy", retentionPolicy);
-    formData.append("template_id", templateId);
-    formData.append("perform_analysis", String(performAnalysis));
-    formData.append("language", transcriptionLanguage ?? "sv");
-    // Opt-in molnsynk: persist=true → resultatet sparas i molnet (dashboard). Default av →
-    // backend returnerar resultatet inline och raderar jobbet (inget moln-spår).
-    formData.append("persist", String(persistOverride ?? cloudSync));
-    // Fas 2: talarseparering (opt-in, Pro). Skickas bara när påslaget → gamla beteendet
-    // oförändrat annars. Servern ignorerar tyst `diarize` när omtranskribering med talare är avstängd.
-    if (diarize) formData.append("diarize", "true");
-    if (numSpeakers && numSpeakers > 0) formData.append("num_speakers", String(numSpeakers));
-    // §13.4: DU/mik-kanalens talarantal (stereo) — desktop skickar 1 (ensam vid mikrofonen)
-    // som default → ingen Du 1/Du 2-översegmentering. Skickas bara vid diarisering.
-    if (diarize && micSpeakers && micSpeakers > 0) formData.append("mic_speakers", String(micSpeakers));
+    for (const [k, v] of fields) formData.append(k, v);
 
-    // 4. Upload
-    // Ensure backendUrl doesn't have trailing slash if we add one, or handle it
-    let baseUrl = backendUrl.replace(/\/$/, "");
-
-    // STRICTLY ensure /api/v1 suffix
-    if (!baseUrl.endsWith("/api/v1")) {
-        // If the user already pasted /api/v1 just ensure we don't double it (handled by check above)
-        // Check if it ends with /api (without v1) logic? No, just straightforward append if missing.
-        // User might have entered "backend.com/api" -> "backend.com/api/api/v1" - hopefully not often.
-        // Let's assume user enters base domain or full api path.
-        // But the requirement is explicit: "strictly verify that the resulting string is [BASE_URL]/api/v1"
-        baseUrl = `${baseUrl}/api/v1`;
-    }
-
-    const url = `${baseUrl}/jobs`;
-
-    console.log(`[Upload] Uploading to: ${url}`);
-    console.debug(`[Upload] Backend URL determined as: ${baseUrl}`);
-
-    const headers: HeadersInit = {
-        "Authorization": `Bearer ${token}`
-    };
-
+    let response: Response;
     try {
-        const response = await fetch(url, {
+        response = await fetch(`${baseUrl}/jobs`, {
             method: "POST",
-            headers,
+            headers: { "Authorization": `Bearer ${token}` },
             body: formData,
         });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            let parsedError = errorText;
-            try {
-                const parsed = JSON.parse(errorText);
-                if (parsed.detail) parsedError = parsed.detail;
-            } catch (e) { }
-
-            if (response.status === 401) {
-                throw new Error(`Unauthorized: ${parsedError}`);
-            }
-            if (response.status === 402) {
-                throw new Error(`Payment Required: Denna funktion kräver Pro. Vänligen uppgradera via webbportalen.`);
-            }
-            throw new Error(`Kunde inte ladda upp: ${parsedError}`);
-        }
-
-        return await response.json();
     } catch (error: any) {
         console.error("🔥 API Upload Error:", error);
-        if (error.response) {
-            console.error("Response data:", error.response.data);
-        }
-
-        if (error instanceof Error && error.message.startsWith("Unauthorized")) {
-            throw error;
-        }
-        if (error instanceof Error && error.message.includes("Payment Required")) {
-            throw error;
-        }
-
-        if (error instanceof TypeError && error.message.includes("Failed to fetch")) {
-            throw new Error(`Kunde inte nå servern på "${baseUrl}". Kontrollera att servern är igång och att URL:en i inställningar är korrekt.`);
-        }
-
+        report("failed_network");
+        if (error instanceof TypeError && error.message.includes("Failed to fetch")) throw unreachable(baseUrl);
         throw new Error(`Upload failed: ${error?.name} - ${error?.message}`);
     }
+    report(outcomeForStatus(response.status), response.status);
+    if (!response.ok) throw jobHttpError(response.status, await response.text());
+    return await response.json();
 }
 
 export async function getJob(jobId: string, token: string): Promise<Job> {
@@ -285,9 +358,17 @@ export async function reanalyzeTranscript(
     text: string,
     templateId: string = "general",
     token: string,
-    opts: { idempotencyKey?: string } = {},
+    opts: { idempotencyKey?: string; naming?: ProtocolNaming } = {},
 ): Promise<any> {
     const url = `${apiBase()}/analyze`;
+    // Namnförslag i samma anrop: servern svarar då också med speaker_map, confidence och
+    // speaker_groups. En äldre server ignorerar fälten och svarar som förut.
+    const body: Record<string, unknown> = { text, template_id: templateId };
+    if (opts.naming && opts.naming.turns.length > 0 && namingChars(opts.naming) <= PROTOCOL_NAMING_MAX_CHARS) {
+        body.turns = opts.naming.turns;
+        body.participant_hints = opts.naming.participantHints;
+        body.name_speakers = true;
+    }
 
     const headers: Record<string, string> = {
         "Content-Type": "application/json",
@@ -300,7 +381,7 @@ export async function reanalyzeTranscript(
         response = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ text, template_id: templateId }),
+            body: JSON.stringify(body),
         });
     } catch (error: any) {
         console.error("🔥 API Reanalyze Error:", error);
@@ -395,6 +476,26 @@ export interface SpeakerTurn {
 export interface IdentifySpeakersResult {
     speaker_map: Record<string, string>;
     confidence: Record<string, number>;
+    /** Flera namngivna personer på samma kanal: etikett → två till fyra namn. Saknas hos
+     *  äldre servrar. En etikett står aldrig i både speaker_map och speaker_groups. */
+    speaker_groups?: Record<string, string[]>;
+}
+
+/** Underlaget för namnförslag när protokollet skapas: turerna med talaretiketter, och
+ *  deltagarlistan ur "Vilka är med?". */
+export interface ProtocolNaming {
+    turns: SpeakerTurn[];
+    participantHints: string[];
+}
+
+/** Servern tar emot högst så här många tecken (turernas text och etiketter plus
+ *  deltagarlistan) för namnförslag. Över det skickas protokollet utan namnförslag, så att ett
+ *  långt möte fortfarande får sitt protokoll. */
+export const PROTOCOL_NAMING_MAX_CHARS = 250_000;
+
+export function namingChars(naming: ProtocolNaming): number {
+    return naming.turns.reduce((n, t) => n + t.text.length + t.speaker.length, 0)
+        + naming.participantHints.reduce((n, h) => n + h.length, 0);
 }
 
 /**
@@ -450,8 +551,8 @@ export interface DiarizeTurn {
  * INGET lagrat ljud. Anroparen (auto-finalize) mappar turerna på de
  * redan strömmade segmenten via `applyDiarizationTurns`.
  *
- * Läser filen via samma Rust-väg som `uploadJob` (`read_audio_file`), som är storlekstät på
- * mono-MÖTET (≈110 MB/h). Kastar vid 401/402/413 + 503 (kill switch) så anroparen kan
+ * Läser filen via samma Rust-väg som `uploadJob` (`read_audio_file`). Mono-MÖTET är
+ * ≈110 MB/h, så molnets tak (upload-limits.ts) räcker till ungefär 17 minuter. Kastar vid 401/402/413 + 503 (kill switch) så anroparen kan
  * degradera tyst till DU/MÖTET. Speglar `identifySpeakers` felhantering.
  */
 export async function diarizeMeeting(monoWavPath: string, token: string): Promise<DiarizeTurn[]> {
@@ -461,6 +562,14 @@ export async function diarizeMeeting(monoWavPath: string, token: string): Promis
         fileBytes = await invoke<number[]>("read_audio_file", { path: monoWavPath });
     } catch (error) {
         throw new Error(`Kunde inte läsa mono-WAV: ${error}`);
+    }
+    // Samma tak som uploadJob. Kastar med prefixet "För stort" som ett 413 → anroparen degraderar.
+    // Eventet gäller bara uppladdningen; talaridentifieringens eget utfall har ett eget event.
+    const report = uploadReporter("desktop_diarize_stop", fileBytes);
+    const tooLarge = uploadTooLargeMessage(fileBytes.length);
+    if (tooLarge) {
+        report("blocked_size");
+        throw new Error(tooLarge);
     }
 
     const uint8 = new Uint8Array(fileBytes);
@@ -473,11 +582,18 @@ export async function diarizeMeeting(monoWavPath: string, token: string): Promis
     if (!baseUrl.endsWith("/api/v1")) baseUrl = `${baseUrl}/api/v1`;
     const url = `${baseUrl}/diarize`;
 
-    const response = await fetch(url, {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${token}` },
-        body: formData,
-    });
+    let response: Response;
+    try {
+        response = await fetch(url, {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${token}` },
+            body: formData,
+        });
+    } catch (e) {
+        report("failed_network");
+        throw e;
+    }
+    report(outcomeForStatus(response.status), response.status);
 
     if (!response.ok) {
         const errText = await response.text();

@@ -189,7 +189,7 @@ export function RecordingsPage({ onViewChange }: { onViewChange: (view: 'dashboa
         setSyncingId(rec.id);
         try {
             toast.info("Synkar till molnet...");
-            const job = await uploadJob(rec.file_path, "general", token, true, true);
+            const job = await uploadJob("desktop_sync_list", rec.file_path, "general", token, true, true);
             await invoke("update_recording_status", { id: rec.id, status: 'uploaded', cloudJobId: job.id });
             toast.success("Synkad till molnet — visas nu i dashboarden på sagt.ai.");
             // Optimistisk uppdatering så raden blir "Synkad" direkt — utan att kräva flikbyte/remount.

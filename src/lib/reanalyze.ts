@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { CloudJobNotFoundError, reanalyzeJob, reanalyzeTranscript } from "@/lib/api";
+import { CloudJobNotFoundError, reanalyzeJob, reanalyzeTranscript, type ProtocolNaming } from "@/lib/api";
 import { IdempotencyKeys, requestProtocol } from "@/lib/entitlements";
 
 /**
@@ -22,7 +22,8 @@ export function bestSavedText(
 }
 
 export interface ReanalyzeOutcome {
-    /** Analysen i backendens form: summary, key_decisions, action_items, template_used. */
+    /** Analysen i backendens form: summary, key_decisions, action_items, template_used, och
+     *  speaker_map/speaker_groups när namnförslag begärdes och servern kan ge dem. */
     raw: any;
     /** Molnjobbet fanns inte längre, så analysen gjordes på den lokala texten i stället. */
     cloudJobGone: boolean;
@@ -45,11 +46,17 @@ export async function reanalyzeRecording(opts: {
     token: string;
     /** Nycklarna för den stateless vägen. Utan dem skickas ingen nyckel (bara Pro klarar sig utan). */
     keys?: IdempotencyKeys;
+    /** Be om namnförslag i samma anrop. Bara på den stateless vägen: omkörningen av ett
+     *  synkat molnjobb ger inga namn. Nyckeln binds fortfarande bara till text och mall, så
+     *  ett omförsök med en ändrad deltagarlista drar inget nytt protokoll. */
+    naming?: ProtocolNaming;
 }): Promise<ReanalyzeOutcome> {
-    const { cloudJobId, cloudSync, fullText, templateId, token, keys } = opts;
+    const { cloudJobId, cloudSync, fullText, templateId, token, keys, naming } = opts;
+    const call: typeof reanalyzeTranscript = (text, template, tok, o = {}) =>
+        reanalyzeTranscript(text, template, tok, { ...o, naming });
     const stateless = () => keys
-        ? requestProtocol({ text: fullText, templateId, token, keys, call: reanalyzeTranscript })
-        : reanalyzeTranscript(fullText, templateId, token);
+        ? requestProtocol({ text: fullText, templateId, token, keys, call })
+        : call(fullText, templateId, token);
     let outcome: ReanalyzeOutcome;
     if (cloudJobId && cloudSync) {
         try {

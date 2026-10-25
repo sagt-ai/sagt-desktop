@@ -7,6 +7,27 @@ The changelog starts at 0.9.41. Earlier versions are not documented here.
 
 ---
 
+## 0.12.4 — 2026-10-25
+
+### Added
+
+- **Speaker names are suggested when you create a protocol.** If names come
+  up in the meeting, or you list the participants in "Vilka är med?", the
+  speakers are named in the transcript instead of only "DU" and "MÖTET". Click
+  a name to change it. Nothing is suggested when the meeting gives no names.
+  You can turn this off in Settings.
+
+### Changed
+
+- **Longer meetings can be transcribed in the cloud.** Before, cloud
+  transcription stopped at about 8 minutes. Recordings that are too large to
+  send as they are are now compressed first, to about a tenth of their size,
+  so much longer meetings can be sent. Short meetings are sent unchanged. The
+  recording on your computer is not changed, and a meeting that is longer than
+  the cloud accepts gets a message with the limit instead of a failed upload.
+
+---
+
 ## 0.12.3 — 2026-10-25
 
 ### Changed

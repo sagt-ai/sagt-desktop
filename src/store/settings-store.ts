@@ -49,6 +49,11 @@ interface SettingsState {
     autoAnalyze: boolean;
     autoDiarize: boolean;
 
+    // Föreslå talarnamn när ett protokoll skapas (på som standard). Med den på skickas
+    // talaretiketterna och namnen i "Vilka är med?" med texten, och servern föreslår vem som
+    // talar. Av: protokollet skapas på texten som förut.
+    nameSpeakersWithProtocol: boolean;
+
     // New unified mode
     recordingMode: 'cloud_analysis' | 'cloud' | 'local';
     modeExplicitlySet: boolean; // true = user has consciously picked a mode via dropdown
@@ -78,6 +83,7 @@ interface SettingsState {
     setMicIsSingleSpeaker: (val: boolean) => void;
     setAutoAnalyze: (val: boolean) => void;
     setAutoDiarize: (val: boolean) => void;
+    setNameSpeakersWithProtocol: (val: boolean) => void;
 
     // Kept for backward compat, but calling them sets recordingMode under the hood
     setAutoTranscribeCloud: (val: boolean) => void;
@@ -107,6 +113,7 @@ export const useSettingsStore = create<SettingsState>()(
             micIsSingleSpeaker: true,
             autoAnalyze: true,
             autoDiarize: true,
+            nameSpeakersWithProtocol: true,
 
             // New unified mode — default 'local' så gratisanvändare inte möts av
             // molnläge-toast vid första inspelning
@@ -150,6 +157,7 @@ export const useSettingsStore = create<SettingsState>()(
             setMicIsSingleSpeaker: (micIsSingleSpeaker) => set({ micIsSingleSpeaker }),
             setAutoAnalyze: (autoAnalyze) => set({ autoAnalyze }),
             setAutoDiarize: (autoDiarize) => set({ autoDiarize }),
+            setNameSpeakersWithProtocol: (nameSpeakersWithProtocol) => set({ nameSpeakersWithProtocol }),
 
             // Legacy mapping
             setAutoTranscribeCloud: (val) => set((state) => {
@@ -179,6 +187,7 @@ export const useSettingsStore = create<SettingsState>()(
                 micIsSingleSpeaker: true,
                 autoAnalyze: true,
                 autoDiarize: true,
+                nameSpeakersWithProtocol: true,
                 recordingMode: 'local',
                 modeExplicitlySet: false,
                 cloudChoicePending: false,
@@ -227,6 +236,9 @@ export function migrateSettings(state: any, version: number) {
         // v9: automatik efter möte — analys + talarseparering (opt-out, default på)
         autoAnalyze: state.autoAnalyze ?? true,
         autoDiarize: state.autoDiarize ?? true,
+        // Talarnamn med protokollet. Ny nyckel med standardvärde: sparade inställningar utan den
+        // får värdet ur grundläget även utan versionsbyte, och raden här gäller en migrering.
+        nameSpeakersWithProtocol: state.nameSpeakersWithProtocol ?? true,
         // v10: frågan om molnmodellen, en gång, för den som hade den som standard.
         cloudChoicePending: version < 10 ? wasCloud : (state.cloudChoicePending ?? false),
     };

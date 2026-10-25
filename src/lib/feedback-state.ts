@@ -12,7 +12,7 @@
 // - Minst ett dygn mellan två tillfällen.
 // - Tre obesvarade visningar i rad ger 14 dagars vila.
 
-export type FeedbackSurface = "questionnaire" | "paywall" | "pro"
+export type FeedbackSurface = "questionnaire" | "paywall" | "pro" | "transcript"
 
 export const DAY_MS = 24 * 60 * 60 * 1000
 export const SNOOZE_MS = 14 * DAY_MS
@@ -67,7 +67,7 @@ export function parseState(raw: string | null): FeedbackState {
             lastShownAt: num(v.lastShownAt),
             ignoredInARow: num(v.ignoredInARow) ?? 0,
             done: Array.isArray(v.done)
-                ? v.done.filter((s): s is FeedbackSurface => s === "questionnaire" || s === "paywall" || s === "pro")
+                ? v.done.filter((s): s is FeedbackSurface => s === "questionnaire" || s === "paywall" || s === "pro" || s === "transcript")
                 : [],
             analyses: num(v.analyses) ?? 0,
         }
@@ -93,6 +93,11 @@ export function shouldInvite(state: FeedbackState, now: number, ctx: SessionCont
 
 export function shouldAskPaywall(state: FeedbackState, now: number, ctx: SessionContext): boolean {
     return mayPrompt(state, now, ctx) && !state.done.includes("paywall")
+}
+
+/** "Blev texten rätt?" efter ett transkript med text. Frågas en gång. */
+export function shouldAskTranscript(state: FeedbackState, now: number, ctx: SessionContext): boolean {
+    return mayPrompt(state, now, ctx) && !state.done.includes("transcript")
 }
 
 export function shouldAskPro(state: FeedbackState, now: number, ctx: SessionContext & { isPro: boolean }): boolean {
@@ -129,6 +134,11 @@ export function ignored(state: FeedbackState, now: number): FeedbackState {
 export function finished(state: FeedbackState, surface: FeedbackSurface): FeedbackState {
     const done = state.done.includes(surface) ? state.done : [...state.done, surface]
     return { ...state, done, ignoredInARow: 0 }
+}
+
+/** Ytan räknas som frågad redan när kortet visas. Rör inte räkningen av orörda kort. */
+export function asked(state: FeedbackState, surface: FeedbackSurface): FeedbackState {
+    return state.done.includes(surface) ? state : { ...state, done: [...state.done, surface] }
 }
 
 export function analysisCompleted(state: FeedbackState): FeedbackState {

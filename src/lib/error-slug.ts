@@ -13,7 +13,8 @@ export function errorSlug(error: unknown): string {
     const msg = error instanceof Error ? error.message : String(error ?? "");
     if (/^Unauthorized|session är inte längre giltig/i.test(msg)) return "unauthorized";
     if (/Payment Required|aktiv Pro|kräver Pro/i.test(msg)) return "not_pro";
-    if (/^För stort/i.test(msg)) return "file_too_large";
+    // Storleks- och längdtaket är samma slags hinder för användaren: mötet ryms inte i molnet.
+    if (/^För (stort|långt)/i.test(msg)) return "file_too_large";
     // Skilj timspärr (anti-abuse, "vänta") från månadskvot (usage-cap, "uppgradera"):
     if (/Hastighetsgräns/i.test(msg)) return "rate_limited";
     if (/Quota|Månadsgräns/i.test(msg)) return "quota_exceeded";

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { checkoutInterval, diarizeAvailable, jobDiarizeAvailable, liveDiarizeAvailable, mcpAvailable, proYearlyAvailable, type SystemConfig } from "./system-config";
+import { checkoutInterval, cloudUploadPolicy, FALLBACK_UPLOAD_POLICY, DEFAULT_MAX_CLOUD_JOB_MINUTES, maxCloudJobMinutes, diarizeAvailable, jobDiarizeAvailable, liveDiarizeAvailable, mcpAvailable, proYearlyAvailable, type SystemConfig } from "./system-config";
 
 // Samma fall som webbens frontend/lib/system-config.test.ts: talarsepareringen gäller bara
 // när backend uttryckligen svarar true.
@@ -149,5 +149,44 @@ describe("mcpAvailable", () => {
         for (const c of [null, undefined, {}, { mcp_available: false }, { mcp_available: "true" as unknown as boolean }, { mcp_available: 1 as unknown as boolean }]) {
             expect(mcpAvailable(c)).toBe(false)
         }
+    })
+})
+
+describe("maxCloudJobMinutes", () => {
+    it("serverns tak gäller när det är ett positivt tal", () => {
+        expect(maxCloudJobMinutes({ max_cloud_job_minutes: 90 })).toBe(90)
+        expect(maxCloudJobMinutes({ max_cloud_job_minutes: 45.5 })).toBe(45.5)
+    })
+    it("allt annat ger standardtaket, aldrig 'inget tak'", () => {
+        for (const c of [null, undefined, {}, { max_cloud_job_minutes: 0 }, { max_cloud_job_minutes: -5 },
+            { max_cloud_job_minutes: Infinity }, { max_cloud_job_minutes: NaN }, { max_cloud_job_minutes: "120" as any }]) {
+            expect(maxCloudJobMinutes(c as any)).toBe(DEFAULT_MAX_CLOUD_JOB_MINUTES)
+        }
+        expect(DEFAULT_MAX_CLOUD_JOB_MINUTES).toBe(25)
+    })
+})
+
+describe("cloudUploadPolicy", () => {
+    it("serverns val gäller: 0 är WAV, ett giltigt värde är Opus", () => {
+        expect(cloudUploadPolicy({ opus_bitrate_per_channel: 0, opus_only_when_needed: false }))
+            .toEqual({ opusBitratePerChannel: 0, onlyWhenNeeded: false, source: "server" })
+        expect(cloudUploadPolicy({ opus_bitrate_per_channel: 16000, opus_only_when_needed: true }))
+            .toEqual({ opusBitratePerChannel: 16000, onlyWhenNeeded: true, source: "server" })
+        expect(cloudUploadPolicy({ opus_bitrate_per_channel: 6000, opus_only_when_needed: false }).source).toBe("server")
+        expect(cloudUploadPolicy({ opus_bitrate_per_channel: 128000, opus_only_when_needed: false }).source).toBe("server")
+    })
+    it("saknat eller ogiltigt fält ger reservläget, aldrig WAV och aldrig en klampad bitrate", () => {
+        // Negativt prov: en tolkning som läser saknat som 0 hade stängt av långa möten tyst.
+        for (const c of [null, undefined, {}, { opus_bitrate_per_channel: 5999 }, { opus_bitrate_per_channel: 128001 },
+            { opus_bitrate_per_channel: 24000.5 }, { opus_bitrate_per_channel: -1 }, { opus_bitrate_per_channel: "24000" as any },
+            { opus_bitrate_per_channel: NaN }]) {
+            expect(cloudUploadPolicy(c as any)).toEqual(FALLBACK_UPLOAD_POLICY)
+        }
+        expect(FALLBACK_UPLOAD_POLICY).toEqual({ opusBitratePerChannel: 24000, onlyWhenNeeded: true, source: "fallback" })
+    })
+    it("bitraten giltig men flaggan saknas: serverns bitrate, reservflaggan, källan fallback", () => {
+        expect(cloudUploadPolicy({ opus_bitrate_per_channel: 0 }))
+            .toEqual({ opusBitratePerChannel: 0, onlyWhenNeeded: true, source: "fallback" })
+        expect(cloudUploadPolicy({ opus_bitrate_per_channel: 32000, opus_only_when_needed: "false" as any }).source).toBe("fallback")
     })
 })

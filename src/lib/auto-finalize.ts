@@ -74,6 +74,8 @@ async function runAutoAnalysis(recordingId: number | null, segs: UISegment[], to
     try {
         captureEvent("analysis_requested", { source: "auto_stop" });
         const fullText = segs.map(s => s.text).join(" ");
+        // Ber inte om namnförslag: namngivningen vid stopp körs redan parallellt, och samma
+        // möte ska inte namnges två gånger.
         const raw = await reanalyzeTranscript(fullText, "general", token);
         // Publicera bara om detta möte fortfarande visas (annars klottrar vi den nya
         // sessionens analysvy). reset() vid ny inspelning har redan nollställt analysData.

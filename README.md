@@ -122,7 +122,8 @@ We hold **neither ISO 27001 nor SOC 2**, and do not claim to. What we offer inst
 Stated plainly, so you can decide before downloading:
 
 - **Apple Silicon Macs only.** The Mac build is arm64 — there is no Intel Mac build and no universal binary. macOS 14.2 or later is required, because the API used to capture meeting audio does not exist before it. No Linux build exists.
-- **Speakers are told apart by channel only.** Everyone on the same channel appears as one speaker: the other people on a call as "Mötet" (the meeting), and people in the room with you as "Du" (you). Acoustic speaker separation ("Speaker 1, 2, 3") was switched off on 2026-09-18.
+- **Speakers are told apart by channel only.** Everyone on the same channel appears as one speaker: the other people on a call as "Mötet" (the meeting), and people in the room with you as "Du" (you). Acoustic speaker separation ("Speaker 1, 2, 3") was switched off on 2026-09-18. When you create meeting minutes, the app can suggest names for the two channels from what is said in the meeting; you can change a name or turn suggestions off in Settings.
+- **Cloud re-transcription takes meetings up to 25 minutes.** A longer meeting gets a message saying so and keeps the transcript it already has.
 - **Swedish-first.** The bundled on-device model handles Swedish only. Norwegian and English are available through the cloud tier (Pro).
 
 ## FAQ

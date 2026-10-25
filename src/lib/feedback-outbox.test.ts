@@ -108,7 +108,7 @@ describe("frågorna", () => {
         expect(questionsFor("questionnaire", true).map((q) => q.id)).toContain("pro_worth")
     })
     it("frågornas id är unika inom en yta", () => {
-        for (const s of ["questionnaire", "paywall", "pro"] as const) {
+        for (const s of ["questionnaire", "paywall", "pro", "transcript"] as const) {
             const ids = questionsFor(s, false).map((q) => q.id)
             expect(new Set(ids).size).toBe(ids.length)
         }

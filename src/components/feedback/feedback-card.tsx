@@ -178,7 +178,7 @@ function Card({ paused }: { paused: boolean }) {
 
                     {(expanded || !question.thumb) ? (
                         <div className="mt-3 animate-in fade-in duration-200 motion-reduce:animate-none">
-                            <p className="text-[13px] text-ink leading-snug">{question.text}</p>
+                            <p className="text-[13px] text-ink leading-snug">{rating === "up" && question.textUp ? question.textUp : question.text}</p>
                             <textarea
                                 autoFocus={!question.thumb || rating !== null}
                                 value={text}

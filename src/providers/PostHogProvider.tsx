@@ -2,7 +2,7 @@ import { useEffect } from 'react'
 import posthog from 'posthog-js'
 import { useAuthStore } from '@/store/auth-store'
 import { captureEvent } from '@/hooks/use-posthog-events'
-import { CURRENT_VERSION } from '@/lib/version'
+import { CURRENT_VERSION, BUILD_CHANNEL } from '@/lib/version'
 import { recordingMarker } from '@/lib/recording-marker'
 import { consumeSignInIntent } from '@/lib/sign-in-intent'
 
@@ -34,7 +34,7 @@ if (KEY) {
         // skapas i PostHog dyka upp här ovanpå den.
         disable_surveys: true,
         loaded: (ph) => {
-            ph.register({ platform: 'desktop', app_version: CURRENT_VERSION })
+            ph.register({ platform: 'desktop', app_version: CURRENT_VERSION, build_channel: BUILD_CHANNEL })
             ph.capture('app_opened')
             // En inspelning från förra körningen som aldrig sparades eller avbröts.
             recordingMarker.reportLeftover()
@@ -68,7 +68,7 @@ export function PostHogProvider({ children }: { children: React.ReactNode }) {
                 captureEvent('sign_out')
                 posthog.reset()
                 // Re-register device super properties — reset() clears them
-                posthog.register({ platform: 'desktop', app_version: CURRENT_VERSION })
+                posthog.register({ platform: 'desktop', app_version: CURRENT_VERSION, build_channel: BUILD_CHANNEL })
             }
         })
     }, [])

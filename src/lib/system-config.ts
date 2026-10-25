@@ -22,6 +22,64 @@ export interface SystemConfig {
     // MCP (lokal server för en AI-assistent på datorn). Styr om avsnittet i Inställningar
     // visas. En MCP-server som redan slagits på fortsätter fungera oavsett fältet.
     mcp_available?: boolean
+    // Längsta möte molnet tar emot per uppladdning, i minuter. Klienten prövar längden före
+    // uppladdningen, så att ett för långt möte inte kodas och skickas förgäves.
+    max_cloud_job_minutes?: number
+    // Opus-kodningen före uppladdning, styrd av servern: 0 = skicka alltid WAV, annars bitrate
+    // per kanal i bit/s. Med opus_only_when_needed skickas WAV när filen ryms och Opus bara
+    // när den inte gör det.
+    opus_bitrate_per_channel?: number
+    opus_only_when_needed?: boolean
+}
+
+/** Hur inspelningar skickas till molnet. `source` säger om servern bestämde eller om
+ *  klienten föll tillbaka (fältet saknades eller var ogiltigt: ett kontraktsfel som ska synas). */
+export interface CloudUploadPolicy {
+    opusBitratePerChannel: number
+    onlyWhenNeeded: boolean
+    source: "server" | "fallback"
+}
+
+export const OPUS_BITRATE_MIN = 6_000
+export const OPUS_BITRATE_MAX = 128_000
+
+/**
+ * Läget när servern inte sagt något giltigt: Opus bara när WAV-filen inte ryms, 24 kbit/s per
+ * kanal. Korta möten skickas då som WAV, som före Opus, och långa går att skicka. Ett saknat
+ * fält (äldre backend, felstavad variabel) ska inte stänga av långa möten tyst; att välja WAV
+ * är serverns uttryckliga 0.
+ */
+export const FALLBACK_UPLOAD_POLICY: CloudUploadPolicy = {
+    opusBitratePerChannel: 24_000,
+    onlyWhenNeeded: true,
+    source: "fallback",
+}
+
+/**
+ * Tolkar serverns val strikt. 0 betyder WAV och är ett giltigt val. En bitrate gäller bara som
+ * heltal i intervallet; allt annat (saknat, flyttal, sträng, negativt, över taket) ger
+ * reservläget, inte WAV och inte en klampad bitrate.
+ */
+export function cloudUploadPolicy(config: SystemConfig | null | undefined): CloudUploadPolicy {
+    const b = config?.opus_bitrate_per_channel
+    const valid = typeof b === "number" && Number.isInteger(b) && (b === 0 || (b >= OPUS_BITRATE_MIN && b <= OPUS_BITRATE_MAX))
+    if (!valid) return FALLBACK_UPLOAD_POLICY
+    const flag = config?.opus_only_when_needed
+    if (typeof flag !== "boolean") return { ...FALLBACK_UPLOAD_POLICY, opusBitratePerChannel: b }
+    return { opusBitratePerChannel: b, onlyWhenNeeded: flag, source: "server" }
+}
+
+/** Taket när servern inte sagt något (äldre backend, eller appen startade offline). */
+export const DEFAULT_MAX_CLOUD_JOB_MINUTES = 25
+
+/**
+ * Längsta möte i minuter som skickas till molnet. Ett positivt, ändligt tal från servern
+ * gäller. Allt annat (saknat fält, 0, en sträng, Infinity) ger standardtaket: ett tak som
+ * tolkas som "inget tak" hade släppt igenom möten som servern inte hinner med.
+ */
+export function maxCloudJobMinutes(config: SystemConfig | null | undefined): number {
+    const v = config?.max_cloud_job_minutes
+    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : DEFAULT_MAX_CLOUD_JOB_MINUTES
 }
 
 // Det nya fältet om backend skickar det, annars det gamla gemensamma.

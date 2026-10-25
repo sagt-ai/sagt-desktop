@@ -8,7 +8,7 @@
 import { create } from "zustand"
 import posthog from "posthog-js"
 import { invoke } from "@tauri-apps/api/core"
-import { CURRENT_VERSION } from "@/lib/version"
+import { BUILD_CHANNEL, CURRENT_VERSION } from "@/lib/version"
 import { useAuthStore } from "@/store/auth-store"
 import { useSyncStore } from "@/store/sync-store"
 import { useTranscriptionStore } from "@/store/transcription-store"
@@ -17,12 +17,14 @@ import {
     type FeedbackSurface,
     type SessionContext,
     analysisCompleted,
+    asked,
     decline,
     finished,
     ignored,
     parseState,
     shouldAskPaywall,
     shouldAskPro,
+    shouldAskTranscript,
     shouldInvite,
     shown,
     snooze,
@@ -127,17 +129,28 @@ async function successfulTranscripts(): Promise<number> {
     }
 }
 
-async function inviteIfDue() {
+async function inviteIfDue(): Promise<boolean> {
     const count = await successfulTranscripts()
     if (shouldInvite(loadState(), Date.now(), { ...context(), successfulTranscripts: count })) {
         show("questionnaire", "invite")
+        return true
     }
+    return false
 }
 
 /** En lokal inspelning är sparad. Bara ett transkript med text räknas. */
 export function onTranscriptSaved(hadText: boolean) {
     if (!hadText) return
-    setTimeout(inviteIfDue, AFTER_TRANSCRIPT_MS)
+    setTimeout(async () => {
+        // Inbjudan går före: den som nått tre transkript ska inte få den
+        // uppskjuten. Kvalitetsfrågan visas en enda gång, besvarad eller inte,
+        // så att ett orört kort inte upprepas och tär på vilan för alla ytor.
+        if (await inviteIfDue()) return
+        if (shouldAskTranscript(loadState(), Date.now(), context())) {
+            saveState(asked(loadState(), "transcript"))
+            show("transcript", "question")
+        }
+    }, AFTER_TRANSCRIPT_MS)
 }
 
 /**
@@ -245,6 +258,7 @@ export function sendAnswer(args: {
         app_version: CURRENT_VERSION,
         os: osName(),
         environment: import.meta.env.PROD ? "production" : "development",
+        build_channel: BUILD_CHANNEL,
     })
     if (!props) return
     const item: OutboxItem = {

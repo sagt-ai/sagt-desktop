@@ -65,6 +65,8 @@ export function SettingsPage() {
         setAutoDiarize,
         autoAnalyze,
         setAutoAnalyze,
+        nameSpeakersWithProtocol,
+        setNameSpeakersWithProtocol,
         localAudioRetention,
         setLocalAudioRetention,
     } = useSettingsStore();
@@ -482,6 +484,35 @@ export function SettingsPage() {
                                 </div>
                             </div>
                         )}
+
+                        {/* Talarnamn med protokollet: gäller alla med konto, även gratis */}
+                        <div className="border-t pt-4 space-y-3">
+                            <div>
+                                <SettingLabel hint="Namnen du skriver i Vilka är med? skickas med texten när du skapar ett protokoll. Du ändrar ett förslag genom att klicka på namnet i transkriptet.">
+                                    Föreslå talarnamn när protokoll skapas
+                                </SettingLabel>
+                                <p className="text-xs text-muted-foreground mt-1">
+                                    Byter Du och Mötet mot namn när samtalet visar vem som talar.
+                                </p>
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
+                                {([
+                                    { value: true, label: 'På' },
+                                    { value: false, label: 'Av' },
+                                ] as { value: boolean; label: string }[]).map(({ value, label }) => (
+                                    <button
+                                        key={String(value)}
+                                        onClick={() => setNameSpeakersWithProtocol(value)}
+                                        className={`px-3 py-2 rounded-md border text-sm font-medium transition-all ${nameSpeakersWithProtocol === value
+                                            ? 'border-primary bg-primary/5 text-primary ring-1 ring-primary'
+                                            : 'border-line bg-white text-ink-soft hover:bg-paper-dim'
+                                        }`}
+                                    >
+                                        {label}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
 
                         {/* Language Selection */}
                         <div className="border-t pt-4 space-y-3">

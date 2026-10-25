@@ -27,6 +27,7 @@ macro_rules! eprint {
 pub mod applog;
 mod audio;
 mod audio_meter;
+mod cloud_upload;
 /// Systemljud via Core Audio Taps. All osäker CoreAudio-FFI är isolerad här,
 /// på samma sätt som audio_meter.rs isolerar WASAPI:s COM-kod.
 #[cfg(target_os = "macos")]
@@ -546,6 +547,7 @@ pub fn run() {
             cleanup_audio_storage,
             audio::extract_meeting_channel,
             audio::delete_diarize_temp,
+            cloud_upload::upload_cloud_audio,
             mcp::commands::mcp_write_session,
             mcp::commands::mcp_clear_session,
             mcp::commands::mcp_server_command
