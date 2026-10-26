@@ -32,7 +32,7 @@ It listens to **your computer's audio** rather than integrating with a meeting p
 - **Installs without administrator rights** — works on a locked-down work laptop
 - **Works offline** — no internet connection needed on the free tier
 - **You and the meeting on separate channels** — your microphone and the computer's audio are transcribed apart, so the transcript shows what you said and what was said in the meeting
-- **AI meeting minutes** — summaries, decisions and action items via Gemma 4 31B on Berget.ai's Swedish servers: 3 per month with a free account, unlimited on Pro. Never outside Europe
+- **AI meeting minutes** — summaries, decisions and action items via Gemma 4 31B on Berget.ai, in the Nordics, within the EU: 3 per month with a free account, unlimited on Pro. Never outside Europe
 - **Export to Word, Markdown, text and PDF** — 10 exports per month with a free account, unlimited on Pro
 - **MCP (optional, off by default)** — let the AI assistant you choose, such as Claude Desktop or Claude Code, read your meetings. Sagt sends nothing on its own; your assistant fetches the text, and that text then goes to the assistant's provider under their terms. Audio is never reachable through MCP. 10 tool calls per day with a free account, unlimited on Pro
 
@@ -135,7 +135,7 @@ Yes, and with anything else that makes sound. Sagt captures your computer's audi
 Not to record and transcribe: no email address, no password, no sign-up. A free account (no payment card) gives you 3 AI meeting minutes and 10 exports per month. Pro removes the limits and adds the cloud model and sync.
 
 **Does my audio leave my computer?**
-Not on the free tier — transcription runs on your own CPU. With a free account, AI meeting minutes are made from the transcript text; the audio stays on your computer. On Pro, only the recordings you choose to process are uploaded, to servers in Sweden, and the audio files are deleted within 24 hours.
+Not on the free tier — transcription runs on your own CPU. With a free account, AI meeting minutes are made from the transcript text; the audio stays on your computer. On Pro, only the recordings you choose to process are uploaded for processing in the Nordics, within the EU, and the audio files are deleted within 24 hours.
 
 **Is it really free, or is it a trial?**
 Free is free, with no time limit. Local transcription is unlimited. A free account adds 3 AI meeting minutes and 10 exports per month.
@@ -203,7 +203,7 @@ npx tsc --noEmit
 - [KB-Whisper](https://huggingface.co/KBLab) via local `whisper-cli` sidecar (beam-size 1, VAD-gated)
 - System audio captured as a channel separate from the microphone — WASAPI loopback on Windows, Core Audio taps on macOS
 - SQLite for local recording storage
-- Cloud tier: KB-Whisper Large and Gemma 4 31B via [Berget.ai](https://berget.ai) (Swedish servers). Acoustic speaker diarization via pyannoteAI is switched off since 2026-09-18
+- Cloud tier: KB-Whisper Large and Gemma 4 31B via [Berget.ai](https://berget.ai), in the Nordics, within the EU. Acoustic speaker diarization via pyannoteAI is switched off since 2026-09-18
 
 ---
 
